@@ -1,11 +1,17 @@
 # Architecture
 
 This document explains how the two pieces of the toolkit — the **session
-manager** (`copilot-s`) and the **Jira usage reporter**
-(`copilot-jira-report.py`) — fit together, and how the **multi-agent
+manager** (`copilot-s`) and the **task usage reporter**
+(`copilot-task-report.py`) — fit together, and how the **multi-agent
 pipeline** (`agents/*.agent.md` + `instructions/copilot-instructions.md`)
 is wired into a Copilot CLI session. It's written for someone evaluating or
 extending the toolkit, not just using it.
+
+> **History note:** prior to 2.0.0 this reporter was Jira-specific
+> (`copilot-jira-report.py`, `~/.copilot/jira-reports/`, `tickets/`,
+> `~/Desktop/CopilotJiraTaskReports`). See the
+> [CHANGELOG's 2.0.0 entry](../CHANGELOG.md) for the rename and the
+> automatic migration of existing data.
 
 ## Component overview
 
@@ -16,16 +22,16 @@ flowchart TB
         COPILOT["copilot\n(GitHub Copilot CLI)"]
         OTEL["~/.copilot/otel/*.jsonl\n(OTEL span export)"]
         EVENTS["~/.copilot/session-state/<id>/events.jsonl"]
-        HELPER["bin/copilot-jira-report.py\n(ingest + report renderer)"]
-        STATE["~/.copilot/jira-reports/\nsession-state.json, tickets/*.json"]
-        PRICING["~/.copilot/jira-reports/\nmodel-pricing.json (user-editable)"]
-        REPORTS["Jira usage reports (Markdown)\ndefault: ~/Desktop/CopilotJiraTaskReports\noverride: $COPILOT_JIRA_REPORTS_DIR"]
+        HELPER["bin/copilot-task-report.py\n(ingest + report renderer)"]
+        STATE["~/.copilot/task-reports/\nsession-state.json, tasks/*.json"]
+        PRICING["~/.copilot/task-reports/\nmodel-pricing.json (user-editable)"]
+        REPORTS["Task usage reports (Markdown)\ndefault: ~/Desktop/CopilotTaskReports\noverride: $COPILOT_TASK_REPORTS_DIR"]
     end
 
     CS -->|"launches, sets COPILOT_OTEL_* env"| COPILOT
     COPILOT -->|writes spans| OTEL
     COPILOT -->|writes events| EVENTS
-    CS -->|"on exit: ingest --session-id --jira KEY"| HELPER
+    CS -->|"on exit: ingest --session-id --task KEY"| HELPER
     OTEL --> HELPER
     EVENTS --> HELPER
     PRICING --> HELPER
@@ -58,16 +64,17 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
 - **OTEL wiring** — before launching `copilot`, it sets
   `COPILOT_OTEL_ENABLED=true`, `COPILOT_OTEL_EXPORTER_TYPE=file`, and a
   fresh per-invocation `COPILOT_OTEL_FILE_EXPORTER_PATH` under
-  `~/.copilot/otel/`. This is what makes the Jira usage reporter possible —
+  `~/.copilot/otel/`. This is what makes the task usage reporter possible —
   see below.
-- **Jira key resolution** — on session start/resume/exit, it tries to
-  extract a Jira-style key (`[A-Z][A-Z0-9]+-[0-9]+`) from the current git
-  branch, falling back to the resumed session's stored branch, and finally
-  prompting the user (with input validation and retry) for a brand-new
-  session with no detectable key.
+- **Task ID resolution** — on session start/resume/exit, it tries to
+  extract a conservative `KEY-123`-style ID (`[A-Z][A-Z0-9]+-[0-9]+`) from
+  the current git branch, falling back to the resumed session's stored
+  branch, and finally prompting the user (with input validation and
+  retry) for a brand-new session with no detectable ID — accepting either
+  a `KEY-123`-style ID or a free-form task name.
 - **Exit hooks** — after `copilot` exits, before the keep/rename/delete
   prompt (and before any session directory is deleted in the bulk-delete
-  flow), it calls `copilot-jira-report.py ingest` non-fatally: a failure
+  flow), it calls `copilot-task-report.py ingest` non-fatally: a failure
   here is reported as a warning and never blocks the keep/rename/delete
   flow.
 
@@ -75,12 +82,12 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
 terminal prompts, and the session index; it treats the reporter as an
 external, swappable helper it shells out to.
 
-## 2. `copilot-jira-report.py` — usage aggregator
+## 2. `copilot-task-report.py` — usage aggregator
 
 A stdlib-only Python script, invoked by `copilot-s` (or standalone via
-`--report`). It has three responsibilities: **ingest** new telemetry,
-**merge** it into a per-ticket aggregate, and **render** that aggregate as
-Markdown.
+`--report`/`--task`). It has three responsibilities: **ingest** new
+telemetry, **merge** it into a per-task aggregate, and **render** that
+aggregate as Markdown.
 
 ### Data sources
 
@@ -88,13 +95,13 @@ Markdown.
 |---|---|---|
 | OTEL span files (`~/.copilot/otel/copilot-otel-*.jsonl`) | Per-call model, token counts (prompt/completion/reasoning/cache-read), call duration, and (when present) the per-call reasoning-effort level | This is the **primary** source — the real conversation model calls. `events.jsonl`'s own model-call events only cover small internal utility calls, not the primary chat turns. |
 | `events.jsonl` (per session, under `~/.copilot/session-state/<id>/`) | Configured reasoning-effort timeline (`session.start`/`resume`/`model_change`), cumulative Copilot-internal usage checkpoints (`session.usage_checkpoint`), and subagent start/complete pairs | **Secondary** source, ingested independently of OTEL — a missing/late-arriving file on either side never blocks the other. |
-| `config/model-pricing.json` (installed to `~/.copilot/jira-reports/model-pricing.json`, user-editable) | USD/1M-token rates per model, plus an alias map | Turns raw token counts into an approximate, independent USD estimate. Models with no pricing entry (after alias resolution) are reported as "no pricing data", never silently priced at $0. |
+| `config/model-pricing.json` (installed to `~/.copilot/task-reports/model-pricing.json`, user-editable) | USD/1M-token rates per model, plus an alias map | Turns raw token counts into an approximate, independent USD estimate. Models with no pricing entry (after alias resolution) are reported as "no pricing data", never silently priced at $0. |
 
 ### Ingest semantics (why it's safe to run repeatedly)
 
 - **Byte-offset tracking per file** — each OTEL file and each session's
   `events.jsonl` has its own tracked read offset in
-  `~/.copilot/jira-reports/session-state.json`. Re-running ingest with no
+  `~/.copilot/task-reports/session-state.json`. Re-running ingest with no
   new bytes is a no-op; re-running with new bytes only processes the new
   bytes.
 - **Install-epoch gating** — usage is only ever counted from the moment the
@@ -114,7 +121,7 @@ Markdown.
   a best-effort cross-process file lock (`fcntl.flock`, falling back to
   unlocked operation if unavailable), and every file write goes through a
   temp-file-then-`os.replace` atomic write. Offsets/cursors are persisted
-  *before* the ticket JSON, so a crash mid-ingest can only undercount on
+  *before* the task JSON, so a crash mid-ingest can only undercount on
   the next run, never double-count.
 - **Truncation handling** — if a tracked file has shrunk since the last
   recorded offset (e.g. rotated/rewound), ingestion prints a warning and
@@ -139,11 +146,11 @@ priority order:
 
 ### Reports
 
-`ticket_path()`/`report_path()` map a normalized Jira key (or the literal
-`UNASSIGNED`) to a JSON aggregate (`~/.copilot/jira-reports/tickets/<KEY>.json`)
+`task_path()`/`report_path()` map a normalized task ID (or the literal
+`UNASSIGNED`) to a JSON aggregate (`~/.copilot/task-reports/tasks/<ID>.json`)
 and a rendered Markdown report. The reports directory defaults to
-`~/Desktop/CopilotJiraTaskReports` and can be overridden with the
-`COPILOT_JIRA_REPORTS_DIR` environment variable. Deleting Copilot sessions
+`~/Desktop/CopilotTaskReports` and can be overridden with the
+`COPILOT_TASK_REPORTS_DIR` environment variable. Deleting Copilot sessions
 never touches these files — they live independently of session storage.
 
 ## 3. Multi-agent pipeline
@@ -157,12 +164,12 @@ stages. Each `agents/*.agent.md` file is a self-contained role definition
 loaded by the Copilot CLI's custom-agent mechanism.
 
 This is pure configuration — no code ties the pipeline to the session
-manager or the Jira reporter. You can adopt just the agents, just the
+manager or the task reporter. You can adopt just the agents, just the
 session manager, or both.
 
 ## Known limitations
 
-See the [README's Jira reporting section](../README.md#jira-usage-reporting)
+See the [README's task reporting section](../README.md#task-usage-reporting)
 for the full, current list of documented tradeoffs (OTEL availability,
 truncation gaps, USD estimate accuracy, etc.) — they are kept in one place
 to avoid drift between this document and the README.

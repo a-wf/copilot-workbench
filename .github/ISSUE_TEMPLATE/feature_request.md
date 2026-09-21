@@ -16,4 +16,4 @@ Any alternative solutions or workarounds you've considered.
 
 **Additional context**
 Anything else relevant (e.g. which component this touches: session
-manager, Jira reporter, agent pipeline, install scripts).
+manager, task reporter, agent pipeline, install scripts).

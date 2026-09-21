@@ -23,7 +23,7 @@ bash -n bin/copilot-s scripts/install.sh scripts/uninstall.sh scripts/update.sh 
 shellcheck -S warning bin/copilot-s scripts/install.sh scripts/uninstall.sh scripts/update.sh tests/test_update.sh
 
 # Python compile + test suite
-python3 -m py_compile bin/copilot-jira-report.py tests/test_copilot_jira_report.py tests/test_copilot_s.py
+python3 -m py_compile bin/copilot-task-report.py tests/test_copilot_task_report.py tests/test_copilot_s.py
 python3 -m unittest discover -s tests -v
 
 # Install/uninstall smoke test against a throwaway HOME — never run against
@@ -56,15 +56,15 @@ a PR.
   both BSD (`date -j -f`) and GNU (`date -d`) as `bin/copilot-s`'s
   `format_timestamp()` does.
 - **Python**: stdlib-only, no third-party dependencies. Keep
-  `bin/copilot-jira-report.py` a single self-contained script.
+  `bin/copilot-task-report.py` a single self-contained script.
 - **Tests**: hermetic — no writes outside a per-test temp directory, no
   network access, no dependency on any specific machine's real
   `~/.copilot` state. Module/script paths under test should be resolved
-  relative to the repo root (see `tests/test_copilot_jira_report.py`'s
+  relative to the repo root (see `tests/test_copilot_task_report.py`'s
   `REPO_ROOT`/`MODULE_PATH`/`SCRIPT_PATH` constants), not hardcoded to an
   installed location.
 - **No personal/machine-specific paths, IDs, or data** in anything checked
-  in: no real Jira ticket keys, no real session IDs, no `/Users/<name>`
+  in: no real task IDs, no real session IDs, no `/Users/<name>`
   paths, no usage/report data from a real machine. Use synthetic examples.
 
 ## Submitting changes
@@ -73,6 +73,6 @@ a PR.
    change) so the approach can be discussed.
 2. Keep PRs focused — unrelated cleanups should be a separate PR.
 3. Update `README.md`/`docs/architecture.md` if behavior changes.
-4. Add or update tests for any change to `bin/copilot-jira-report.py` or
+4. Add or update tests for any change to `bin/copilot-task-report.py` or
    `bin/copilot-s`'s testable logic.
 5. Add a `CHANGELOG.md` entry under "Unreleased".

@@ -202,7 +202,54 @@ log ""
 log "${BOLD}Executables${RESET} -> $BIN_PREFIX"
 mkdir_p "$BIN_PREFIX"
 install_one "$REPO_ROOT/bin/copilot-s" "$BIN_PREFIX/copilot-s" true
-install_one "$REPO_ROOT/bin/copilot-jira-report.py" "$BIN_PREFIX/copilot-jira-report.py" true
+install_one "$REPO_ROOT/bin/copilot-task-report.py" "$BIN_PREFIX/copilot-task-report.py" true
+
+# --- Remove a stale pre-2.0 copilot-jira-report.py helper, if present ---
+# Only ever touches it when it's clearly this toolkit's own doing: either
+# recorded in our install manifest, or a symlink pointing back into this
+# repo checkout. A copilot-jira-report.py that isn't ours (unmanaged file,
+# or a symlink pointing somewhere else entirely) is left completely alone.
+legacy_helper="$BIN_PREFIX/copilot-jira-report.py"
+if [[ -e "$legacy_helper" || -L "$legacy_helper" ]]; then
+  legacy_is_ours=false
+  if is_managed_path "$legacy_helper"; then
+    legacy_is_ours=true
+  elif [[ -L "$legacy_helper" ]]; then
+    legacy_target="$(readlink "$legacy_helper")"
+    [[ "$legacy_target" != /* ]] && legacy_target="$BIN_PREFIX/$legacy_target"
+    case "$legacy_target" in
+      "$REPO_ROOT"/*) legacy_is_ours=true ;;
+    esac
+  fi
+  if $legacy_is_ours; then
+    if $DRY_RUN; then
+      run_note "remove stale toolkit-managed $legacy_helper (superseded by copilot-task-report.py)"
+    else
+      rm -f "$legacy_helper"
+      if [[ -f "$MANIFEST_FILE" ]]; then
+        grep_rc=0
+        grep -Fxv "$legacy_helper" "$MANIFEST_FILE" > "$MANIFEST_FILE.tmp" 2>/dev/null || grep_rc=$?
+        # grep's exit status distinguishes "removed a matching line" (0)
+        # and "no lines matched / file now empty" (1) — both are a safe,
+        # valid result to move into place — from a genuine read/write
+        # failure (>=2, e.g. permission denied, disk error), where
+        # $MANIFEST_FILE.tmp could be empty/truncated garbage. Only ever
+        # overwrite the real manifest in the first two cases; on a real
+        # error, discard the tmp file and warn instead of risking wiping
+        # out the install manifest.
+        if [[ $grep_rc -le 1 ]]; then
+          mv "$MANIFEST_FILE.tmp" "$MANIFEST_FILE"
+        else
+          rm -f "$MANIFEST_FILE.tmp"
+          log "  ${YELLOW}warning:${RESET} could not update $MANIFEST_FILE after removing $legacy_helper (grep exit $grep_rc) — manifest left untouched; it may still list the now-removed path"
+        fi
+      fi
+      log "  ${YELLOW}removed${RESET} stale toolkit-managed $legacy_helper (superseded by copilot-task-report.py)"
+    fi
+  else
+    log "  ${DIM}left in place${RESET} $legacy_helper (not managed by this toolkit — remove it yourself if it's no longer needed)"
+  fi
+fi
 
 # --- Agents ---
 log ""
@@ -218,10 +265,32 @@ log ""
 log "${BOLD}Orchestrator instructions${RESET} -> $COPILOT_HOME/copilot-instructions.md"
 install_one "$REPO_ROOT/instructions/copilot-instructions.md" "$COPILOT_HOME/copilot-instructions.md"
 
+# --- Legacy data migration ---
+# Force any pre-2.0 ~/.copilot/jira-reports data (and its edited pricing
+# config) to migrate into ~/.copilot/task-reports *now*, before the
+# copy-if-absent pricing install below runs — otherwise a fresh default
+# pricing file could get written first and the user's edited legacy one
+# would then be skipped as "already exists". copilot-task-report.py runs
+# this migration on every invocation (including `ensure-marker`), so this
+# is just forcing it to happen at a convenient, deterministic point.
+if $DRY_RUN; then
+  run_note "python3 $REPO_ROOT/bin/copilot-task-report.py ensure-marker (also runs one-time legacy migration)"
+elif command -v python3 >/dev/null 2>&1; then
+  marker_warnings="$(python3 "$REPO_ROOT/bin/copilot-task-report.py" ensure-marker 2>&1 >/dev/null || true)"
+  # Discard stdout (nothing useful there for this call), but never
+  # silently drop stderr: a successful (exit 0) migration can still print
+  # actionable warnings (e.g. an unresolved legacy-migration conflict) that
+  # must reach the user, not just failures. Stay quiet only when there is
+  # truly nothing to report.
+  if [[ -n "$marker_warnings" ]]; then
+    log "  ${YELLOW}${marker_warnings}${RESET}"
+  fi
+fi
+
 # --- Pricing config: copy-only-if-absent, never overwrite user edits ---
 log ""
-log "${BOLD}Pricing config${RESET} -> $COPILOT_HOME/jira-reports/model-pricing.json"
-pricing_dest="$COPILOT_HOME/jira-reports/model-pricing.json"
+log "${BOLD}Pricing config${RESET} -> $COPILOT_HOME/task-reports/model-pricing.json"
+pricing_dest="$COPILOT_HOME/task-reports/model-pricing.json"
 mkdir_p "$(dirname "$pricing_dest")"
 if [[ -e "$pricing_dest" ]]; then
   log "  ${DIM}skipped${RESET} (already exists — your edits are preserved): $pricing_dest"

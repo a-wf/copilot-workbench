@@ -5,7 +5,7 @@ set -eo pipefail
 # Global session tracking in ~/.copilot-sessions with per-directory filtering.
 # Format: session_id|name|timestamp|cwd
 
-COPILOT_S_VERSION="1.0.0"
+COPILOT_S_VERSION="2.0.0"
 
 SESSIONS_FILE="$HOME/.copilot-sessions"
 SESSION_STATE_DIR="$HOME/.copilot/session-state"
@@ -31,7 +31,7 @@ setup_otel() {
 # --- Locate this script's own real (symlink-resolved) directory ---
 # Works whether copilot-s is invoked as a symlink (default `install.sh`
 # mode, pointing back into the repo checkout) or as a plain copy
-# (`install.sh --copy`), and regardless of --prefix, because the Jira
+# (`install.sh --copy`), and regardless of --prefix, because the task
 # report helper is always installed as a sibling file right next to this
 # script by scripts/install.sh.
 resolve_script_dir() {
@@ -46,25 +46,30 @@ resolve_script_dir() {
 }
 SCRIPT_DIR="$(resolve_script_dir)"
 
-# --- Jira usage reporting ---
+# --- Task usage reporting ---
 # Resolution order:
-#   1. COPILOT_JIRA_REPORT_HELPER env override (explicit escape hatch).
-#   2. Sibling copilot-jira-report.py next to this script's real location
+#   1. COPILOT_TASK_REPORT_HELPER env override (explicit escape hatch).
+#   2. Sibling copilot-task-report.py next to this script's real location
 #      (correct for both symlink and --copy installs, any --prefix).
 #   3. Fallback to the conventional ~/.local/bin path, in case this script
 #      is being run directly from a checkout without a helper alongside it.
-if [[ -n "${COPILOT_JIRA_REPORT_HELPER:-}" ]]; then
-  JIRA_REPORT_HELPER="$COPILOT_JIRA_REPORT_HELPER"
-elif [[ -f "$SCRIPT_DIR/copilot-jira-report.py" ]]; then
-  JIRA_REPORT_HELPER="$SCRIPT_DIR/copilot-jira-report.py"
+if [[ -n "${COPILOT_TASK_REPORT_HELPER:-}" ]]; then
+  TASK_REPORT_HELPER="$COPILOT_TASK_REPORT_HELPER"
+elif [[ -f "$SCRIPT_DIR/copilot-task-report.py" ]]; then
+  TASK_REPORT_HELPER="$SCRIPT_DIR/copilot-task-report.py"
 else
-  JIRA_REPORT_HELPER="$HOME/.local/bin/copilot-jira-report.py"
+  TASK_REPORT_HELPER="$HOME/.local/bin/copilot-task-report.py"
 fi
-JIRA_KEY_REGEX='[A-Z][A-Z0-9]+-[0-9]+'
-# Reports directory can be overridden with COPILOT_JIRA_REPORTS_DIR; this is
+TASK_KEY_REGEX='[A-Z][A-Z0-9]+-[0-9]+'
+# Must match MAX_TASK_ID_LEN in copilot-task-report.py's normalize_task_id
+# (defense-in-depth: this bash-side fast path is a convenience/no-python
+# shortcut, not the source of truth, but should never accept something the
+# Python side would reject on length grounds alone).
+MAX_TASK_ID_LEN=200
+# Reports directory can be overridden with COPILOT_TASK_REPORTS_DIR; this is
 # only used for the informational message below (the Python helper is the
 # actual source of truth for where reports are written).
-JIRA_REPORTS_DIR_DISPLAY="${COPILOT_JIRA_REPORTS_DIR:-$HOME/Desktop/CopilotJiraTaskReports}"
+TASK_REPORTS_DIR_DISPLAY="${COPILOT_TASK_REPORTS_DIR:-$HOME/Desktop/CopilotTaskReports}"
 
 BOLD='\033[1m'
 DIM='\033[2m'
@@ -122,33 +127,48 @@ flush_stdin() {
   return 0
 }
 
-# --- Jira ticket resolution (for usage reporting) ---
-# Extract a Jira-style key (e.g. ABC-123) from a branch name, if present.
+# --- Task ID resolution (for usage reporting) ---
+# Extract a conservative KEY-123-style task ID (e.g. ABC-123) from a branch name, if present.
 # Branch names can contain lowercase segments (e.g. "feature/abc-123-foo"),
 # so normalize to uppercase before matching/returning.
-extract_jira_from_branch() {
+extract_task_key_from_branch() {
   local branch="${1:-}"
   [[ -z "$branch" ]] && return 1
   local upper
   upper=$(echo "$branch" | tr '[:lower:]' '[:upper:]')
-  if [[ "$upper" =~ $JIRA_KEY_REGEX ]]; then
+  if [[ "$upper" =~ $TASK_KEY_REGEX ]]; then
     echo "${BASH_REMATCH[0]}"
     return 0
   fi
   return 1
 }
 
-# Validate/normalize a Jira key: uppercase it, then check it matches the
-# expected KEY-NUMBER shape. Prints the normalized key and returns 0 on
-# success; returns 1 (no output) if invalid.
-normalize_and_validate_jira() {
+# Validate/normalize a task ID or free-form task name for the manual-entry
+# prompt below. Conservative KEY-123-style IDs are validated locally (fast
+# path, no python needed); anything else is delegated to
+# `copilot-task-report.py normalize-task-id`, which is the single source of
+# truth for the generic sanitization/collision-safety rules (trim/collapse,
+# safe charset, max length, traversal/control-char rejection, case-folding).
+# Prints the normalized ID and returns 0 on success; returns 1 (no output)
+# if invalid.
+normalize_and_validate_task() {
   local raw="${1:-}"
   [[ -z "$raw" ]] && return 1
   local upper
-  upper=$(echo "$raw" | tr '[:lower:]' '[:upper:]' | xargs)
-  if [[ "$upper" =~ ^${JIRA_KEY_REGEX}$ ]]; then
+  # xargs is used here purely to trim surrounding whitespace on the fast
+  # path; malformed input (e.g. an unbalanced quote) makes it print its
+  # own "unterminated quote"-style diagnostic to stderr, which is never
+  # an intended validation message for the caller and must not leak —
+  # any such input simply fails the regex check below and falls through
+  # to the python normalizer, exactly like any other non-KEY-123 input.
+  upper=$(echo "$raw" | tr '[:lower:]' '[:upper:]' | xargs 2>/dev/null)
+  if [[ ${#upper} -le $MAX_TASK_ID_LEN && "$upper" =~ ^${TASK_KEY_REGEX}$ ]]; then
     echo "$upper"
     return 0
+  fi
+  if [[ -f "$TASK_REPORT_HELPER" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "$TASK_REPORT_HELPER" normalize-task-id -- "$raw" 2>/dev/null
+    return $?
   fi
   return 1
 }
@@ -164,79 +184,87 @@ session_stored_branch() {
   grep '^branch:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^branch: *//'
 }
 
-# Determine the Jira key to attribute usage to for this invocation.
+# Determine the task ID to attribute usage to for this invocation.
 #   $1 = session_id (empty if this is about to be a brand-new session)
 # Prints the resolved key (or empty string to let the report helper reuse
 # whatever it last knew for this session / fall back to UNASSIGNED).
-resolve_jira_key() {
+resolve_task_id() {
   local session_id="${1:-}"
-  local jira="" branch=""
+  local task_id="" branch=""
 
   branch=$(current_git_branch)
-  jira=$(extract_jira_from_branch "$branch") || true
+  task_id=$(extract_task_key_from_branch "$branch") || true
 
-  if [[ -z "$jira" && -n "$session_id" ]]; then
+  if [[ -z "$task_id" && -n "$session_id" ]]; then
     branch=$(session_stored_branch "$SESSION_STATE_DIR/$session_id") || true
-    jira=$(extract_jira_from_branch "$branch") || true
+    task_id=$(extract_task_key_from_branch "$branch") || true
   fi
 
-  if [[ -z "$jira" && -z "$session_id" ]]; then
-    # Brand-new session with no detectable Jira key: ask (re-prompting on
+  if [[ -z "$task_id" && -z "$session_id" ]]; then
+    # Brand-new session with no detectable Task key: ask (re-prompting on
     # invalid input rather than silently accepting/mangling it).
     local attempts=0 input="" normalized=""
     while [[ $attempts -lt 3 ]]; do
-      echo -ne "${YELLOW}No Jira ticket detected on this branch. Jira key for usage tracking (Enter to skip): ${RESET}" >&2
+      echo -ne "${YELLOW}No task ID detected on this branch. Task ID/name for usage tracking (Enter to skip): ${RESET}" >&2
       prompt_read input
       if [[ -z "$input" ]]; then
-        jira="UNASSIGNED"
+        task_id="UNASSIGNED"
         break
       fi
-      if normalized=$(normalize_and_validate_jira "$input"); then
-        jira="$normalized"
+      if normalized=$(normalize_and_validate_task "$input"); then
+        task_id="$normalized"
         break
       fi
-      echo -e "${RED}Invalid Jira key '${input}'. Expected format like ABC-123.${RESET}" >&2
+      echo -e "${RED}Invalid task ID/name '${input}'. Expected e.g. ABC-123, or a free-form name (letters/digits/./_/-).${RESET}" >&2
       attempts=$((attempts + 1))
     done
-    if [[ -z "$jira" ]]; then
+    if [[ -z "$task_id" ]]; then
       echo -e "${YELLOW}Too many invalid attempts; defaulting to UNASSIGNED.${RESET}" >&2
-      jira="UNASSIGNED"
+      task_id="UNASSIGNED"
     fi
   fi
 
-  echo "$jira"
+  echo "$task_id"
 }
 
-# Non-interactive Jira key resolution for batch contexts (multi-select
-# delete): never prompts. Falls back to whatever the Jira report helper
+# Non-interactive task ID resolution for batch contexts (multi-select
+# delete): never prompts. Falls back to whatever the task report helper
 # already has on file for this session (via the python state), or
 # UNASSIGNED if nothing is known — the helper itself preserves any
-# previously-resolved key when passed an empty --jira.
-resolve_jira_key_noninteractive() {
+# previously-resolved task ID when passed an empty --task.
+resolve_task_id_noninteractive() {
   local session_id="${1:-}"
   local branch=""
   branch=$(session_stored_branch "$SESSION_STATE_DIR/$session_id") || true
-  extract_jira_from_branch "$branch" || true
+  extract_task_key_from_branch "$branch" || true
 }
 
-# Ingest this run's usage into the per-ticket Jira report. Never fails hard:
+# Ingest this run's usage into the per-task report. Never fails hard:
 # any error is downgraded to a warning so keep/rename/delete flows always run.
-update_jira_report() {
-  local session_id="${1:-}" jira_key="${2:-}"
+update_task_report() {
+  local session_id="${1:-}" task_id="${2:-}"
   [[ -z "$session_id" ]] && return 0
-  if [[ ! -f "$JIRA_REPORT_HELPER" ]]; then
-    echo -e "${YELLOW}Warning: Jira report helper not found at $JIRA_REPORT_HELPER — usage reporting skipped for this session. Set COPILOT_JIRA_REPORT_HELPER or re-run the installer.${RESET}" >&2
+  if [[ ! -f "$TASK_REPORT_HELPER" ]]; then
+    echo -e "${YELLOW}Warning: task report helper not found at $TASK_REPORT_HELPER — usage reporting skipped for this session. Set COPILOT_TASK_REPORT_HELPER or re-run the installer.${RESET}" >&2
     return 0
   fi
-  command -v python3 >/dev/null 2>&1 || { echo -e "${YELLOW}Warning: python3 not found — Jira usage reporting skipped.${RESET}" >&2; return 0; }
+  command -v python3 >/dev/null 2>&1 || { echo -e "${YELLOW}Warning: python3 not found — task usage reporting skipped.${RESET}" >&2; return 0; }
 
   local session_dir="$SESSION_STATE_DIR/$session_id"
-  local out
-  if ! out=$(python3 "$JIRA_REPORT_HELPER" ingest \
+  local rc=0 out
+  out=$(python3 "$TASK_REPORT_HELPER" ingest \
       --session-id "$session_id" \
-      --jira "$jira_key" \
-      --session-dir "$session_dir" 2>&1); then
-    echo -e "${YELLOW}Warning: Jira usage report update failed (session kept/renamed/deleted normally):${RESET} ${out}" >&2
+      --task="$task_id" \
+      --session-dir "$session_dir" 2>&1) || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${YELLOW}Warning: task usage report update failed (session kept/renamed/deleted normally):${RESET} ${out}" >&2
+  elif [[ -n "$out" ]]; then
+    # The helper succeeded (exit 0) but still printed something to
+    # stderr — e.g. a legacy-migration conflict/failure warning. That
+    # must never be silently swallowed just because the ingest itself
+    # succeeded; only skip printing anything when there's truly nothing
+    # to say, so the normal/clean-run path stays quiet.
+    echo -e "${YELLOW}${out}${RESET}" >&2
   fi
   return 0
 }
@@ -477,16 +505,16 @@ list_sessions() {
 # --- Post-session: keep/delete then rename ---
 post_session() {
   local session_id="${1:-}"
-  local jira_key="${2:-}"
+  local task_id="${2:-}"
   [[ -z "$session_id" ]] && return 0
 
   local session_dir="$SESSION_STATE_DIR/$session_id"
   [[ -d "$session_dir" ]] || return 0
 
-  # Update the Jira usage report FIRST, while events.jsonl still exists on
+  # Update the task usage report FIRST, while events.jsonl still exists on
   # disk — this must run regardless of whether the user then keeps, renames,
   # or deletes the session below, and must never abort this script.
-  update_jira_report "$session_id" "$jira_key"
+  update_task_report "$session_id" "$task_id"
 
   local created_at cwd
   created_at=$(grep '^created_at:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^created_at: *//' || true)
@@ -548,11 +576,11 @@ run_copilot() {
   local session_id="${1:-}"
   shift 2>/dev/null || true
 
-  # Resolve which Jira ticket this run's usage should be attributed to,
+  # Resolve which task this run's usage should be attributed to,
   # before copilot starts (prompts once only for a brand-new session with no
-  # Jira key detectable from the branch).
-  local jira_key
-  jira_key=$(resolve_jira_key "$session_id")
+  # task ID detectable from the branch).
+  local task_id
+  task_id=$(resolve_task_id "$session_id")
 
   # Snapshot existing session dirs
   local before_file
@@ -576,7 +604,7 @@ run_copilot() {
   rm -f "$before_file"
 
   local final_id="${detected_id:-$session_id}"
-  post_session "${final_id:-}" "$jira_key"
+  post_session "${final_id:-}" "$task_id"
   exit 0
 }
 
@@ -670,18 +698,18 @@ delete_session() {
     mv "$tmp" "$SESSIONS_FILE"
 
     # Remove session state directories from disk — but ingest any pending
-    # usage into the Jira report FIRST for each one, so bulk-deleting
+    # usage into the Task report FIRST for each one, so bulk-deleting
     # sessions never silently drops usage that was never ingested yet.
     for did in "${del_ids[@]}"; do
       if [[ -d "$SESSION_STATE_DIR/$did" ]]; then
-        local del_jira
-        del_jira=$(resolve_jira_key_noninteractive "$did")
-        update_jira_report "$did" "$del_jira"
+        local del_task_id
+        del_task_id=$(resolve_task_id_noninteractive "$did")
+        update_task_report "$did" "$del_task_id"
         rm -rf "${SESSION_STATE_DIR:?}/${did:?}"
       fi
     done
 
-    echo -e "${GREEN}Deleted ${#del_ids[@]} session(s). Jira usage reports for them (if any) remain at $(short_path "$JIRA_REPORTS_DIR_DISPLAY").${RESET}"
+    echo -e "${GREEN}Deleted ${#del_ids[@]} session(s). Task usage reports for them (if any) remain at $(short_path "$TASK_REPORTS_DIR_DISPLAY").${RESET}"
   else
     echo "Cancelled."
   fi
@@ -734,18 +762,18 @@ select_session() {
   esac
 }
 
-# --- Ensure the Jira-usage-reporting install marker exists ---
+# --- Ensure the task-usage-reporting install marker exists ---
 # Must run BEFORE the first-ever `copilot` invocation from this script so
 # that a brand-new install's very first session counts (its events land
 # after installed_epoch), while any sessions that already existed before
 # this feature was ever used remain excluded (their events predate it).
-ensure_jira_install_marker() {
-  if [[ ! -f "$JIRA_REPORT_HELPER" ]]; then
-    echo -e "${YELLOW}Warning: Jira report helper not found at $JIRA_REPORT_HELPER — usage reporting is disabled until this is fixed. Set COPILOT_JIRA_REPORT_HELPER or re-run the installer.${RESET}" >&2
+ensure_task_install_marker() {
+  if [[ ! -f "$TASK_REPORT_HELPER" ]]; then
+    echo -e "${YELLOW}Warning: task report helper not found at $TASK_REPORT_HELPER — usage reporting is disabled until this is fixed. Set COPILOT_TASK_REPORT_HELPER or re-run the installer.${RESET}" >&2
     return 0
   fi
-  command -v python3 >/dev/null 2>&1 || { echo -e "${YELLOW}Warning: python3 not found — Jira usage reporting disabled.${RESET}" >&2; return 0; }
-  python3 "$JIRA_REPORT_HELPER" ensure-marker >/dev/null 2>&1 || true
+  command -v python3 >/dev/null 2>&1 || { echo -e "${YELLOW}Warning: python3 not found — task usage reporting disabled.${RESET}" >&2; return 0; }
+  python3 "$TASK_REPORT_HELPER" ensure-marker >/dev/null 2>&1 || true
 }
 
 # --- Help / usage ---
@@ -756,43 +784,45 @@ show_help() {
 ${BOLD}copilot-s${RESET} — Copilot Session Manager (v${COPILOT_S_VERSION})
 
 Lists and manages local Copilot CLI sessions, with per-directory filtering,
-resume/rename/delete, and optional per-Jira-ticket usage reporting.
+resume/rename/delete, and optional per-task usage reporting.
 
 ${BOLD}Usage:${RESET}
   copilot-s                     List sessions relevant to the current directory
   copilot-s --all | -a          List every session, across all directories
-  copilot-s --report TICKET-123 Print/regenerate the usage report for a ticket
+  copilot-s --report TASK_ID    Print/regenerate the usage report for a task
+  copilot-s --task TASK_ID      Alias for --report
   copilot-s --help | -h         Show this help and exit
   copilot-s --version | -v      Show the version and exit
 
 ${BOLD}Features:${RESET}
   - Resume, rename, or delete sessions (single/range/multi-select)
   - Prompts to keep/rename/delete a session when \`copilot\` exits
-  - Per-ticket Jira usage reports (\`--report\`), attributed via the current
-    git branch or an interactive prompt
+  - Per-task usage reports (\`--report\`/\`--task\`), attributed via the current
+    git branch (KEY-123-style IDs only) or an interactive prompt that also
+    accepts free-form task names
 
 ${BOLD}Environment:${RESET}
-  COPILOT_JIRA_REPORTS_DIR       Override where Jira usage reports are written
-  COPILOT_JIRA_REPORT_HELPER     Override the path to copilot-jira-report.py
+  COPILOT_TASK_REPORTS_DIR       Override where task usage reports are written
+  COPILOT_TASK_REPORT_HELPER     Override the path to copilot-task-report.py
 
 Verify install with: copilot-s --help
 EOF
 )"
 }
 
-# --- Manually regenerate/display a Jira usage report ---
-show_jira_report() {
-  local ticket="${1:-}"
-  if [[ -z "$ticket" ]]; then
-    echo -e "${RED}Usage:${RESET} copilot-s --report TICKET-123" >&2
+# --- Manually regenerate/display a task usage report ---
+show_task_report() {
+  local task_id="${1:-}"
+  if [[ -z "$task_id" ]]; then
+    echo -e "${RED}Usage:${RESET} copilot-s --report TASK_ID" >&2
     return 1
   fi
-  if [[ ! -f "$JIRA_REPORT_HELPER" ]]; then
-    echo -e "${RED}Jira report helper not found:${RESET} $JIRA_REPORT_HELPER" >&2
+  if [[ ! -f "$TASK_REPORT_HELPER" ]]; then
+    echo -e "${RED}task report helper not found:${RESET} $TASK_REPORT_HELPER" >&2
     return 1
   fi
   command -v python3 >/dev/null 2>&1 || { echo -e "${RED}python3 not found.${RESET}" >&2; return 1; }
-  python3 "$JIRA_REPORT_HELPER" report "$ticket"
+  python3 "$TASK_REPORT_HELPER" report -- "$task_id"
 }
 
 # --- Entry point ---
@@ -816,38 +846,50 @@ main() {
   # very first `copilot` invocation this script ever makes is guaranteed to
   # land after installed_epoch (first post-install session counts; nothing
   # historical/pre-existing does).
-  ensure_jira_install_marker
+  ensure_task_install_marker
 
-  # --report TICKET: regenerate/print a Jira usage report and exit
-  # immediately, bypassing the session manager entirely. Scan the full
-  # argument list (not just $1) so `--report` works regardless of position,
-  # and strip both the flag and its value from what would otherwise be
-  # passed through — --report must never reach `copilot` itself.
-  local report_ticket="" found_report=false
+  # --report TASK_ID / --task TASK_ID: regenerate/print a task usage report
+  # and exit immediately, bypassing the session manager entirely. Scan the
+  # full argument list (not just $1) so these flags work regardless of
+  # position, and strip both the flag and its value from what would
+  # otherwise be passed through — neither flag must ever reach `copilot`.
+  local report_task_id="" found_report=false
   local remaining=()
   local n=$#
   local idx=0
   while [[ $idx -lt $n ]]; do
     idx=$((idx + 1))
     local arg="${!idx}"
-    if [[ "$arg" == "--report" ]]; then
+    if [[ "$arg" == "--report" || "$arg" == "--task" ]]; then
       found_report=true
       local next_idx=$((idx + 1))
       if [[ $next_idx -le $n ]]; then
-        report_ticket="${!next_idx}"
-        idx=$next_idx
+        local next_val="${!next_idx}"
+        # Only consume the next token as the value if it doesn't itself
+        # look like a recognized flag (e.g. `copilot-s --task --all` must
+        # not silently swallow `--all` as the task ID and drop it). A
+        # valid task ID can never start with '-' anyway (rejected by the
+        # normalizer), so this can never misclassify a real value.
+        if [[ "$next_val" != -* ]]; then
+          report_task_id="$next_val"
+          idx=$next_idx
+        fi
       fi
       continue
     elif [[ "$arg" == --report=* ]]; then
       found_report=true
-      report_ticket="${arg#--report=}"
+      report_task_id="${arg#--report=}"
+      continue
+    elif [[ "$arg" == --task=* ]]; then
+      found_report=true
+      report_task_id="${arg#--task=}"
       continue
     fi
     remaining+=("$arg")
   done
 
   if [[ "$found_report" == "true" ]]; then
-    show_jira_report "$report_ticket"
+    show_task_report "$report_task_id"
     exit $?
   fi
 

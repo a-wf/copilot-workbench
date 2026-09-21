@@ -1,12 +1,12 @@
 ---
 name: Bug report
-about: Report a problem with the session manager, Jira reporter, install scripts, or agent pipeline
+about: Report a problem with the session manager, task reporter, install scripts, or agent pipeline
 title: "[Bug] "
 labels: bug
 ---
 
 **Component**
-<!-- copilot-s / copilot-jira-report.py / install.sh / uninstall.sh / update.sh / agents / other -->
+<!-- copilot-s / copilot-task-report.py / install.sh / uninstall.sh / update.sh / agents / other -->
 
 **Describe the bug**
 A clear description of what went wrong.
@@ -26,6 +26,6 @@ What you expected to happen.
 
 **Logs / output**
 ```
-paste relevant output here — please redact any real Jira ticket keys,
+paste relevant output here — please redact any real task IDs,
 session IDs, file paths containing your username, or usage/cost data
 ```

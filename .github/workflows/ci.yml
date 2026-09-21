@@ -43,7 +43,7 @@ jobs:
 
       - name: Python compile check
         run: |
-          python3 -m py_compile bin/copilot-jira-report.py tests/test_copilot_jira_report.py tests/test_copilot_s.py
+          python3 -m py_compile bin/copilot-task-report.py tests/test_copilot_task_report.py tests/test_copilot_s.py
 
       - name: Run test suite
         run: |
@@ -56,17 +56,35 @@ jobs:
           HOME="$TESTHOME" bash scripts/install.sh --dry-run
           HOME="$TESTHOME" bash scripts/install.sh
           test -L "$TESTHOME/.local/bin/copilot-s"
-          test -L "$TESTHOME/.local/bin/copilot-jira-report.py"
+          test -L "$TESTHOME/.local/bin/copilot-task-report.py"
           test -x "$TESTHOME/.local/bin/copilot-s"
           for a in planner coder reviewer fixer tester test-reviewer; do
             test -L "$TESTHOME/.copilot/agents/$a.agent.md"
           done
           test -L "$TESTHOME/.copilot/copilot-instructions.md"
-          test -f "$TESTHOME/.copilot/jira-reports/model-pricing.json"
-          test ! -L "$TESTHOME/.copilot/jira-reports/model-pricing.json"
+          test -f "$TESTHOME/.copilot/task-reports/model-pricing.json"
+          test ! -L "$TESTHOME/.copilot/task-reports/model-pricing.json"
           # Re-run must be idempotent (no duplicate backups).
           HOME="$TESTHOME" bash scripts/install.sh
           echo "install smoke test OK"
+
+      - name: Legacy helper cleanup smoke test
+        run: |
+          set -e
+          TESTHOME="$(mktemp -d)"
+          mkdir -p "$TESTHOME/.local/bin"
+          ln -s "$GITHUB_WORKSPACE/bin/copilot-task-report.py" "$TESTHOME/.local/bin/copilot-jira-report.py"
+          HOME="$TESTHOME" bash scripts/install.sh
+          test ! -e "$TESTHOME/.local/bin/copilot-jira-report.py"
+          test -L "$TESTHOME/.local/bin/copilot-task-report.py"
+          # An unrelated file at the legacy path must never be touched.
+          TESTHOME2="$(mktemp -d)"
+          mkdir -p "$TESTHOME2/.local/bin"
+          echo "not toolkit-managed" > "$TESTHOME2/.local/bin/copilot-jira-report.py"
+          HOME="$TESTHOME2" bash scripts/install.sh
+          test -f "$TESTHOME2/.local/bin/copilot-jira-report.py"
+          grep -qF "not toolkit-managed" "$TESTHOME2/.local/bin/copilot-jira-report.py"
+          echo "legacy helper cleanup smoke test OK"
 
       - name: Install smoke test (--copy mode)
         run: |
@@ -82,16 +100,16 @@ jobs:
         run: |
           set -e
           TESTHOME="$(mktemp -d)"
-          mkdir -p "$TESTHOME/.copilot/jira-reports/tickets"
-          echo '{"totals":{}}' > "$TESTHOME/.copilot/jira-reports/tickets/ABC-123.json"
+          mkdir -p "$TESTHOME/.copilot/task-reports/tasks"
+          echo '{"totals":{}}' > "$TESTHOME/.copilot/task-reports/tasks/ABC-123.json"
           HOME="$TESTHOME" bash scripts/install.sh
           HOME="$TESTHOME" bash scripts/uninstall.sh --dry-run
           HOME="$TESTHOME" bash scripts/uninstall.sh
           test ! -e "$TESTHOME/.local/bin/copilot-s"
           test ! -e "$TESTHOME/.copilot/agents/planner.agent.md"
-          # Ticket state and pricing config must never be removed.
-          test -f "$TESTHOME/.copilot/jira-reports/tickets/ABC-123.json"
-          test -f "$TESTHOME/.copilot/jira-reports/model-pricing.json"
+          # Task state and pricing config must never be removed.
+          test -f "$TESTHOME/.copilot/task-reports/tasks/ABC-123.json"
+          test -f "$TESTHOME/.copilot/task-reports/model-pricing.json"
           echo "uninstall smoke test OK"
 
       - name: Install --prefix hardening smoke test

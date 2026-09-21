@@ -3,14 +3,19 @@
 #
 # Only removes paths this toolkit's installer actually created (tracked in
 # ~/.copilot-cli-toolkit/install-manifest.txt). It NEVER deletes:
-#   - Jira usage reports (~/Desktop/CopilotJiraTaskReports or
-#     $COPILOT_JIRA_REPORTS_DIR)
-#   - Ticket/session ingest state (~/.copilot/jira-reports/tickets,
+#   - Task usage reports (~/Desktop/CopilotTaskReports or
+#     $COPILOT_TASK_REPORTS_DIR)
+#   - Task/session ingest state (~/.copilot/task-reports/tasks,
 #     session-state.json, install-marker.json)
-#   - The user's pricing config (~/.copilot/jira-reports/model-pricing.json)
+#   - The user's pricing config (~/.copilot/task-reports/model-pricing.json)
 #     — this file is copy-once-if-absent and is never toolkit-managed.
 #   - Copilot session state (~/.copilot/session-state, ~/.copilot-sessions)
 #   - Any other user data.
+#
+# A stale pre-2.0 copilot-jira-report.py helper is handled by
+# scripts/install.sh (which removes it from the manifest/disk on re-install
+# when it was toolkit-managed), so this script needs no Jira-specific logic
+# of its own — it simply removes whatever the current manifest lists.
 #
 # Usage:
 #   scripts/uninstall.sh [--dry-run] [--restore-backups]
@@ -97,7 +102,7 @@ if $DRY_RUN; then
 else
   log "${GREEN}Uninstall complete.${RESET} Removed $removed_count toolkit-managed path(s)."
   rm -f "$MANIFEST_FILE"
-  log "Note: Jira reports, ticket state, session state, and your pricing config were left untouched."
+  log "Note: Task reports, task state, session state, and your pricing config were left untouched."
   if ! $RESTORE; then
     log "Backups of any pre-existing files (if created during install) remain at: $STATE_DIR/backups/"
   fi

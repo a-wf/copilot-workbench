@@ -3,10 +3,10 @@
 Focused regression tests for bin/copilot-s, covering the reviewer findings
 fixed in this pass:
 
-  1. copilot-jira-report.py helper resolution must follow copilot-s's own
+  1. copilot-task-report.py helper resolution must follow copilot-s's own
      (symlink-resolved) install location — correct for both the default
      symlink install and `--copy`, and for any custom `--prefix` — with a
-     COPILOT_JIRA_REPORT_HELPER env override taking priority, and a
+     COPILOT_TASK_REPORT_HELPER env override taking priority, and a
      sensible ~/.local/bin fallback.
   2. `copilot-s --help` (and `--version`) must print and exit immediately:
      no prompting, no session listing, no launching of `copilot`.
@@ -29,7 +29,7 @@ import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COPILOT_S = os.path.join(REPO_ROOT, "bin", "copilot-s")
-JIRA_HELPER = os.path.join(REPO_ROOT, "bin", "copilot-jira-report.py")
+TASK_HELPER = os.path.join(REPO_ROOT, "bin", "copilot-task-report.py")
 INSTALL_SH = os.path.join(REPO_ROOT, "scripts", "install.sh")
 UNINSTALL_SH = os.path.join(REPO_ROOT, "scripts", "uninstall.sh")
 
@@ -118,7 +118,7 @@ class TestHelpAndVersionAreSafe(BaseHomeTestCase):
     def test_report_flag_sets_up_otel_for_real_invocation(self):
         # A real (non-informational) invocation must still get OTEL telemetry
         # set up, even though it exits early via the --report path.
-        os.makedirs(os.path.join(self.home, ".copilot", "jira-reports"), exist_ok=True)
+        os.makedirs(os.path.join(self.home, ".copilot", "task-reports"), exist_ok=True)
         result = run(
             [COPILOT_S, "--report", "ABC-123"],
             env=self.env(),
@@ -129,15 +129,62 @@ class TestHelpAndVersionAreSafe(BaseHomeTestCase):
             "a real invocation must still create the OTEL export directory",
         )
 
+    def test_task_flag_is_an_alias_for_report_flag(self):
+        # --task TASK_ID must behave identically to --report TASK_ID.
+        os.makedirs(os.path.join(self.home, ".copilot", "task-reports"), exist_ok=True)
+        result = run(
+            [COPILOT_S, "--task", "ABC-123"],
+            env=self.env(),
+            stdin=subprocess.DEVNULL,
+        )
+        self.assertTrue(
+            os.path.isdir(os.path.join(self.home, ".copilot", "otel")),
+            "--task must set up OTEL just like --report",
+        )
+
+    def test_task_equals_form_is_accepted(self):
+        os.makedirs(os.path.join(self.home, ".copilot", "task-reports"), exist_ok=True)
+        result = run(
+            [COPILOT_S, "--task=ABC-123"],
+            env=self.env(),
+            stdin=subprocess.DEVNULL,
+        )
+        self.assertTrue(
+            os.path.isdir(os.path.join(self.home, ".copilot", "otel")),
+            "--task=ID must be parsed the same as --task ID",
+        )
+
+    def test_help_mentions_task_alias(self):
+        result = run([COPILOT_S, "--help"], env=self.env(), stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--task", result.stdout)
+
+    def test_task_flag_does_not_swallow_a_following_flag_as_its_value(self):
+        # `copilot-s --task --all` must not silently treat "--all" as the
+        # task ID (and thereby drop it): a real task ID can never start
+        # with '-', so the next token must only be consumed as the value
+        # when it doesn't itself look like a flag.
+        os.makedirs(os.path.join(self.home, ".copilot", "task-reports"), exist_ok=True)
+        result = run(
+            [COPILOT_S, "--task", "--all"],
+            env=self.env(),
+            stdin=subprocess.DEVNULL,
+        )
+        # No value was supplied (the next token was rejected as a value),
+        # so this must behave like a bare/missing task ID: a clear usage
+        # error, not a silent swallow-and-continue.
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Usage", result.stderr)
+
 
 class TestHelperResolution(BaseHomeTestCase):
-    """copilot-jira-report.py must be found relative to copilot-s's own
+    """copilot-task-report.py must be found relative to copilot-s's own
     resolved location, regardless of symlink vs --copy install mode or
     --prefix, with an env override taking priority."""
 
     def _resolved_helper_path(self, copilot_s_path, extra_env=None):
-        # `--version` exits before any Jira-report work, so use `bash -x`
-        # to observe the JIRA_REPORT_HELPER assignment without needing a
+        # `--version` exits before any task-report work, so use `bash -x`
+        # to observe the TASK_REPORT_HELPER assignment without needing a
         # tty or a real `copilot` binary on PATH.
         result = run(
             ["bash", "-x", copilot_s_path, "--version"],
@@ -147,16 +194,16 @@ class TestHelperResolution(BaseHomeTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for line in result.stderr.splitlines():
             line = line.strip()
-            if line.startswith("+ JIRA_REPORT_HELPER="):
+            if line.startswith("+ TASK_REPORT_HELPER="):
                 return line.split("=", 1)[1]
-        self.fail(f"JIRA_REPORT_HELPER assignment not observed in:\n{result.stderr}")
+        self.fail(f"TASK_REPORT_HELPER assignment not observed in:\n{result.stderr}")
 
     def test_symlink_install_resolves_helper_next_to_repo(self):
         run([INSTALL_SH], env=self.env(), check=True)
         installed = os.path.join(self.home, ".local", "bin", "copilot-s")
         self.assertTrue(os.path.islink(installed))
         resolved = self._resolved_helper_path(installed)
-        self.assertEqual(resolved, JIRA_HELPER)
+        self.assertEqual(resolved, TASK_HELPER)
 
     def test_copy_install_resolves_helper_as_sibling_copy(self):
         run([INSTALL_SH, "--copy"], env=self.env(), check=True)
@@ -164,7 +211,7 @@ class TestHelperResolution(BaseHomeTestCase):
         self.assertFalse(os.path.islink(installed))
         resolved = self._resolved_helper_path(installed)
         expected = os.path.realpath(
-            os.path.join(self.home, ".local", "bin", "copilot-jira-report.py")
+            os.path.join(self.home, ".local", "bin", "copilot-task-report.py")
         )
         self.assertEqual(os.path.realpath(resolved), expected)
         self.assertTrue(os.path.exists(resolved))
@@ -175,14 +222,14 @@ class TestHelperResolution(BaseHomeTestCase):
         installed = os.path.join(custom_prefix, "copilot-s")
         self.assertTrue(os.path.islink(installed))
         resolved = self._resolved_helper_path(installed)
-        self.assertEqual(resolved, JIRA_HELPER)
+        self.assertEqual(resolved, TASK_HELPER)
 
     def test_env_override_wins_over_sibling_resolution(self):
         run([INSTALL_SH], env=self.env(), check=True)
         installed = os.path.join(self.home, ".local", "bin", "copilot-s")
-        override = "/tmp/some-other-copilot-jira-report.py"
+        override = "/tmp/some-other-copilot-task-report.py"
         resolved = self._resolved_helper_path(
-            installed, extra_env={"COPILOT_JIRA_REPORT_HELPER": override}
+            installed, extra_env={"COPILOT_TASK_REPORT_HELPER": override}
         )
         self.assertEqual(resolved, override)
 
@@ -191,7 +238,7 @@ class TestHelperResolution(BaseHomeTestCase):
         # with a decoy helper only present at ~/.local/bin — since the
         # repo bin/ *does* have a real helper next to it, simulate the
         # "no sibling helper" case by invoking a standalone copy placed
-        # somewhere with no copilot-jira-report.py alongside it.
+        # somewhere with no copilot-task-report.py alongside it.
         standalone_dir = os.path.join(self.home, "standalone")
         os.makedirs(standalone_dir)
         standalone_copilot_s = os.path.join(standalone_dir, "copilot-s")
@@ -200,7 +247,7 @@ class TestHelperResolution(BaseHomeTestCase):
 
         fallback_dir = os.path.join(self.home, ".local", "bin")
         os.makedirs(fallback_dir)
-        fallback_helper = os.path.join(fallback_dir, "copilot-jira-report.py")
+        fallback_helper = os.path.join(fallback_dir, "copilot-task-report.py")
         with open(fallback_helper, "w", encoding="utf-8") as f:
             f.write("#!/usr/bin/env python3\n")
 
@@ -209,7 +256,7 @@ class TestHelperResolution(BaseHomeTestCase):
 
 
 class TestMissingHelperIsVisibleNotSilent(BaseHomeTestCase):
-    """A missing Jira report helper must never silently disable reporting:
+    """A missing task report helper must never silently disable reporting:
     it must warn (session-exit/marker paths) or clearly error (--report)."""
 
     def _funcs_only_script(self):
@@ -241,31 +288,82 @@ class TestMissingHelperIsVisibleNotSilent(BaseHomeTestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not found", result.stderr)
-        self.assertIn("copilot-jira-report.py", result.stderr)
+        self.assertIn("copilot-task-report.py", result.stderr)
 
     def test_ensure_marker_warns_instead_of_silently_returning(self):
         funcs_path = self._funcs_only_script()
         script = (
             f'source "{funcs_path}"; '
-            'JIRA_REPORT_HELPER="/nonexistent/copilot-jira-report.py"; '
-            "ensure_jira_install_marker"
+            'TASK_REPORT_HELPER="/nonexistent/copilot-task-report.py"; '
+            "ensure_task_install_marker"
         )
         result = run(["bash", "-c", script], env=self.env(), stdin=subprocess.DEVNULL)
         self.assertEqual(result.returncode, 0)  # never fails hard
         self.assertIn("Warning", result.stderr)
         self.assertIn("not found", result.stderr)
 
-    def test_update_jira_report_warns_instead_of_silently_returning(self):
+    def test_update_task_report_warns_instead_of_silently_returning(self):
         funcs_path = self._funcs_only_script()
         script = (
             f'source "{funcs_path}"; '
-            'JIRA_REPORT_HELPER="/nonexistent/copilot-jira-report.py"; '
-            'update_jira_report "sess-1" "ABC-1"'
+            'TASK_REPORT_HELPER="/nonexistent/copilot-task-report.py"; '
+            'update_task_report "sess-1" "ABC-1"'
         )
         result = run(["bash", "-c", script], env=self.env(), stdin=subprocess.DEVNULL)
         self.assertEqual(result.returncode, 0)  # never fails hard
         self.assertIn("Warning", result.stderr)
         self.assertIn("not found", result.stderr)
+
+
+class TestUpdateTaskReportSurfacesWarningsOnSuccess(BaseHomeTestCase):
+    """update_task_report() must not silently discard stderr just because
+    the underlying ingest call succeeded (exit 0) — e.g. a legacy-
+    migration warning printed alongside a normal successful ingest must
+    still reach the user, while a genuinely clean/quiet success must
+    print nothing extra (no noise on the common path)."""
+
+    def _funcs_only_script(self):
+        with open(COPILOT_S, encoding="utf-8") as f:
+            lines = f.readlines()
+        funcs_path = os.path.join(self.home, "copilot-s-funcs.sh")
+        with open(funcs_path, "w", encoding="utf-8") as f:
+            f.writelines(lines[:-1])
+        return funcs_path
+
+    def _fake_helper(self, body):
+        path = os.path.join(self.home, "fake-helper.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!/usr/bin/env python3\n" + body)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+        return path
+
+    def test_stderr_is_surfaced_when_ingest_succeeds_but_warns(self):
+        helper = self._fake_helper(
+            "import sys\n"
+            "sys.stderr.write('warning: legacy migration found a conflict, both copies kept\\n')\n"
+            "sys.exit(0)\n"
+        )
+        funcs_path = self._funcs_only_script()
+        script = (
+            f'source "{funcs_path}"; '
+            f'TASK_REPORT_HELPER="{helper}"; '
+            'update_task_report "sess-1" "ABC-1"'
+        )
+        result = run(["bash", "-c", script], env=self.env(), stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("legacy migration found a conflict", result.stderr)
+
+    def test_stderr_stays_quiet_when_ingest_succeeds_cleanly(self):
+        helper = self._fake_helper("import sys\nsys.exit(0)\n")
+        funcs_path = self._funcs_only_script()
+        script = (
+            f'source "{funcs_path}"; '
+            f'TASK_REPORT_HELPER="{helper}"; '
+            'update_task_report "sess-1" "ABC-1"'
+        )
+        result = run(["bash", "-c", script], env=self.env(), stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
 
 
 class TestSessionNameEventsPathIsSafe(BaseHomeTestCase):
@@ -373,6 +471,65 @@ class TestInstallerPrefixArgValidation(BaseHomeTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(os.path.exists(os.path.join(custom_prefix, "copilot-s")))
+
+
+class TestNormalizeAndValidateTaskFastPathStderr(BaseHomeTestCase):
+    """normalize_and_validate_task()'s KEY-123 fast path pipes through
+    `xargs` purely to trim whitespace. Malformed input (e.g. containing an
+    unbalanced quote) makes `xargs` print its own "unterminated quote"
+    diagnostic to stderr; that diagnostic is never an intended validation
+    message for the caller (the real validation message is the caller's
+    own "Invalid task ID/name ..." echo) and must not leak.
+
+    This sources a trimmed copy of bin/copilot-s (everything up to but not
+    including the trailing unconditional `main "$@"` call) so the function
+    can be exercised directly without running the whole session manager.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with open(COPILOT_S, encoding="utf-8") as f:
+            lines = f.readlines()
+        self.assertEqual(lines[-1].strip(), 'main "$@"', "unexpected trailing line in bin/copilot-s")
+        self.sourceable = os.path.join(self.home, "copilot-s.sourceable")
+        with open(self.sourceable, "w", encoding="utf-8") as f:
+            f.writelines(lines[:-1])
+
+    def _call(self, raw_input):
+        # Invoke the function the same way real call sites do
+        # (`if normalized=$(normalize_and_validate_task "$input"); then`),
+        # so `set -e` in the sourced script behaves exactly as it does in
+        # production instead of aborting on the first internal failure.
+        script = (
+            f'source "{self.sourceable}"; '
+            'if out=$(normalize_and_validate_task "$1"); then '
+            "  echo \"OK:$out\"; "
+            "else "
+            "  echo \"FAIL:$?\"; "
+            "fi"
+        )
+        return subprocess.run(
+            ["bash", "-c", script, "_", raw_input],
+            env=self.env(),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    def test_unbalanced_quote_input_never_leaks_xargs_diagnostic(self):
+        result = self._call("O'Brien task")
+        self.assertNotIn("xargs", result.stderr)
+        self.assertNotIn("unterminated quote", result.stderr)
+
+    def test_valid_key_still_accepted_with_clean_stderr(self):
+        result = self._call("abc-123")
+        self.assertEqual(result.stdout.strip(), "OK:ABC-123")
+        self.assertEqual(result.stderr.strip(), "")
+
+    def test_another_unbalanced_quote_variant_stays_clean(self):
+        result = self._call('task "unterminated')
+        self.assertNotIn("xargs", result.stderr)
+        self.assertNotIn("unterminated quote", result.stderr)
 
 
 if __name__ == "__main__":

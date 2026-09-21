@@ -1,7 +1,7 @@
 # copilot-cli-toolkit
 
 Personal-workflow tooling for the [GitHub Copilot CLI](https://github.com/github/copilot-cli):
-a session manager with automatic per-Jira-ticket usage/cost reporting, and a
+a session manager with automatic per-task usage/cost reporting, and a
 6-role multi-agent implementation pipeline (planner → coder → reviewer →
 fixer → tester → test-reviewer).
 
@@ -12,7 +12,7 @@ pipeline, or vice versa.
 
 The Copilot CLI is powerful but, out of the box, gives you no persistent
 cross-directory session list, no automatic usage/cost accounting tied to
-your actual ticket work, and no opinionated structure for multi-step
+your actual task work, and no opinionated structure for multi-step
 implementation tasks. This toolkit adds all three as a thin, inspectable
 layer around the stock CLI — it never forks or patches `copilot` itself.
 
@@ -21,10 +21,10 @@ layer around the stock CLI — it never forks or patches `copilot` itself.
 - **Global session manager** (`copilot-s`) — list, resume, rename, and
   delete Copilot CLI sessions across every directory, not just the one
   you're in.
-- **Automatic per-Jira-ticket usage reports** — every session exit appends
+- **Automatic per-task usage reports** — every session exit appends
   token counts, model-call time, reasoning-effort intent, and an estimated
-  USD cost to a cumulative Markdown report for the ticket associated with
-  your current git branch.
+  USD cost to a cumulative Markdown report for the task associated with
+  your current git branch (or a free-form task name/ID you provide).
 - **6-role agent pipeline** — `planner`, `coder`, `reviewer`, `fixer`,
   `tester`, `test-reviewer`, wired together by an orchestrator so
   non-trivial tasks get planned, implemented, reviewed, tested, and
@@ -43,10 +43,10 @@ flowchart LR
     CS["copilot-s"] -->|launches, sets OTEL env| COPILOT["copilot CLI"]
     COPILOT --> OTEL["OTEL span files"]
     COPILOT --> EVENTS["events.jsonl"]
-    CS -->|on exit: ingest| HELPER["copilot-jira-report.py"]
+    CS -->|on exit: ingest| HELPER["copilot-task-report.py"]
     OTEL --> HELPER
     EVENTS --> HELPER
-    HELPER --> REPORT["Markdown usage report\nper Jira ticket"]
+    HELPER --> REPORT["Markdown usage report\nper task"]
 ```
 
 See [`docs/architecture.md`](docs/architecture.md) for the full breakdown,
@@ -55,7 +55,7 @@ including the multi-agent pipeline diagram and ingest/idempotency design.
 ## Example report output
 
 ```markdown
-# Copilot Jira Usage Report — ABC-123
+# Copilot Task Usage Report — ABC-123
 
 - Report last updated: 2026-09-20T14:03:11Z
 - First recorded: 2026-09-18T09:12:45Z
@@ -80,7 +80,7 @@ including the multi-agent pipeline diagram and ingest/idempotency design.
 | gpt-5.4-mini | 12 | 35,717 | $0.42 |
 ```
 
-(Illustrative — no real ticket IDs, tokens, or costs; generated from
+(Illustrative — no real task IDs, tokens, or costs; generated from
 synthetic data for documentation purposes.)
 
 ## Requirements
@@ -90,7 +90,7 @@ synthetic data for documentation purposes.)
 - Python 3.7+ (stdlib only — no dependencies to install).
 - [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`)
   installed and on `PATH`.
-- `git` (for Jira-key-from-branch detection, and for `scripts/update.sh`).
+- `git` (for task-key-from-branch detection, and for `scripts/update.sh`).
 
 ## Quick install
 
@@ -105,10 +105,10 @@ This installs:
 
 | What | Installed to | Method |
 |---|---|---|
-| `copilot-s`, `copilot-jira-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
+| `copilot-s`, `copilot-task-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
 | 6 agent definitions | `~/.copilot/agents/` | symlink (or copy with `--copy`) |
 | Orchestrator instructions | `~/.copilot/copilot-instructions.md` | symlink (or copy with `--copy`) |
-| Pricing table | `~/.copilot/jira-reports/model-pricing.json` | **copied once, only if absent** — your edits are never overwritten |
+| Pricing table | `~/.copilot/task-reports/model-pricing.json` | **copied once, only if absent** — your edits are never overwritten |
 
 Make sure `~/.local/bin` is on your `PATH`. Any pre-existing file at an
 install destination is backed up (never deleted) before being replaced —
@@ -131,7 +131,9 @@ see `scripts/install.sh --help`.
 ```bash
 copilot-s                     # list sessions relevant to the current directory
 copilot-s --all               # list every session, across all directories
-copilot-s --report ABC-123    # print/regenerate the cumulative usage report for a ticket
+copilot-s --report ABC-123    # print/regenerate the cumulative usage report for a task
+copilot-s --task ABC-123      # alias for --report (kept for convenience; --report is
+                               # the canonical/documented flag name for this toolkit)
 copilot-s --help               # show usage/features and exit (safe: never launches copilot)
 copilot-s --version | -v       # print the copilot-s version and exit (safe: never launches copilot)
 ```
@@ -140,23 +142,33 @@ From the session list you can resume, rename, or delete sessions
 (single/range/multi-select). On exiting a `copilot` session you'll be
 prompted to keep, rename, or delete it.
 
-## Jira usage reporting
+## Task usage reporting
 
-### How ticket attribution works
+> **Upgrading from a pre-2.0 checkout?** This was previously Jira-specific
+> (`copilot-jira-report.py`, `~/.copilot/jira-reports/`,
+> `~/Desktop/CopilotJiraTaskReports`). 2.0.0 renames everything to generic
+> "task" terminology with no compatibility shim — but your existing data
+> is migrated automatically and idempotently the first time you run
+> `scripts/install.sh` or use `copilot-s`/`copilot-task-report.py` after
+> upgrading. See the [CHANGELOG's 2.0.0 entry](CHANGELOG.md) for exactly
+> what moves and how conflicts/edits are preserved.
 
-1. `copilot-s` tries to extract a Jira-style key (`ABC-123`) from your
-   current git branch name.
+### How task attribution works
+
+1. `copilot-s` tries to extract a conservative `KEY-123`-style ID (e.g. an
+   issue-tracker key) from your current git branch name.
 2. If that fails and it's a resumed session, it falls back to the branch
    stored when that session was created.
 3. If that fails and it's a **brand-new** session, you're prompted once
-   (with input validation and retries); leaving it blank assigns
-   `UNASSIGNED`. Resumed sessions are never re-prompted.
+   for a task ID or free-form task name (with input validation and
+   retries); leaving it blank assigns `UNASSIGNED`. Resumed sessions are
+   never re-prompted.
 
 ### Configuration
 
-- `COPILOT_JIRA_REPORTS_DIR` — override where Markdown reports are written
-  (default: `~/Desktop/CopilotJiraTaskReports`).
-- `~/.copilot/jira-reports/model-pricing.json` — edit freely to add new
+- `COPILOT_TASK_REPORTS_DIR` — override where Markdown reports are written
+  (default: `~/Desktop/CopilotTaskReports`).
+- `~/.copilot/task-reports/model-pricing.json` — edit freely to add new
   models, correct rates, or map an alternate model id to an existing priced
   entry via the `aliases` map. This file is never overwritten by
   `scripts/install.sh` once it exists.
@@ -187,6 +199,19 @@ prompted to keep, rename, or delete it.
 - The estimated USD cost is an independent approximation from a
   locally-maintained pricing table — not an official Copilot invoice, and
   it will drift from actual billing.
+- **Legacy Desktop-reports migration only looks in the hardcoded default
+  pre-2.0 location** (`~/Desktop/CopilotJiraTaskReports`). If you had
+  customized the old `COPILOT_JIRA_REPORTS_DIR` env var to point your
+  legacy reports somewhere else, that custom location is **not**
+  auto-discovered (the env var itself is gone in 2.0.0 — see the
+  [CHANGELOG](CHANGELOG.md) — so there is nothing left for this toolkit to
+  read it from), and those reports will **not** be migrated automatically.
+  If this applies to you, move/copy your old reports directory to the
+  default `~/Desktop/CopilotJiraTaskReports` path yourself before first
+  running `scripts/install.sh` or `copilot-s` after upgrading, so the
+  automatic migration picks them up; otherwise they're simply left where
+  they are (never deleted, but also never merged into the new
+  `~/Desktop/CopilotTaskReports` location).
 - Copilot-internal nano-AIU/premium-request figures are opaque accounting
   units reported by Copilot itself, kept separate from the USD estimate.
 
@@ -229,8 +254,8 @@ Verify the pipeline is loaded:
 
 | Setting | Where | Default |
 |---|---|---|
-| Jira reports directory | `COPILOT_JIRA_REPORTS_DIR` env var | `~/Desktop/CopilotJiraTaskReports` |
-| Model pricing | `~/.copilot/jira-reports/model-pricing.json` | copied from `config/model-pricing.json` on first install |
+| Task reports directory | `COPILOT_TASK_REPORTS_DIR` env var | `~/Desktop/CopilotTaskReports` |
+| Model pricing | `~/.copilot/task-reports/model-pricing.json` | copied from `config/model-pricing.json` on first install |
 | Executables install prefix | `scripts/install.sh --prefix DIR` | `~/.local/bin` |
 | Install method | `scripts/install.sh --copy` | symlink |
 
@@ -239,9 +264,9 @@ Verify the pipeline is loaded:
 - Everything runs locally; no telemetry is sent anywhere by this toolkit
   itself (the Copilot CLI's own telemetry is a separate concern — see
   GitHub's documentation).
-- Jira keys, tokens, and cost data are stored only in your own
-  `~/.copilot/jira-reports/` directory and your reports directory — nothing
-  is transmitted or shared by these scripts.
+- Task IDs, tokens, and cost data are stored only in your own
+  `~/.copilot/task-reports/` directory and your reports directory —
+  nothing is transmitted or shared by these scripts.
 - The pricing table contains only public, independent list-price
   approximations — no account, billing, or credential data.
 - See [`SECURITY.md`](SECURITY.md) for how to report a vulnerability.
@@ -256,7 +281,7 @@ scripts/uninstall.sh --restore-backups   # also restore whatever was backed up a
 scripts/update.sh                        # git pull --ff-only, then re-run the installer
 ```
 
-Uninstalling never touches Jira usage reports, ticket/session ingest state,
+Uninstalling never touches usage reports, task/session ingest state,
 your pricing config, or Copilot session state — only the symlinks/copies
 this toolkit created.
 
@@ -265,13 +290,13 @@ this toolkit created.
 - [ ] Optional Homebrew formula / package for install.
 - [ ] Linux CI coverage expansion beyond current smoke tests (broader shell
       matrix).
-- [ ] Pluggable ticket-tracker backends beyond Jira-style keys.
+- [ ] Pluggable issue-tracker backends beyond `KEY-123`-style keys.
 
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md). Issues and PRs are welcome —
 please run `python3 -m unittest discover -s tests -v` (covers both
-`tests.test_copilot_jira_report` and `tests.test_copilot_s`) and
+`tests.test_copilot_task_report` and `tests.test_copilot_s`) and
 `bash -n bin/copilot-s scripts/*.sh` before submitting.
 
 ## License
