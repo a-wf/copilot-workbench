@@ -1,0 +1,886 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+# Copilot Session Manager
+# Global session tracking in ~/.copilot-sessions with per-directory filtering.
+# Format: session_id|name|timestamp|cwd
+
+COPILOT_S_VERSION="1.0.0"
+
+SESSIONS_FILE="$HOME/.copilot-sessions"
+SESSION_STATE_DIR="$HOME/.copilot/session-state"
+SHOW_ALL=false
+FILTERED_FILE=""
+
+COPILOT_OTEL_DIR="$HOME/.copilot/otel"
+
+# Set up OTEL export (creates $COPILOT_OTEL_DIR and exports env vars used by
+# `copilot` for telemetry). Deliberately NOT called at script load time: it
+# has filesystem side effects (mkdir), so it must only run once we know
+# we're past --help/--version handling and are actually about to do
+# session-manager work (list sessions, launch `copilot`, etc). This keeps
+# `copilot-s --help`/`--version` side-effect-free.
+setup_otel() {
+  mkdir -p "$COPILOT_OTEL_DIR"
+  export COPILOT_OTEL_ENABLED=true
+  export COPILOT_OTEL_EXPORTER_TYPE=file
+  COPILOT_OTEL_RUN_TS="$(date +%Y%m%d-%H%M%S)"
+  export COPILOT_OTEL_FILE_EXPORTER_PATH="$COPILOT_OTEL_DIR/copilot-otel-$COPILOT_OTEL_RUN_TS.jsonl"
+}
+
+# --- Locate this script's own real (symlink-resolved) directory ---
+# Works whether copilot-s is invoked as a symlink (default `install.sh`
+# mode, pointing back into the repo checkout) or as a plain copy
+# (`install.sh --copy`), and regardless of --prefix, because the Jira
+# report helper is always installed as a sibling file right next to this
+# script by scripts/install.sh.
+resolve_script_dir() {
+  local src="${BASH_SOURCE[0]}"
+  local dir
+  while [[ -L "$src" ]]; do
+    dir="$(cd -P "$(dirname "$src")" && pwd)"
+    src="$(readlink "$src")"
+    [[ "$src" != /* ]] && src="$dir/$src"
+  done
+  (cd -P "$(dirname "$src")" && pwd)
+}
+SCRIPT_DIR="$(resolve_script_dir)"
+
+# --- Jira usage reporting ---
+# Resolution order:
+#   1. COPILOT_JIRA_REPORT_HELPER env override (explicit escape hatch).
+#   2. Sibling copilot-jira-report.py next to this script's real location
+#      (correct for both symlink and --copy installs, any --prefix).
+#   3. Fallback to the conventional ~/.local/bin path, in case this script
+#      is being run directly from a checkout without a helper alongside it.
+if [[ -n "${COPILOT_JIRA_REPORT_HELPER:-}" ]]; then
+  JIRA_REPORT_HELPER="$COPILOT_JIRA_REPORT_HELPER"
+elif [[ -f "$SCRIPT_DIR/copilot-jira-report.py" ]]; then
+  JIRA_REPORT_HELPER="$SCRIPT_DIR/copilot-jira-report.py"
+else
+  JIRA_REPORT_HELPER="$HOME/.local/bin/copilot-jira-report.py"
+fi
+JIRA_KEY_REGEX='[A-Z][A-Z0-9]+-[0-9]+'
+# Reports directory can be overridden with COPILOT_JIRA_REPORTS_DIR; this is
+# only used for the informational message below (the Python helper is the
+# actual source of truth for where reports are written).
+JIRA_REPORTS_DIR_DISPLAY="${COPILOT_JIRA_REPORTS_DIR:-$HOME/Desktop/CopilotJiraTaskReports}"
+
+BOLD='\033[1m'
+DIM='\033[2m'
+CYAN='\033[36m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+RESET='\033[0m'
+
+cleanup() {
+  if [[ -n "${FILTERED_FILE:-}" ]] && [[ -f "$FILTERED_FILE" ]]; then
+    rm -f "$FILTERED_FILE"
+  fi
+}
+trap cleanup EXIT
+
+# Replace $HOME with ~ for display
+short_path() {
+  echo "${1/#$HOME/\~}"
+}
+
+# Format an ISO-ish "YYYY-MM-DDTHH:MM:SS[.fff]" timestamp for display.
+# Supports both BSD date (macOS, `date -j -f`) and GNU date (Linux, `date -d`).
+# Falls back to a raw substring if neither parses successfully.
+format_timestamp() {
+  local raw="${1:-}"
+  local trimmed="${raw%%.*}"
+  [[ -z "$trimmed" ]] && return 0
+  local out=""
+  if out=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$trimmed" "+%Y-%m-%d %H:%M" 2>/dev/null); then
+    echo "$out"
+    return 0
+  fi
+  if out=$(date -d "$trimmed" "+%Y-%m-%d %H:%M" 2>/dev/null); then
+    echo "$out"
+    return 0
+  fi
+  echo "${raw:0:16}"
+}
+
+# Read a line from the terminal, safe against EOF and leftover stdin
+prompt_read() {
+  local varname="$1"
+  local result=""
+  # shellcheck disable=SC2034  # read via eval below, not a direct reference
+  result=$(head -n1 < /dev/tty 2>/dev/null) || true
+  eval "$varname=\$result"
+}
+
+# Drain any leftover bytes in /dev/tty after copilot exits
+flush_stdin() {
+  local dummy=""
+  # shellcheck disable=SC2034  # value is intentionally discarded
+  while IFS= read -r -t 0.2 dummy < /dev/tty 2>/dev/null; do true; done
+  return 0
+}
+
+# --- Jira ticket resolution (for usage reporting) ---
+# Extract a Jira-style key (e.g. ABC-123) from a branch name, if present.
+# Branch names can contain lowercase segments (e.g. "feature/abc-123-foo"),
+# so normalize to uppercase before matching/returning.
+extract_jira_from_branch() {
+  local branch="${1:-}"
+  [[ -z "$branch" ]] && return 1
+  local upper
+  upper=$(echo "$branch" | tr '[:lower:]' '[:upper:]')
+  if [[ "$upper" =~ $JIRA_KEY_REGEX ]]; then
+    echo "${BASH_REMATCH[0]}"
+    return 0
+  fi
+  return 1
+}
+
+# Validate/normalize a Jira key: uppercase it, then check it matches the
+# expected KEY-NUMBER shape. Prints the normalized key and returns 0 on
+# success; returns 1 (no output) if invalid.
+normalize_and_validate_jira() {
+  local raw="${1:-}"
+  [[ -z "$raw" ]] && return 1
+  local upper
+  upper=$(echo "$raw" | tr '[:lower:]' '[:upper:]' | xargs)
+  if [[ "$upper" =~ ^${JIRA_KEY_REGEX}$ ]]; then
+    echo "$upper"
+    return 0
+  fi
+  return 1
+}
+
+current_git_branch() {
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || true
+}
+
+# Read the branch recorded for an existing (possibly resumed) session.
+session_stored_branch() {
+  local session_dir="$1"
+  [[ -f "$session_dir/workspace.yaml" ]] || return 1
+  grep '^branch:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^branch: *//'
+}
+
+# Determine the Jira key to attribute usage to for this invocation.
+#   $1 = session_id (empty if this is about to be a brand-new session)
+# Prints the resolved key (or empty string to let the report helper reuse
+# whatever it last knew for this session / fall back to UNASSIGNED).
+resolve_jira_key() {
+  local session_id="${1:-}"
+  local jira="" branch=""
+
+  branch=$(current_git_branch)
+  jira=$(extract_jira_from_branch "$branch") || true
+
+  if [[ -z "$jira" && -n "$session_id" ]]; then
+    branch=$(session_stored_branch "$SESSION_STATE_DIR/$session_id") || true
+    jira=$(extract_jira_from_branch "$branch") || true
+  fi
+
+  if [[ -z "$jira" && -z "$session_id" ]]; then
+    # Brand-new session with no detectable Jira key: ask (re-prompting on
+    # invalid input rather than silently accepting/mangling it).
+    local attempts=0 input="" normalized=""
+    while [[ $attempts -lt 3 ]]; do
+      echo -ne "${YELLOW}No Jira ticket detected on this branch. Jira key for usage tracking (Enter to skip): ${RESET}" >&2
+      prompt_read input
+      if [[ -z "$input" ]]; then
+        jira="UNASSIGNED"
+        break
+      fi
+      if normalized=$(normalize_and_validate_jira "$input"); then
+        jira="$normalized"
+        break
+      fi
+      echo -e "${RED}Invalid Jira key '${input}'. Expected format like ABC-123.${RESET}" >&2
+      attempts=$((attempts + 1))
+    done
+    if [[ -z "$jira" ]]; then
+      echo -e "${YELLOW}Too many invalid attempts; defaulting to UNASSIGNED.${RESET}" >&2
+      jira="UNASSIGNED"
+    fi
+  fi
+
+  echo "$jira"
+}
+
+# Non-interactive Jira key resolution for batch contexts (multi-select
+# delete): never prompts. Falls back to whatever the Jira report helper
+# already has on file for this session (via the python state), or
+# UNASSIGNED if nothing is known — the helper itself preserves any
+# previously-resolved key when passed an empty --jira.
+resolve_jira_key_noninteractive() {
+  local session_id="${1:-}"
+  local branch=""
+  branch=$(session_stored_branch "$SESSION_STATE_DIR/$session_id") || true
+  extract_jira_from_branch "$branch" || true
+}
+
+# Ingest this run's usage into the per-ticket Jira report. Never fails hard:
+# any error is downgraded to a warning so keep/rename/delete flows always run.
+update_jira_report() {
+  local session_id="${1:-}" jira_key="${2:-}"
+  [[ -z "$session_id" ]] && return 0
+  if [[ ! -f "$JIRA_REPORT_HELPER" ]]; then
+    echo -e "${YELLOW}Warning: Jira report helper not found at $JIRA_REPORT_HELPER — usage reporting skipped for this session. Set COPILOT_JIRA_REPORT_HELPER or re-run the installer.${RESET}" >&2
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo -e "${YELLOW}Warning: python3 not found — Jira usage reporting skipped.${RESET}" >&2; return 0; }
+
+  local session_dir="$SESSION_STATE_DIR/$session_id"
+  local out
+  if ! out=$(python3 "$JIRA_REPORT_HELPER" ingest \
+      --session-id "$session_id" \
+      --jira "$jira_key" \
+      --session-dir "$session_dir" 2>&1); then
+    echo -e "${YELLOW}Warning: Jira usage report update failed (session kept/renamed/deleted normally):${RESET} ${out}" >&2
+  fi
+  return 0
+}
+
+# --- Session name resolution ---
+# Priority: saved name > workspace.yaml name/summary > first user message > dir name
+get_session_name() {
+  local session_dir="$1"
+  local yaml="$session_dir/workspace.yaml"
+  local events="$session_dir/events.jsonl"
+
+  # Try workspace.yaml fields
+  if [[ -f "$yaml" ]]; then
+    local name summary
+    name=$(grep '^name:' "$yaml" 2>/dev/null | sed 's/^name: *//' || true)
+    summary=$(grep '^summary:' "$yaml" 2>/dev/null | sed 's/^summary: *//' || true)
+
+    if [[ -n "$name" && "$name" != "exit" && "$name" != "q" ]]; then
+      echo "$name"; return
+    fi
+    if [[ -n "$summary" && "$summary" != "exit" && "$summary" != "q" ]]; then
+      echo "$summary"; return
+    fi
+  fi
+
+  # Try first user message from events
+  if [[ -f "$events" ]]; then
+    local first_msg
+    # Pass the events path as argv[1] rather than interpolating it into the
+    # Python source string, so paths containing quotes/backslashes/etc.
+    # can never break out of the string literal or inject code.
+    first_msg=$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    for line in f:
+        try:
+            e = json.loads(line)
+            if e.get('type') == 'user.message':
+                msg = e.get('data', {}).get('content', '').strip()
+                if msg and msg.lower() not in ('exit', 'quit', 'q', '/exit', '/quit'):
+                    msg = msg.split(chr(10))[0][:50]
+                    if len(msg) == 50:
+                        msg = msg[:47] + '...'
+                    print(msg)
+                    break
+        except Exception:
+            pass
+" "$events" 2>/dev/null || true)
+    if [[ -n "$first_msg" ]]; then
+      echo "$first_msg"; return
+    fi
+  fi
+
+  # Fallback: directory name
+  if [[ -f "$yaml" ]]; then
+    local cwd
+    cwd=$(grep '^cwd:' "$yaml" 2>/dev/null | sed 's/^cwd: *//' || true)
+    if [[ -n "$cwd" ]]; then
+      echo "$(basename "$cwd") session"; return
+    fi
+  fi
+
+  echo "unnamed"
+}
+
+# --- Save / update a session entry ---
+save_session() {
+  local session_id="$1" name="$2" timestamp="$3" cwd="$4"
+  local force="${5:-false}"
+
+  # Update existing entry
+  if [[ -f "$SESSIONS_FILE" ]] && grep -q "^${session_id}|" "$SESSIONS_FILE" 2>/dev/null; then
+    local existing_name
+    existing_name=$(grep "^${session_id}|" "$SESSIONS_FILE" | head -1 | cut -d'|' -f2)
+    local should_update=false
+    if [[ "$force" == "true" ]]; then
+      should_update=true
+    elif [[ "$existing_name" == "unnamed" || -z "$existing_name" ]] && [[ "$name" != "unnamed" && -n "$name" ]]; then
+      should_update=true
+    fi
+    if [[ "$should_update" == "true" ]]; then
+      local tmp
+      tmp=$(mktemp)
+      while IFS='|' read -r eid ename ets ecwd; do
+        [[ -z "$eid" ]] && continue
+        if [[ "$eid" == "$session_id" ]]; then
+          echo "${session_id}|${name}|${timestamp}|${cwd}"
+        else
+          echo "${eid}|${ename}|${ets}|${ecwd}"
+        fi
+      done < "$SESSIONS_FILE" > "$tmp"
+      mv "$tmp" "$SESSIONS_FILE"
+    fi
+    return
+  fi
+
+  # New entry
+  echo "${session_id}|${name}|${timestamp}|${cwd}" >> "$SESSIONS_FILE"
+}
+
+# --- Refresh stale names in the sessions file ---
+refresh_session_names() {
+  [[ -f "$SESSIONS_FILE" ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  while IFS='|' read -r id name timestamp cwd; do
+    [[ -z "$id" ]] && continue
+    # Backfill cwd if missing (migration from old format)
+    if [[ -z "$cwd" ]] && [[ -d "$SESSION_STATE_DIR/$id" ]]; then
+      cwd=$(grep '^cwd:' "$SESSION_STATE_DIR/$id/workspace.yaml" 2>/dev/null | sed 's/^cwd: *//' || true)
+    fi
+    # Refresh unnamed entries
+    if [[ "$name" == "unnamed" || -z "$name" ]] && [[ -d "$SESSION_STATE_DIR/$id" ]]; then
+      name=$(get_session_name "$SESSION_STATE_DIR/$id")
+    fi
+    echo "${id}|${name}|${timestamp}|${cwd}"
+  done < "$SESSIONS_FILE" > "$tmp"
+  mv "$tmp" "$SESSIONS_FILE"
+}
+
+# --- Detect which session copilot just used ---
+detect_new_session() {
+  local before_file="$1"
+
+  # Check for newly created session dirs
+  for dir in "$SESSION_STATE_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    local id
+    id=$(basename "$dir")
+    if ! grep -q "^${id}$" "$before_file" 2>/dev/null; then
+      local yaml="$dir/workspace.yaml"
+      if [[ -f "$yaml" ]]; then
+        local cwd
+        cwd=$(grep '^cwd:' "$yaml" 2>/dev/null | sed 's/^cwd: *//' || true)
+        if [[ "$cwd" == "$PWD" ]]; then
+          echo "$id"; return
+        fi
+      fi
+    fi
+  done
+}
+
+# --- Import any sessions from copilot state not yet tracked ---
+sync_sessions() {
+  [[ -d "$SESSION_STATE_DIR" ]] || return 0
+  touch "$SESSIONS_FILE"
+  for dir in "$SESSION_STATE_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    local id
+    id=$(basename "$dir")
+    # Skip if already tracked
+    grep -q "^${id}|" "$SESSIONS_FILE" 2>/dev/null && continue
+    local yaml="$dir/workspace.yaml"
+    [[ -f "$yaml" ]] || continue
+    local cwd created_at
+    cwd=$(grep '^cwd:' "$yaml" 2>/dev/null | sed 's/^cwd: *//' || true)
+    created_at=$(grep '^created_at:' "$yaml" 2>/dev/null | sed 's/^created_at: *//' || true)
+    local display_name
+    display_name=$(get_session_name "$dir")
+    echo "${id}|${display_name}|${created_at}|${cwd}" >> "$SESSIONS_FILE"
+  done
+}
+
+# --- Display session list ---
+list_sessions() {
+  sync_sessions
+
+  if [[ ! -f "$SESSIONS_FILE" ]] || [[ ! -s "$SESSIONS_FILE" ]]; then
+    return 1
+  fi
+
+  refresh_session_names
+
+  # Clean up previous filtered file if any
+  if [[ -n "${FILTERED_FILE:-}" ]] && [[ -f "$FILTERED_FILE" ]]; then
+    rm -f "$FILTERED_FILE"
+  fi
+  FILTERED_FILE=$(mktemp)
+
+  local has_entries=false
+  while IFS='|' read -r id name timestamp cwd; do
+    [[ -z "$id" ]] && continue
+    if [[ "$SHOW_ALL" == "true" ]] || [[ "$cwd" == "$PWD" ]]; then
+      echo "${id}|${name}|${timestamp}|${cwd}" >> "$FILTERED_FILE"
+      has_entries=true
+    fi
+  done < "$SESSIONS_FILE"
+
+  if [[ "$has_entries" == "false" ]]; then
+    rm -f "$FILTERED_FILE"
+    FILTERED_FILE=""
+    return 1
+  fi
+
+  if [[ "$SHOW_ALL" == "true" ]]; then
+    echo -e "\n${BOLD}${CYAN}╔══ All Sessions ══╗${RESET}"
+  else
+    echo -e "\n${BOLD}${CYAN}╔══ Sessions ($(short_path "$PWD")) ══╗${RESET}"
+  fi
+  echo ""
+
+  local i=1
+  while IFS='|' read -r id name timestamp cwd; do
+    [[ -z "$id" ]] && continue
+    local short_id="${id:0:8}"
+    local display_date=""
+    if [[ -n "$timestamp" ]]; then
+      display_date=$(format_timestamp "$timestamp")
+    fi
+
+    local status
+    if [[ -d "$SESSION_STATE_DIR/$id" ]]; then
+      status="${GREEN}●${RESET} "
+    else
+      status="${DIM}○${RESET} "
+    fi
+
+    local dir_info=""
+    if [[ "$SHOW_ALL" == "true" && -n "$cwd" ]]; then
+      dir_info="  ${DIM}$(short_path "$cwd")${RESET}"
+    fi
+
+    echo -e "  ${status}${BOLD}${i})${RESET} ${name:-unnamed}  ${DIM}[${short_id}…]  ${display_date}${RESET}${dir_info}"
+    i=$((i + 1))
+  done < "$FILTERED_FILE"
+
+  echo ""
+  if [[ "$SHOW_ALL" != "true" ]]; then
+    echo -e "  ${BOLD}${CYAN}a)${RESET} Show all sessions"
+  fi
+  echo -e "  ${BOLD}${GREEN}n)${RESET} New session"
+  echo -e "  ${BOLD}${YELLOW}d)${RESET} Delete a session"
+  echo -e "  ${BOLD}q)${RESET} Quit"
+  echo ""
+  return 0
+}
+
+# --- Post-session: keep/delete then rename ---
+post_session() {
+  local session_id="${1:-}"
+  local jira_key="${2:-}"
+  [[ -z "$session_id" ]] && return 0
+
+  local session_dir="$SESSION_STATE_DIR/$session_id"
+  [[ -d "$session_dir" ]] || return 0
+
+  # Update the Jira usage report FIRST, while events.jsonl still exists on
+  # disk — this must run regardless of whether the user then keeps, renames,
+  # or deletes the session below, and must never abort this script.
+  update_jira_report "$session_id" "$jira_key"
+
+  local created_at cwd
+  created_at=$(grep '^created_at:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^created_at: *//' || true)
+  cwd=$(grep '^cwd:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^cwd: *//' || true)
+
+  # Prefer user's previously saved name
+  local display_name=""
+  if [[ -f "$SESSIONS_FILE" ]]; then
+    display_name=$(grep "^${session_id}|" "$SESSIONS_FILE" 2>/dev/null | head -1 | cut -d'|' -f2 || true)
+  fi
+  if [[ -z "$display_name" || "$display_name" == "unnamed" ]]; then
+    display_name=$(get_session_name "$session_dir")
+  fi
+
+  echo ""
+  echo -e "${BOLD}Session:${RESET} ${display_name}  ${DIM}[${session_id:0:8}…]${RESET}"
+  echo -ne "  ${GREEN}k)${RESET} Keep  ${YELLOW}r)${RESET} Rename  ${RED}d)${RESET} Delete  ${DIM}[K/r/d]:${RESET} "
+  local action=""
+  prompt_read action
+
+  case "${action:-}" in
+    d|D)
+      # Remove from sessions file
+      if [[ -f "$SESSIONS_FILE" ]]; then
+        local tmp
+        tmp=$(mktemp)
+        while IFS='|' read -r eid ename ets ecwd; do
+          [[ -z "$eid" ]] && continue
+          if [[ "$eid" != "$session_id" ]]; then
+            echo "${eid}|${ename}|${ets}|${ecwd}"
+          fi
+        done < "$SESSIONS_FILE" > "$tmp"
+        mv "$tmp" "$SESSIONS_FILE"
+      fi
+      # Remove from disk
+      rm -rf "$session_dir"
+      echo -e "${RED}Session deleted.${RESET}"
+      ;;
+    r|R)
+      echo -ne "${YELLOW}New name: ${RESET}"
+      local new_name=""
+      prompt_read new_name
+      if [[ -n "$new_name" ]]; then
+        display_name="$new_name"
+      fi
+      save_session "$session_id" "$display_name" "$created_at" "$cwd" "true"
+      echo -e "${GREEN}Session saved:${RESET} ${display_name} ${DIM}[${session_id:0:8}…]${RESET}"
+      ;;
+    *)
+      # Keep with current name (default)
+      save_session "$session_id" "$display_name" "$created_at" "$cwd"
+      echo -e "${GREEN}Session kept:${RESET} ${display_name} ${DIM}[${session_id:0:8}…]${RESET}"
+      ;;
+  esac
+}
+
+# --- Launch copilot ---
+run_copilot() {
+  local session_id="${1:-}"
+  shift 2>/dev/null || true
+
+  # Resolve which Jira ticket this run's usage should be attributed to,
+  # before copilot starts (prompts once only for a brand-new session with no
+  # Jira key detectable from the branch).
+  local jira_key
+  jira_key=$(resolve_jira_key "$session_id")
+
+  # Snapshot existing session dirs
+  local before_file
+  before_file=$(mktemp)
+  if [[ -d "$SESSION_STATE_DIR" ]]; then
+    ls "$SESSION_STATE_DIR" > "$before_file" 2>/dev/null || true
+  fi
+
+  echo -e "${CYAN}Starting copilot...${RESET}\n"
+  if [[ -n "$session_id" ]]; then
+    copilot --resume="$session_id" "$@" || true
+  else
+    copilot "$@" || true
+  fi
+
+  flush_stdin
+
+  # Figure out which session was used
+  local detected_id
+  detected_id=$(detect_new_session "$before_file") || true
+  rm -f "$before_file"
+
+  local final_id="${detected_id:-$session_id}"
+  post_session "${final_id:-}" "$jira_key"
+  exit 0
+}
+
+# --- Delete sessions ---
+delete_session() {
+  echo -e "${YELLOW}Enter session numbers to delete:${RESET}"
+  echo -e "  ${DIM}Examples: 1 3 5 · 1-5 · 2 7-10 · all${RESET}"
+  echo -ne "${YELLOW}> ${RESET}"
+  local del_input=""
+  prompt_read del_input
+
+  if [[ -z "$del_input" ]]; then
+    echo "Cancelled."
+    return
+  fi
+
+  # Build list of line numbers to delete
+  local total
+  total=$(wc -l < "$FILTERED_FILE" | tr -d ' ')
+  local numbers=()
+
+  if [[ "$del_input" == "all" ]]; then
+    local n=1
+    while [[ $n -le $total ]]; do
+      numbers+=("$n")
+      n=$((n + 1))
+    done
+  else
+    for token in $del_input; do
+      if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        local from="${BASH_REMATCH[1]}" to="${BASH_REMATCH[2]}"
+        local n=$from
+        while [[ $n -le $to ]]; do
+          numbers+=("$n")
+          n=$((n + 1))
+        done
+      elif [[ "$token" =~ ^[0-9]+$ ]]; then
+        numbers+=("$token")
+      fi
+    done
+  fi
+
+  if [[ ${#numbers[@]} -eq 0 ]]; then
+    echo "Cancelled."
+    return
+  fi
+
+  # Collect sessions to delete and preview them
+  local del_ids=()
+  local del_names=()
+  echo ""
+  for num in "${numbers[@]}"; do
+    local line
+    line=$(sed -n "${num}p" "$FILTERED_FILE" 2>/dev/null) || true
+    if [[ -n "$line" ]]; then
+      local did dname
+      did=$(echo "$line" | cut -d'|' -f1)
+      dname=$(echo "$line" | cut -d'|' -f2)
+      del_ids+=("$did")
+      del_names+=("$dname")
+      echo -e "  ${RED}✕${RESET} ${dname}  ${DIM}[${did:0:8}…]${RESET}"
+    fi
+  done
+
+  if [[ ${#del_ids[@]} -eq 0 ]]; then
+    echo "No valid sessions selected."
+    return
+  fi
+
+  echo ""
+  echo -ne "${RED}Delete ${#del_ids[@]} session(s) and their history? (y/N): ${RESET}"
+  local confirm=""
+  prompt_read confirm
+
+  if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    # Build lookup string of IDs to delete
+    local del_lookup=""
+    for did in "${del_ids[@]}"; do
+      del_lookup="${del_lookup}${did}:"
+    done
+
+    # Rewrite sessions file excluding deleted IDs
+    local tmp
+    tmp=$(mktemp)
+    while IFS='|' read -r eid ename ets ecwd; do
+      [[ -z "$eid" ]] && continue
+      if [[ "$del_lookup" != *"${eid}:"* ]]; then
+        echo "${eid}|${ename}|${ets}|${ecwd}"
+      fi
+    done < "$SESSIONS_FILE" > "$tmp"
+    mv "$tmp" "$SESSIONS_FILE"
+
+    # Remove session state directories from disk — but ingest any pending
+    # usage into the Jira report FIRST for each one, so bulk-deleting
+    # sessions never silently drops usage that was never ingested yet.
+    for did in "${del_ids[@]}"; do
+      if [[ -d "$SESSION_STATE_DIR/$did" ]]; then
+        local del_jira
+        del_jira=$(resolve_jira_key_noninteractive "$did")
+        update_jira_report "$did" "$del_jira"
+        rm -rf "${SESSION_STATE_DIR:?}/${did:?}"
+      fi
+    done
+
+    echo -e "${GREEN}Deleted ${#del_ids[@]} session(s). Jira usage reports for them (if any) remain at $(short_path "$JIRA_REPORTS_DIR_DISPLAY").${RESET}"
+  else
+    echo "Cancelled."
+  fi
+}
+
+# --- Interactive menu ---
+select_session() {
+  echo -ne "${BOLD}Select session to resume (or n/q): ${RESET}"
+  local choice=""
+  prompt_read choice
+
+  case "${choice:-}" in
+    q|Q)
+      echo "Bye!"
+      ;;
+    a|A)
+      SHOW_ALL=true
+      if list_sessions; then
+        select_session "$@"
+      else
+        echo -e "\n${DIM}No sessions found.${RESET}"
+      fi
+      ;;
+    n|N)
+      run_copilot "" "$@"
+      ;;
+    d|D)
+      delete_session
+      if list_sessions; then
+        select_session "$@"
+      else
+        echo -e "\n${DIM}No sessions left. Starting a new one...${RESET}\n"
+        run_copilot "" "$@"
+      fi
+      ;;
+    *)
+      if [[ "${choice:-}" =~ ^[0-9]+$ ]]; then
+        local sid
+        sid=$(sed -n "${choice}p" "$FILTERED_FILE" 2>/dev/null | cut -d'|' -f1) || true
+        if [[ -n "${sid:-}" ]]; then
+          echo -e "${GREEN}Resuming session ${sid:0:8}…${RESET}"
+          run_copilot "$sid" "$@"
+        else
+          echo "Invalid selection."
+        fi
+      else
+        echo "Invalid selection."
+      fi
+      ;;
+  esac
+}
+
+# --- Ensure the Jira-usage-reporting install marker exists ---
+# Must run BEFORE the first-ever `copilot` invocation from this script so
+# that a brand-new install's very first session counts (its events land
+# after installed_epoch), while any sessions that already existed before
+# this feature was ever used remain excluded (their events predate it).
+ensure_jira_install_marker() {
+  if [[ ! -f "$JIRA_REPORT_HELPER" ]]; then
+    echo -e "${YELLOW}Warning: Jira report helper not found at $JIRA_REPORT_HELPER — usage reporting is disabled until this is fixed. Set COPILOT_JIRA_REPORT_HELPER or re-run the installer.${RESET}" >&2
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo -e "${YELLOW}Warning: python3 not found — Jira usage reporting disabled.${RESET}" >&2; return 0; }
+  python3 "$JIRA_REPORT_HELPER" ensure-marker >/dev/null 2>&1 || true
+}
+
+# --- Help / usage ---
+# Safe to run at any time: never touches sessions, never prompts, never
+# launches `copilot`. Exits immediately after printing.
+show_help() {
+  echo -e "$(cat <<EOF
+${BOLD}copilot-s${RESET} — Copilot Session Manager (v${COPILOT_S_VERSION})
+
+Lists and manages local Copilot CLI sessions, with per-directory filtering,
+resume/rename/delete, and optional per-Jira-ticket usage reporting.
+
+${BOLD}Usage:${RESET}
+  copilot-s                     List sessions relevant to the current directory
+  copilot-s --all | -a          List every session, across all directories
+  copilot-s --report TICKET-123 Print/regenerate the usage report for a ticket
+  copilot-s --help | -h         Show this help and exit
+  copilot-s --version | -v      Show the version and exit
+
+${BOLD}Features:${RESET}
+  - Resume, rename, or delete sessions (single/range/multi-select)
+  - Prompts to keep/rename/delete a session when \`copilot\` exits
+  - Per-ticket Jira usage reports (\`--report\`), attributed via the current
+    git branch or an interactive prompt
+
+${BOLD}Environment:${RESET}
+  COPILOT_JIRA_REPORTS_DIR       Override where Jira usage reports are written
+  COPILOT_JIRA_REPORT_HELPER     Override the path to copilot-jira-report.py
+
+Verify install with: copilot-s --help
+EOF
+)"
+}
+
+# --- Manually regenerate/display a Jira usage report ---
+show_jira_report() {
+  local ticket="${1:-}"
+  if [[ -z "$ticket" ]]; then
+    echo -e "${RED}Usage:${RESET} copilot-s --report TICKET-123" >&2
+    return 1
+  fi
+  if [[ ! -f "$JIRA_REPORT_HELPER" ]]; then
+    echo -e "${RED}Jira report helper not found:${RESET} $JIRA_REPORT_HELPER" >&2
+    return 1
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo -e "${RED}python3 not found.${RESET}" >&2; return 1; }
+  python3 "$JIRA_REPORT_HELPER" report "$ticket"
+}
+
+# --- Entry point ---
+main() {
+  # --help/--version: handle first, anywhere in argv, and exit immediately.
+  # Never prompts, never touches session/marker state, never launches
+  # `copilot`.
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --help|-h) show_help; exit 0 ;;
+      --version|-v) echo "copilot-s ${COPILOT_S_VERSION}"; exit 0 ;;
+    esac
+  done
+
+  # Past informational-argument handling: this is a real session-manager
+  # invocation, so set up OTEL telemetry (has filesystem side effects) now.
+  setup_otel
+
+  # Always ensure the install marker exists before anything else, so the
+  # very first `copilot` invocation this script ever makes is guaranteed to
+  # land after installed_epoch (first post-install session counts; nothing
+  # historical/pre-existing does).
+  ensure_jira_install_marker
+
+  # --report TICKET: regenerate/print a Jira usage report and exit
+  # immediately, bypassing the session manager entirely. Scan the full
+  # argument list (not just $1) so `--report` works regardless of position,
+  # and strip both the flag and its value from what would otherwise be
+  # passed through — --report must never reach `copilot` itself.
+  local report_ticket="" found_report=false
+  local remaining=()
+  local n=$#
+  local idx=0
+  while [[ $idx -lt $n ]]; do
+    idx=$((idx + 1))
+    local arg="${!idx}"
+    if [[ "$arg" == "--report" ]]; then
+      found_report=true
+      local next_idx=$((idx + 1))
+      if [[ $next_idx -le $n ]]; then
+        report_ticket="${!next_idx}"
+        idx=$next_idx
+      fi
+      continue
+    elif [[ "$arg" == --report=* ]]; then
+      found_report=true
+      report_ticket="${arg#--report=}"
+      continue
+    fi
+    remaining+=("$arg")
+  done
+
+  if [[ "$found_report" == "true" ]]; then
+    show_jira_report "$report_ticket"
+    exit $?
+  fi
+
+  set -- "${remaining[@]+"${remaining[@]}"}"
+
+  # Parse flags
+  local i=0
+  local passthrough=()
+  for arg in "$@"; do
+    case "$arg" in
+      --all|-a) SHOW_ALL=true ;;
+      *) passthrough[i]="$arg"; i=$((i + 1)) ;;
+    esac
+  done
+  set -- "${passthrough[@]+"${passthrough[@]}"}"
+
+  echo -e "${BOLD}${CYAN}┌──────────────────────────────┐${RESET}"
+  echo -e "${BOLD}${CYAN}│  Copilot Session Manager     │${RESET}"
+  echo -e "${BOLD}${CYAN}└──────────────────────────────┘${RESET}"
+
+  if list_sessions; then
+    select_session "$@"
+  else
+    # No local sessions — fall back to all
+    SHOW_ALL=true
+    if list_sessions; then
+      echo -e "${DIM}  No sessions for current directory. Showing all.${RESET}\n"
+      select_session "$@"
+    else
+      echo -e "\n${DIM}No saved sessions found. Starting a new one...${RESET}\n"
+      run_copilot "" "$@"
+    fi
+  fi
+}
+
+main "$@"

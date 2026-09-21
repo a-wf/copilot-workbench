@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bash syntax check
+        run: |
+          set -e
+          for f in bin/copilot-s scripts/install.sh scripts/uninstall.sh scripts/update.sh tests/test_update.sh; do
+            echo "== bash -n $f =="
+            bash -n "$f"
+          done
+
+      - name: Install shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      - name: shellcheck
+        run: |
+          shellcheck -S warning bin/copilot-s scripts/install.sh scripts/uninstall.sh scripts/update.sh tests/test_update.sh
+
+      - name: Python compile check
+        run: |
+          python3 -m py_compile bin/copilot-jira-report.py tests/test_copilot_jira_report.py tests/test_copilot_s.py
+
+      - name: Run test suite
+        run: |
+          python3 -m unittest discover -s tests -v
+
+      - name: Install smoke test (symlink mode, dry-run then real)
+        run: |
+          set -e
+          TESTHOME="$(mktemp -d)"
+          HOME="$TESTHOME" bash scripts/install.sh --dry-run
+          HOME="$TESTHOME" bash scripts/install.sh
+          test -L "$TESTHOME/.local/bin/copilot-s"
+          test -L "$TESTHOME/.local/bin/copilot-jira-report.py"
+          test -x "$TESTHOME/.local/bin/copilot-s"
+          for a in planner coder reviewer fixer tester test-reviewer; do
+            test -L "$TESTHOME/.copilot/agents/$a.agent.md"
+          done
+          test -L "$TESTHOME/.copilot/copilot-instructions.md"
+          test -f "$TESTHOME/.copilot/jira-reports/model-pricing.json"
+          test ! -L "$TESTHOME/.copilot/jira-reports/model-pricing.json"
+          # Re-run must be idempotent (no duplicate backups).
+          HOME="$TESTHOME" bash scripts/install.sh
+          echo "install smoke test OK"
+
+      - name: Install smoke test (--copy mode)
+        run: |
+          set -e
+          TESTHOME="$(mktemp -d)"
+          HOME="$TESTHOME" bash scripts/install.sh --copy
+          test -f "$TESTHOME/.local/bin/copilot-s"
+          test ! -L "$TESTHOME/.local/bin/copilot-s"
+          test -x "$TESTHOME/.local/bin/copilot-s"
+          echo "--copy install smoke test OK"
+
+      - name: Uninstall smoke test
+        run: |
+          set -e
+          TESTHOME="$(mktemp -d)"
+          mkdir -p "$TESTHOME/.copilot/jira-reports/tickets"
+          echo '{"totals":{}}' > "$TESTHOME/.copilot/jira-reports/tickets/ABC-123.json"
+          HOME="$TESTHOME" bash scripts/install.sh
+          HOME="$TESTHOME" bash scripts/uninstall.sh --dry-run
+          HOME="$TESTHOME" bash scripts/uninstall.sh
+          test ! -e "$TESTHOME/.local/bin/copilot-s"
+          test ! -e "$TESTHOME/.copilot/agents/planner.agent.md"
+          # Ticket state and pricing config must never be removed.
+          test -f "$TESTHOME/.copilot/jira-reports/tickets/ABC-123.json"
+          test -f "$TESTHOME/.copilot/jira-reports/model-pricing.json"
+          echo "uninstall smoke test OK"
+
+      - name: Install --prefix hardening smoke test
+        run: |
+          set -e
+          TESTHOME="$(mktemp -d)"
+          # Empty --prefix must be rejected, not silently accepted.
+          if HOME="$TESTHOME" bash scripts/install.sh --prefix "" 2>/tmp/prefix_empty.err; then
+            echo "expected install.sh --prefix '' to fail" >&2
+            exit 1
+          fi
+          grep -qi "non-empty" /tmp/prefix_empty.err
+          # A relative --prefix must be canonicalized to an absolute path,
+          # so a later uninstall from a different cwd still finds it via
+          # the recorded manifest.
+          WORKDIR="$(mktemp -d)"
+          (cd "$WORKDIR" && HOME="$TESTHOME" bash "$GITHUB_WORKSPACE/scripts/install.sh" --prefix relbin)
+          test -L "$WORKDIR/relbin/copilot-s"
+          grep -qF "$WORKDIR/relbin/copilot-s" "$TESTHOME/.copilot-cli-toolkit/install-manifest.txt"
+          # Uninstall from a *different* cwd must still find/remove it,
+          # proving the manifest holds an absolute (not cwd-relative) path.
+          (cd /tmp && HOME="$TESTHOME" bash "$GITHUB_WORKSPACE/scripts/uninstall.sh")
+          test ! -e "$WORKDIR/relbin/copilot-s"
+          echo "install --prefix hardening smoke test OK"
+
+      - name: Update smoke test (hermetic, no network)
+        run: |
+          set -e
+          bash tests/test_update.sh
+
+      - name: macOS /bin/bash 3.2 compatibility smoke test
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          echo "/bin/bash version on this runner:"
+          /bin/bash --version | head -1
+          for f in bin/copilot-s scripts/install.sh scripts/uninstall.sh scripts/update.sh tests/test_update.sh; do
+            /bin/bash -n "$f"
+          done
+          TESTHOME="$(mktemp -d)"
+          HOME="$TESTHOME" /bin/bash scripts/install.sh --dry-run
+          HOME="$TESTHOME" /bin/bash scripts/install.sh
+          test -L "$TESTHOME/.local/bin/copilot-s"
+          # update.sh's empty-array argument passthrough (the bug this
+          # step guards against) only reproduces under the *stock* macOS
+          # /bin/bash 3.2 — GitHub's macOS runner images preinstall a
+          # newer Homebrew bash on PATH, so `bash` alone would not have
+          # caught it; hence invoking /bin/bash explicitly here and in
+          # tests/test_update.sh's own --skip-pull case.
+          HOME="$TESTHOME" /bin/bash scripts/update.sh --skip-pull --dry-run
+          /bin/bash tests/test_update.sh
+          echo "macOS /bin/bash 3.2 compatibility smoke test OK"

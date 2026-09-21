@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+*.swp
+*.log
+
+# Backups/manifests created by scripts/install.sh and uninstall.sh when run
+# against a local test HOME during development.
+/.copilot-cli-toolkit/
