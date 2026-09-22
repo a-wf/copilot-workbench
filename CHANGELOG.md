@@ -6,6 +6,16 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Documentation
+
+- Added a neutral comparison of Copilot `/model auto` and this toolkit,
+  explaining that Auto provides adaptive GitHub-managed model selection while
+  the toolkit provides inspectable workflow policy, session management, task
+  reporting, role separation, and bounded cost controls. The README now
+  recommends a hybrid setup for most users and explicitly documents that the
+  custom-agent pipeline is instruction-driven rather than a deterministic
+  workflow engine.
+
 ### Changed — agent pipeline redesign (7 roles, cost-aware routing)
 
 This redesigns the multi-agent pipeline for lower token/cost overhead and

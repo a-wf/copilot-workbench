@@ -18,6 +18,56 @@ your actual task work, and no opinionated structure for multi-step
 implementation tasks. This toolkit adds all three as a thin, inspectable
 layer around the stock CLI — it never forks or patches `copilot` itself.
 
+## Copilot Auto mode vs. this toolkit
+
+Copilot's `/model auto` setting and this toolkit solve different problems.
+Auto mode lets Copilot dynamically choose a model for the current work.
+This toolkit adds workflow policy *around* Copilot: session management,
+task-level reporting, custom roles, explicit model defaults, bounded loops,
+and rules for skipping unnecessary stages.
+
+The toolkit is **not automatically better, smarter, or more reliable than
+Auto mode**. Auto is maintained by GitHub and can adapt as models and routing
+improve. The toolkit is useful when you prefer more control and repeatability,
+and accept the maintenance and orchestration overhead that comes with it.
+
+| Area | Copilot Auto mode | This toolkit |
+|---|---|---|
+| Model selection | Copilot chooses dynamically based on the current request | Each custom role has a visible default model, with personal overrides available through `/subagents` |
+| Workflow | Flexible; Copilot decides whether and how to delegate | A documented task-tier policy decides which roles should run or be skipped |
+| Cost control | Relies mainly on Copilot's automatic routing and account limits | Uses cheaper routine roles, expensive models only at selected gates, stage skipping, and bounded review/test loops |
+| Role separation | May handle planning, implementation, review, and testing in one session | Separates discovery, planning, production coding, review, and testing into narrowly-scoped roles |
+| Repeatability | Routing may change as Auto evolves or as prompts differ | Agent files and instructions are inspectable, version-controlled defaults |
+| Session management | Uses Copilot CLI's native session commands | Adds a global cross-directory session list, bulk deletion, naming, and exit-time keep/rename/delete prompts |
+| Usage reporting | `/usage` reports session usage interactively | Creates cumulative per-task Markdown reports with models, tokens, time, effort attribution, and estimated cost |
+| Maintenance | Lowest maintenance; GitHub updates the routing | You maintain agent prompts, model defaults, pricing data, and compatibility with future CLI changes |
+
+### Which should you use?
+
+- **Use Auto alone** when you want the simplest experience, trust GitHub's
+  model routing, and do not need this toolkit's session/reporting features or
+  explicit development stages.
+- **Use the toolkit's agent defaults** when repeatable role boundaries,
+  visible model choices, cost budgets, and review/test discipline matter more
+  than fully automatic routing.
+- **Use both together (recommended for most users):** keep the main Copilot
+  session on Auto, while custom subagents use their role-specific defaults.
+  Auto can handle normal conversation and orchestration; the toolkit supplies
+  the session manager, task reports, and reusable role definitions.
+
+### Reliability caveat
+
+The agent pipeline is implemented with Copilot custom-agent profiles and
+instructions, not a separate deterministic workflow engine. The model can
+still decide that a stage is unnecessary or handle work in the main session.
+The orchestrator instructions make behavior more consistent, but cannot
+guarantee that every prompt follows an identical sequence.
+
+For work that requires strict process enforcement, explicitly invoke the
+desired agent (for example, `/agent reviewer`) and verify delegated work with
+`/tasks`. For routine work, the cost-aware automatic routing is intentionally
+allowed to skip stages.
+
 ## Features
 
 - **Global session manager** (`copilot-s`) — list, resume, rename, and
