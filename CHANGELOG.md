@@ -6,6 +6,72 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — agent pipeline redesign (7 roles, cost-aware routing)
+
+This redesigns the multi-agent pipeline for lower token/cost overhead and
+stricter role boundaries. It is agent-config-only: no changes to
+`copilot-s` or the task usage reporter's behavior, other than updated
+agent-name references used for historical-session effort inference.
+
+- **New agents:**
+  - `discovery` (`gemini-3.8-flash`, `read`/`search` tools only) — read-only
+    broad/unfamiliar codebase mapping. Never plans, writes code, reviews,
+    tests, or runs shell commands.
+  - `senior-coder` (`claude-sonnet-5`) — complex implementation and
+    targeted fixes (multi-file architecture, async state, schema/data-model
+    changes, deep structural bugs, new services). Escalations from
+    `coder` hand off the current diff/context and continue rather than
+    restarting from scratch.
+- **Retired:** `agents/fixer.agent.md` is deleted. `coder`/`senior-coder`
+  now apply their own targeted fixes directly, always at the same tier
+  that did the original implementation.
+- **Upgrading:** after pulling this release, run `scripts/update.sh` (or
+  `scripts/install.sh` again) once — a plain `git pull` alone does not
+  remove the retired `fixer` agent's already-installed path
+  (`~/.copilot/agents/fixer.agent.md`), because that removal is an
+  install/update-time migration step, not something a symlink refresh
+  performs on its own. See "Upgrading to this release" in README.md.
+- **`coder`** now targets `kimi-k2.7-code` (was `claude-haiku-4.5`) and is
+  scoped to routine implementation/fixes (CRUD, UI, standard logic);
+  anything more structural routes to `senior-coder`.
+- **`planner`** is now explicitly optional and ambiguity/design-only; it
+  consumes `discovery`'s output instead of duplicating broad exploration,
+  and its output includes a routing hint (routine vs. complex) for
+  `coder`/`senior-coder`.
+- **`reviewer`** now does one comprehensive review, then at most 3 bounded
+  focused-verification rounds that check only prior findings and
+  regressions introduced by fixes — never a second broad review — and
+  escalates to the user if unresolved after round 3.
+- **`tester`** now only runs when behavior merits testing, with a bounded
+  test/fix loop capped at 3 rounds before escalating; never implements
+  fixes itself.
+- **`test-reviewer`** is now scoped to complex/high-risk tasks only, with
+  the same bounded one-pass-plus-3-rounds verification discipline as
+  `reviewer`.
+- `instructions/copilot-instructions.md` is rewritten around explicit task
+  tiers (trivial/small/standard/complex/high-risk) and a stage-selection
+  matrix: every stage is optional, skips are briefly disclosed to the
+  user, and no stage duplicates work another stage already did.
+- Every agent's frontmatter `description` and prompt body now explicitly
+  reinforces bounded scope, concise output, and avoiding duplicated work,
+  as part of the pipeline's cost-control design.
+- `scripts/install.sh` safely removes a previously-installed
+  `~/.copilot/agents/fixer.agent.md` (only when it's manifest-managed or a
+  symlink into this repo checkout, pruning the install manifest
+  atomically) while leaving an unmanaged/user-owned file at that path
+  untouched. `discovery`/`senior-coder` install automatically via the
+  existing `agents/*.agent.md` glob — no installer change was needed to
+  add them.
+- `bin/copilot-task-report.py`'s custom-agent effort-inference map adds
+  `discovery`/`senior-coder` and reflects `coder`'s new (cheaper) model
+  tier; the retired `fixer` entry is kept solely so historical sessions
+  recorded before this change still get a reasonable inferred effort
+  label.
+- README, `docs/architecture.md` (including the pipeline diagram), and
+  this changelog are updated for the 7-role pipeline. The changelog's
+  historical `1.0.0`/`2.0.0` entries are left as-is: they describe the
+  pipeline as it existed at the time and are not retroactively edited.
+
 ## [2.0.0] - 2026-09-21
 
 This is a **breaking** release: the usage reporter and its storage layout

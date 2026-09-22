@@ -125,6 +125,63 @@ record_managed_path() {
   fi
 }
 
+remove_stale_managed_path() {
+  # remove_stale_managed_path TARGET REASON
+  #
+  # Safely removes a retired toolkit file (e.g. a superseded helper or a
+  # deleted agent) and atomically prunes it from the install manifest —
+  # but ONLY when it's clearly this toolkit's own doing: either recorded
+  # in the install manifest, or a symlink pointing back into this repo
+  # checkout. A file at TARGET that isn't ours (an unmanaged file, or a
+  # symlink pointing somewhere else entirely) is left completely alone,
+  # with a clear message explaining why.
+  local target="$1" reason="$2"
+  [[ -e "$target" || -L "$target" ]] || return 0
+
+  local is_ours=false
+  if is_managed_path "$target"; then
+    is_ours=true
+  elif [[ -L "$target" ]]; then
+    local link_target
+    link_target="$(readlink "$target")"
+    [[ "$link_target" != /* ]] && link_target="$(dirname "$target")/$link_target"
+    case "$link_target" in
+      "$REPO_ROOT"/*) is_ours=true ;;
+    esac
+  fi
+
+  if ! $is_ours; then
+    log "  ${DIM}left in place${RESET} $target (not managed by this toolkit — remove it yourself if it's no longer needed)"
+    return 0
+  fi
+
+  if $DRY_RUN; then
+    run_note "remove stale toolkit-managed $target ($reason)"
+    return 0
+  fi
+
+  rm -f "$target"
+  if [[ -f "$MANIFEST_FILE" ]]; then
+    local grep_rc=0
+    grep -Fxv "$target" "$MANIFEST_FILE" > "$MANIFEST_FILE.tmp" 2>/dev/null || grep_rc=$?
+    # grep's exit status distinguishes "removed a matching line" (0) and
+    # "no lines matched / file now empty" (1) — both are a safe, valid
+    # result to move into place — from a genuine read/write failure (>=2,
+    # e.g. permission denied, disk error), where $MANIFEST_FILE.tmp could
+    # be empty/truncated garbage. Only ever overwrite the real manifest
+    # (atomically, via mv) in the first two cases; on a real error,
+    # discard the tmp file and warn instead of risking wiping out the
+    # install manifest.
+    if [[ $grep_rc -le 1 ]]; then
+      mv "$MANIFEST_FILE.tmp" "$MANIFEST_FILE"
+    else
+      rm -f "$MANIFEST_FILE.tmp"
+      log "  ${YELLOW}warning:${RESET} could not update $MANIFEST_FILE after removing $target (grep exit $grep_rc) — manifest left untouched; it may still list the now-removed path"
+    fi
+  fi
+  log "  ${YELLOW}removed${RESET} stale toolkit-managed $target ($reason)"
+}
+
 backup_if_needed() {
   # If $1 exists, is not already a symlink pointing at $2, and is not a
   # path this toolkit itself manages, move it aside into a timestamped
@@ -205,51 +262,10 @@ install_one "$REPO_ROOT/bin/copilot-s" "$BIN_PREFIX/copilot-s" true
 install_one "$REPO_ROOT/bin/copilot-task-report.py" "$BIN_PREFIX/copilot-task-report.py" true
 
 # --- Remove a stale pre-2.0 copilot-jira-report.py helper, if present ---
-# Only ever touches it when it's clearly this toolkit's own doing: either
-# recorded in our install manifest, or a symlink pointing back into this
-# repo checkout. A copilot-jira-report.py that isn't ours (unmanaged file,
-# or a symlink pointing somewhere else entirely) is left completely alone.
-legacy_helper="$BIN_PREFIX/copilot-jira-report.py"
-if [[ -e "$legacy_helper" || -L "$legacy_helper" ]]; then
-  legacy_is_ours=false
-  if is_managed_path "$legacy_helper"; then
-    legacy_is_ours=true
-  elif [[ -L "$legacy_helper" ]]; then
-    legacy_target="$(readlink "$legacy_helper")"
-    [[ "$legacy_target" != /* ]] && legacy_target="$BIN_PREFIX/$legacy_target"
-    case "$legacy_target" in
-      "$REPO_ROOT"/*) legacy_is_ours=true ;;
-    esac
-  fi
-  if $legacy_is_ours; then
-    if $DRY_RUN; then
-      run_note "remove stale toolkit-managed $legacy_helper (superseded by copilot-task-report.py)"
-    else
-      rm -f "$legacy_helper"
-      if [[ -f "$MANIFEST_FILE" ]]; then
-        grep_rc=0
-        grep -Fxv "$legacy_helper" "$MANIFEST_FILE" > "$MANIFEST_FILE.tmp" 2>/dev/null || grep_rc=$?
-        # grep's exit status distinguishes "removed a matching line" (0)
-        # and "no lines matched / file now empty" (1) — both are a safe,
-        # valid result to move into place — from a genuine read/write
-        # failure (>=2, e.g. permission denied, disk error), where
-        # $MANIFEST_FILE.tmp could be empty/truncated garbage. Only ever
-        # overwrite the real manifest in the first two cases; on a real
-        # error, discard the tmp file and warn instead of risking wiping
-        # out the install manifest.
-        if [[ $grep_rc -le 1 ]]; then
-          mv "$MANIFEST_FILE.tmp" "$MANIFEST_FILE"
-        else
-          rm -f "$MANIFEST_FILE.tmp"
-          log "  ${YELLOW}warning:${RESET} could not update $MANIFEST_FILE after removing $legacy_helper (grep exit $grep_rc) — manifest left untouched; it may still list the now-removed path"
-        fi
-      fi
-      log "  ${YELLOW}removed${RESET} stale toolkit-managed $legacy_helper (superseded by copilot-task-report.py)"
-    fi
-  else
-    log "  ${DIM}left in place${RESET} $legacy_helper (not managed by this toolkit — remove it yourself if it's no longer needed)"
-  fi
-fi
+# Only ever touches it when it's clearly this toolkit's own doing (see
+# remove_stale_managed_path above). A copilot-jira-report.py that isn't
+# ours is left completely alone.
+remove_stale_managed_path "$BIN_PREFIX/copilot-jira-report.py" "superseded by copilot-task-report.py"
 
 # --- Agents ---
 log ""
@@ -259,6 +275,17 @@ for agent_file in "$REPO_ROOT"/agents/*.agent.md; do
   name="$(basename "$agent_file")"
   install_one "$agent_file" "$COPILOT_HOME/agents/$name"
 done
+
+# --- Remove the retired fixer agent, if present ---
+# The agent-pipeline redesign folded targeted-fix work directly into
+# coder/senior-coder and deleted agents/fixer.agent.md from this repo, so
+# it's no longer part of the *.agent.md glob above and won't get
+# reinstalled. Only ever removed when it's clearly this toolkit's own
+# doing (manifest-managed, or a symlink pointing back into this repo
+# checkout) — see remove_stale_managed_path above. An unmanaged
+# fixer.agent.md (e.g. a user's own custom agent that happens to share
+# the name) is left completely alone.
+remove_stale_managed_path "$COPILOT_HOME/agents/fixer.agent.md" "retired — fixes are now handled by coder/senior-coder"
 
 # --- Orchestrator instructions ---
 log ""

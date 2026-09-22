@@ -2,8 +2,10 @@
 
 Personal-workflow tooling for the [GitHub Copilot CLI](https://github.com/github/copilot-cli):
 a session manager with automatic per-task usage/cost reporting, and a
-6-role multi-agent implementation pipeline (planner → coder → reviewer →
-fixer → tester → test-reviewer).
+7-role multi-agent implementation pipeline (discovery/planner → coder/
+senior-coder → reviewer → tester → test-reviewer) with cost-aware, bounded
+routing — every stage is optional, and each is scoped to avoid duplicated
+work.
 
 Both pieces are independent — use the session manager without the agent
 pipeline, or vice versa.
@@ -25,10 +27,12 @@ layer around the stock CLI — it never forks or patches `copilot` itself.
   token counts, model-call time, reasoning-effort intent, and an estimated
   USD cost to a cumulative Markdown report for the task associated with
   your current git branch (or a free-form task name/ID you provide).
-- **6-role agent pipeline** — `planner`, `coder`, `reviewer`, `fixer`,
-  `tester`, `test-reviewer`, wired together by an orchestrator so
-  non-trivial tasks get planned, implemented, reviewed, tested, and
-  re-reviewed before being considered done.
+- **7-role agent pipeline** — `discovery`, `planner`, `coder`,
+  `senior-coder`, `reviewer`, `tester`, `test-reviewer`, wired together by
+  an orchestrator with explicit task tiers so trivial/small tasks skip
+  straight to the right implementer while complex/high-risk work gets
+  discovery, planning, review, and testing — with every stage optional and
+  bounded to avoid duplicated, token-burning work.
 - **User-editable pricing table** — add or correct model USD rates in one
   JSON file; unpriced models are reported as "no pricing data", never
   silently as $0.
@@ -106,7 +110,7 @@ This installs:
 | What | Installed to | Method |
 |---|---|---|
 | `copilot-s`, `copilot-task-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
-| 6 agent definitions | `~/.copilot/agents/` | symlink (or copy with `--copy`) |
+| 7 agent definitions | `~/.copilot/agents/` | symlink (or copy with `--copy`) |
 | Orchestrator instructions | `~/.copilot/copilot-instructions.md` | symlink (or copy with `--copy`) |
 | Pricing table | `~/.copilot/task-reports/model-pricing.json` | **copied once, only if absent** — your edits are never overwritten |
 
@@ -220,32 +224,53 @@ documented tradeoffs.
 
 ## Agent pipeline
 
+> **Upgrading to this release?** The retired `fixer` agent is deleted
+> from this repo, but a plain `git pull` does not remove it from
+> `~/.copilot/agents/fixer.agent.md` if you already had it installed —
+> that removal only happens during an install/update run, the same way
+> the pre-2.0 Jira-helper migration above works. Run `scripts/update.sh`
+> (or `scripts/install.sh` again) once after pulling this release so the
+> stale, already-installed `fixer` path gets cleaned up; a symlink that
+> merely gets updated in place isn't enough to remove a path that no
+> longer exists in this repo.
+
 | Role | Purpose | Example model¹ |
 |---|---|---|
-| `planner` | Turns a task into an ordered implementation plan before any code is written | `claude-sonnet-5` |
-| `coder` | Implements the plan with complete, working changes | `claude-sonnet-5` |
-| `reviewer` | Flags correctness/design issues in the coder's diff; doesn't rewrite | `claude-opus-5` |
-| `fixer` | Applies targeted fixes for issues raised by reviewer/test-reviewer | `claude-sonnet-5` |
-| `tester` | Writes and runs tests to validate the implementation | `kimi-k2.7-code` |
-| `test-reviewer` | Final quality gate: checks test coverage/trust before sign-off | `claude-opus-5` |
+| `discovery` | Read-only mapping of broad/unfamiliar codebase areas before planning or coding starts | `gemini-3.8-flash` |
+| `planner` | Turns an ambiguous/design-heavy task into an ordered implementation plan, consuming discovery's output instead of re-exploring | `claude-sonnet-5` |
+| `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `kimi-k2.7-code` |
+| `senior-coder` | Complex implementation and targeted fixes: multi-file architecture, async state, schema/data-model changes, deep structural bugs, new services | `claude-sonnet-5` |
+| `reviewer` | One comprehensive review, then up to 3 bounded focused-verification rounds on prior findings/regressions only; never rewrites | `claude-opus-5` |
+| `tester` | Writes and runs tests, only when behavior merits it; bounded test/fix loop (max 3 rounds) | `kimi-k2.7-code` |
+| `test-reviewer` | Complex/high-risk-only quality gate on test coverage/trust, same bounded verification discipline as `reviewer` | `claude-opus-5` |
 
-¹ Models listed in each `agents/*.agent.md` file are current, working
-examples — not a recommendation frozen in time. Edit the `model:`
-frontmatter field to whatever your Copilot CLI installation currently
-supports (check with `/subagents` in a session); the pipeline logic in
-`instructions/copilot-instructions.md` doesn't depend on which models are
-assigned.
+¹ Models listed in each `agents/*.agent.md` file are this release's
+shipped, CI-validated defaults — not a recommendation frozen in time, but
+also not something you need to edit source to change. For a personal
+override, use `/subagents` in a session to reassign an agent's model for
+your own installation; that's a per-installation setting and does not
+require touching this repo's frontmatter. Only edit the `model:`
+frontmatter field directly if you intend to change the *shipped* default
+for everyone who installs from your checkout — if you do, update
+`tests/test_agent_pipeline.py`'s `EXPECTED_AGENTS` map to match, since CI
+asserts the repository defaults stay in sync with this table. The pipeline
+logic in `instructions/copilot-instructions.md` doesn't depend on which
+models are assigned either way.
 
 The orchestrator (`instructions/copilot-instructions.md`, auto-loaded every
-session) enforces the pipeline order and the review/fix and test/fix
-loops. Trivial one-line changes can skip straight to `coder`; anything
-touching multiple files or with design ambiguity should go through
-`planner` first.
+session) selects stages by task tier (trivial/small/standard/complex/
+high-risk) and enforces bounded review/fix and test/fix loops. Every stage
+is optional — trivial one-line changes can skip straight to `coder` with no
+discovery, planning, review, or tests, while only complex/high-risk work
+pulls in discovery, `senior-coder`, and `test-reviewer`. There is no
+`fixer` agent: `coder`/`senior-coder` handle their own targeted fixes at
+whichever tier originally implemented the code, so there's no hand-off
+duplication.
 
 Verify the pipeline is loaded:
 
 ```
-/agent          # lists all 6 custom agents
+/agent          # lists all 7 custom agents
 /env            # shows loaded agents/instructions in detail
 /subagents       # shows/lets you change each agent's assigned model
 ```

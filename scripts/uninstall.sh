@@ -12,10 +12,16 @@
 #   - Copilot session state (~/.copilot/session-state, ~/.copilot-sessions)
 #   - Any other user data.
 #
-# A stale pre-2.0 copilot-jira-report.py helper is handled by
-# scripts/install.sh (which removes it from the manifest/disk on re-install
-# when it was toolkit-managed), so this script needs no Jira-specific logic
-# of its own — it simply removes whatever the current manifest lists.
+# Two retired paths are handled by scripts/install.sh instead of here:
+#   - A stale pre-2.0 copilot-jira-report.py helper.
+#   - The retired agents/fixer.agent.md agent (removed from this repo when
+#     the fixer role was folded into coder/senior-coder).
+# Both cleanups are install/update-time migration concerns, not uninstall
+# concerns: they run when scripts/install.sh (or scripts/update.sh, which
+# calls it) re-installs from a newer checkout and finds a toolkit-managed
+# path on disk that no longer has a corresponding source file. This script
+# needs no Jira- or fixer-specific logic of its own — it simply removes
+# whatever the current manifest lists.
 #
 # Usage:
 #   scripts/uninstall.sh [--dry-run] [--restore-backups]

@@ -43,7 +43,7 @@ jobs:
 
       - name: Python compile check
         run: |
-          python3 -m py_compile bin/copilot-task-report.py tests/test_copilot_task_report.py tests/test_copilot_s.py
+          python3 -m py_compile bin/copilot-task-report.py tests/test_copilot_task_report.py tests/test_copilot_s.py tests/test_agent_pipeline.py
 
       - name: Run test suite
         run: |
@@ -58,9 +58,10 @@ jobs:
           test -L "$TESTHOME/.local/bin/copilot-s"
           test -L "$TESTHOME/.local/bin/copilot-task-report.py"
           test -x "$TESTHOME/.local/bin/copilot-s"
-          for a in planner coder reviewer fixer tester test-reviewer; do
+          for a in planner discovery coder senior-coder reviewer tester test-reviewer; do
             test -L "$TESTHOME/.copilot/agents/$a.agent.md"
           done
+          test ! -e "$TESTHOME/.copilot/agents/fixer.agent.md"
           test -L "$TESTHOME/.copilot/copilot-instructions.md"
           test -f "$TESTHOME/.copilot/task-reports/model-pricing.json"
           test ! -L "$TESTHOME/.copilot/task-reports/model-pricing.json"
@@ -85,6 +86,37 @@ jobs:
           test -f "$TESTHOME2/.local/bin/copilot-jira-report.py"
           grep -qF "not toolkit-managed" "$TESTHOME2/.local/bin/copilot-jira-report.py"
           echo "legacy helper cleanup smoke test OK"
+
+      - name: Retired fixer agent cleanup smoke test
+        run: |
+          set -e
+          # A previously-installed, manifest-managed fixer.agent.md (as an
+          # older toolkit version would have left behind) must be removed
+          # on the next install, and pruned from the install manifest.
+          TESTHOME="$(mktemp -d)"
+          mkdir -p "$TESTHOME/.copilot/agents" "$TESTHOME/.copilot-cli-toolkit"
+          echo "stale fixer content" > "$TESTHOME/.copilot/agents/fixer.agent.md"
+          echo "$TESTHOME/.copilot/agents/fixer.agent.md" > "$TESTHOME/.copilot-cli-toolkit/install-manifest.txt"
+          HOME="$TESTHOME" bash scripts/install.sh
+          test ! -e "$TESTHOME/.copilot/agents/fixer.agent.md"
+          ! grep -qF "$TESTHOME/.copilot/agents/fixer.agent.md" "$TESTHOME/.copilot-cli-toolkit/install-manifest.txt"
+          # A symlink into this repo checkout (even if never recorded in
+          # the manifest, e.g. from an older toolkit version) must also be
+          # cleaned up.
+          TESTHOME2="$(mktemp -d)"
+          mkdir -p "$TESTHOME2/.copilot/agents"
+          ln -s "$GITHUB_WORKSPACE/agents/coder.agent.md" "$TESTHOME2/.copilot/agents/fixer.agent.md"
+          HOME="$TESTHOME2" bash scripts/install.sh
+          test ! -e "$TESTHOME2/.copilot/agents/fixer.agent.md"
+          # An unmanaged fixer.agent.md (a user's own file, or a symlink
+          # pointing outside this repo) must never be touched.
+          TESTHOME3="$(mktemp -d)"
+          mkdir -p "$TESTHOME3/.copilot/agents"
+          echo "not toolkit-managed" > "$TESTHOME3/.copilot/agents/fixer.agent.md"
+          HOME="$TESTHOME3" bash scripts/install.sh
+          test -f "$TESTHOME3/.copilot/agents/fixer.agent.md"
+          grep -qF "not toolkit-managed" "$TESTHOME3/.copilot/agents/fixer.agent.md"
+          echo "retired fixer agent cleanup smoke test OK"
 
       - name: Install smoke test (--copy mode)
         run: |

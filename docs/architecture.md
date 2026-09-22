@@ -41,16 +41,16 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    A[planner] -->|plan| B[coder]
-    B -->|diff| C[reviewer]
-    C -->|approved| D[tester]
-    C -->|findings| E[fixer]
-    E --> C
-    D -->|pass| F[test-reviewer]
-    D -->|failures| E
-    F -->|approved| G[Done]
-    F -->|gaps| D
-    F -->|bug| E
+    DISC[discovery] -.->|context, optional| P[planner]
+    P -.->|plan, optional| CD["coder or\nsenior-coder"]
+    DISC -.->|context, optional| CD
+    CD -->|diff| R[reviewer]
+    R -->|approved| T[tester]
+    R -->|findings, max 3 rounds| CD
+    T -->|pass| TR[test-reviewer]
+    T -->|failures, max 3 rounds| CD
+    TR -->|approved| DONE[Done]
+    TR -->|gaps, max 3 rounds| T
 ```
 
 ## 1. `copilot-s` — session manager
@@ -156,12 +156,34 @@ never touches these files — they live independently of session storage.
 ## 3. Multi-agent pipeline
 
 `instructions/copilot-instructions.md` is the orchestrator: loaded
-automatically in every Copilot CLI session, it defines a strict pipeline
-order (`planner → coder → reviewer ⇄ fixer → tester ⇄ fixer →
-test-reviewer`) and the looping rules between review/fix and test/fix
-stages. Each `agents/*.agent.md` file is a self-contained role definition
-(frontmatter with `name`/`description`/`model`/`tools`, plus a prompt body)
-loaded by the Copilot CLI's custom-agent mechanism.
+automatically in every Copilot CLI session, it defines task tiers
+(trivial/small/standard/complex/high-risk) and a stage-selection matrix
+that picks which of the 7 roles run for a given task — every stage is
+optional, and skips are briefly disclosed to the user. There is no
+`fixer` role: `coder`/`senior-coder` apply their own targeted fixes,
+always at the same tier that did the original implementation, so a
+review or test failure never restarts work from scratch at a different
+tier.
+
+The bounded flow is: `discovery` (read-only, broad/unfamiliar context
+only) and `planner` (ambiguity/design only, consumes discovery's output
+instead of re-exploring) feed `coder` (routine CRUD/UI/standard logic;
+writes and fixes production code only) or `senior-coder` (multi-file
+architecture, async state, schema/data-model changes, deep structural
+bugs, new services; writes and fixes production code only). `reviewer`
+does one comprehensive pass, then at most 3 focused verification rounds
+checking only prior findings and regressions — never a second broad
+review — before escalating to the user. `tester` only runs when behavior
+merits testing, in a test/fix loop capped at 3 rounds before escalating;
+it writes and runs tests only and never fixes production code itself.
+`test-reviewer` only engages for complex/high-risk tasks, with the same
+bounded one-pass-plus-3-rounds discipline as `reviewer`. Each
+`agents/*.agent.md` file is a self-contained role definition (frontmatter
+with `name`/`description`/`model`/`tools`, plus a prompt body) loaded by
+the Copilot CLI's custom-agent mechanism; every frontmatter description
+and body explicitly reinforces bounded scope, concise output, and no
+duplicated work, since that's part of this pipeline's cost-control
+design, not just documentation.
 
 This is pure configuration — no code ties the pipeline to the session
 manager or the task reporter. You can adopt just the agents, just the

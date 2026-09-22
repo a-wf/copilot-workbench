@@ -165,11 +165,18 @@ TASK_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")
 # Custom agent -> inferred reasoning-effort intent (NOT measured telemetry).
 # Only ever consulted for calls falling inside a fully-CLOSED subagent
 # interval (both started+completed observed) — never a live/open guess.
+#
+# "fixer" is a retired pre-redesign agent (superseded by coder/senior-coder
+# handling fixes directly) — kept here only so historical sessions whose
+# events.jsonl still references it continue to get a reasonable inferred
+# label; it is never installed/loaded by current copilot-instructions.md.
 CUSTOM_AGENT_EFFORT_MAP = {
     "planner": "max",
+    "discovery": "low",
     "reviewer": "max",
     "test-reviewer": "max",
-    "coder": "high",
+    "senior-coder": "high",
+    "coder": "medium",
     "fixer": "high",
     "tester": "medium",
 }
@@ -1932,7 +1939,10 @@ def render_markdown(task):
                   "`configured:*` is the session-level reasoning-effort setting in effect "
                   "at call time (real telemetry, but not call-specific). `inferred:*` is a "
                   "guess based on our custom-agent role mapping "
-                  "(planner/reviewer/test-reviewer=max, coder/fixer=high, tester=medium), "
+                  "(planner/reviewer/test-reviewer=max, senior-coder=high, "
+                  "coder/tester=medium, discovery=low; legacy fixer=high, kept only "
+                  "for historical sessions recorded before the fixer role was retired "
+                  "and folded into coder/senior-coder), "
                   "applied only when the call falls inside a fully-completed subagent "
                   "invocation window, and is **not** measured telemetry. `unknown` means no "
                   "effort information was available for that call._")
