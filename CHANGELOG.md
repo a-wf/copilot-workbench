@@ -6,6 +6,31 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — model/effort remap (Sept 2026 cost-efficiency tiers)
+
+- Remapped agent default models to a 3-tier cost/capability scheme aligned
+  with an internal cost-efficiency alignment reference (start cheap for
+  routine work, step up for design/routing, reserve the top tier for hard
+  problems): `coder`/`tester` now default to `gpt-6-luna` (was
+  `kimi-k2.7-code`), `planner` now defaults to `gpt-6-sol` (was
+  `claude-sonnet-5`), and `senior-coder`/`reviewer`/`test-reviewer` now
+  default to `claude-opus-5.5` (was `claude-sonnet-5`/`claude-opus-5`).
+  `discovery` keeps `gemini-3.8-flash` — its value is context-window size
+  for broad codebase mapping, not raw task-solving capability, so it's
+  exempt from this tiering.
+- Added a per-agent `reasoningEffort` frontmatter default (supported by
+  CLI v1.0.66+): `max` for `coder`/`tester`, `high` for
+  `planner`/`senior-coder`/`reviewer`/`test-reviewer`, `low` for
+  `discovery`. These are shipped repository defaults only — override per
+  installation via `/subagents`, not by editing `agents/*.agent.md`.
+- Added `gpt-6-luna`, `gpt-6-sol`, and `claude-opus-5.5` pricing entries
+  (plus aliases) to `config/model-pricing.json`.
+- Updated `CUSTOM_AGENT_EFFORT_MAP` in `bin/copilot-task-report.py` (the
+  static fallback used only when no measured/configured effort telemetry
+  is available) to match the new defaults.
+- Updated `tests/test_agent_pipeline.py`'s `EXPECTED_AGENTS` and
+  `tests/test_copilot_task_report.py`'s inferred-effort fixture to match.
+
 ### Documentation
 
 - Added a neutral comparison of Copilot `/model auto` and this toolkit,

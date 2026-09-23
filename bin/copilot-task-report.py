@@ -171,14 +171,14 @@ TASK_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")
 # events.jsonl still references it continue to get a reasonable inferred
 # label; it is never installed/loaded by current copilot-instructions.md.
 CUSTOM_AGENT_EFFORT_MAP = {
-    "planner": "max",
+    "planner": "high",
     "discovery": "low",
-    "reviewer": "max",
-    "test-reviewer": "max",
+    "reviewer": "high",
+    "test-reviewer": "high",
     "senior-coder": "high",
-    "coder": "medium",
+    "coder": "max",
     "fixer": "high",
-    "tester": "medium",
+    "tester": "max",
 }
 
 # Cap on how many closed agent intervals we keep per session, to bound

@@ -43,30 +43,37 @@ EXPECTED_AGENTS = {
     # README.md's "Agent pipeline" section.
     "discovery": {
         "model": "gemini-3.8-flash",
+        "reasoningEffort": "low",
         "tools": ["read", "search"],
     },
     "planner": {
-        "model": "claude-sonnet-5",
+        "model": "gpt-6-sol",
+        "reasoningEffort": "high",
         "tools": ["read", "search", "web"],
     },
     "coder": {
-        "model": "kimi-k2.7-code",
+        "model": "gpt-6-luna",
+        "reasoningEffort": "max",
         "tools": ["*"],
     },
     "senior-coder": {
-        "model": "claude-sonnet-5",
+        "model": "claude-opus-5.5",
+        "reasoningEffort": "high",
         "tools": ["*"],
     },
     "reviewer": {
-        "model": "claude-opus-5",
+        "model": "claude-opus-5.5",
+        "reasoningEffort": "high",
         "tools": ["read", "search", "execute"],
     },
     "tester": {
-        "model": "kimi-k2.7-code",
+        "model": "gpt-6-luna",
+        "reasoningEffort": "max",
         "tools": ["*"],
     },
     "test-reviewer": {
-        "model": "claude-opus-5",
+        "model": "claude-opus-5.5",
+        "reasoningEffort": "high",
         "tools": ["read", "search", "execute"],
     },
 }
@@ -141,6 +148,13 @@ class TestAgentInventory(unittest.TestCase):
                     "source)",
                 )
                 self.assertEqual(fm.get("tools"), expected["tools"])
+                self.assertEqual(
+                    fm.get("reasoningEffort"),
+                    expected["reasoningEffort"],
+                    f"{name}.agent.md's shipped default reasoningEffort "
+                    "changed; if intentional, update EXPECTED_AGENTS to "
+                    "match",
+                )
                 self.assertTrue(
                     fm.get("description"),
                     f"{name}.agent.md must have a non-empty description",

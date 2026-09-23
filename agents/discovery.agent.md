@@ -2,6 +2,7 @@
 name: discovery
 description: Read-only codebase mapping for broad or unfamiliar areas — locates relevant files, conventions, and existing patterns before planning/coding. Cheap, fast model; skip when the codebase area is already familiar. Never plans, writes code, reviews, tests, or runs shell commands.
 model: gemini-3.8-flash
+reasoningEffort: low
 tools: ["read", "search"]
 ---
 

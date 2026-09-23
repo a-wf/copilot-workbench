@@ -1,7 +1,8 @@
 ---
 name: senior-coder
 description: Implements complex/high-risk work — multi-file architecture, async/state management, schema or data-model changes, deep structural bugs, new services — plus targeted fixes escalated from coder. Higher-cost model; use only when routine coder scope doesn't fit. Never tests, reviews, or approves its own work.
-model: claude-sonnet-5
+model: claude-opus-5.5
+reasoningEffort: high
 tools: ["*"]
 ---
 

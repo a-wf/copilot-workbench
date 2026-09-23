@@ -286,13 +286,25 @@ documented tradeoffs.
 
 | Role | Purpose | Example model¹ |
 |---|---|---|
-| `discovery` | Read-only mapping of broad/unfamiliar codebase areas before planning or coding starts | `gemini-3.8-flash` |
-| `planner` | Turns an ambiguous/design-heavy task into an ordered implementation plan, consuming discovery's output instead of re-exploring | `claude-sonnet-5` |
-| `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `kimi-k2.7-code` |
-| `senior-coder` | Complex implementation and targeted fixes: multi-file architecture, async state, schema/data-model changes, deep structural bugs, new services | `claude-sonnet-5` |
-| `reviewer` | One comprehensive review, then up to 3 bounded focused-verification rounds on prior findings/regressions only; never rewrites | `claude-opus-5` |
-| `tester` | Writes and runs tests, only when behavior merits it; bounded test/fix loop (max 3 rounds) | `kimi-k2.7-code` |
-| `test-reviewer` | Complex/high-risk-only quality gate on test coverage/trust, same bounded verification discipline as `reviewer` | `claude-opus-5` |
+| `discovery` | Read-only mapping of broad/unfamiliar codebase areas before planning or coding starts | `gemini-3.8-flash` (effort: `low`) |
+| `planner` | Turns an ambiguous/design-heavy task into an ordered implementation plan, consuming discovery's output instead of re-exploring | `gpt-6-sol` (effort: `high`) |
+| `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `gpt-6-luna` (effort: `max`) |
+| `senior-coder` | Complex implementation and targeted fixes: multi-file architecture, async state, schema/data-model changes, deep structural bugs, new services | `claude-opus-5.5` (effort: `high`) |
+| `reviewer` | One comprehensive review, then up to 3 bounded focused-verification rounds on prior findings/regressions only; never rewrites | `claude-opus-5.5` (effort: `high`) |
+| `tester` | Writes and runs tests, only when behavior merits it; bounded test/fix loop (max 3 rounds) | `gpt-6-luna` (effort: `max`) |
+| `test-reviewer` | Complex/high-risk-only quality gate on test coverage/trust, same bounded verification discipline as `reviewer` | `claude-opus-5.5` (effort: `high`) |
+
+Model choices follow a cost/capability tiering (start cheap for routine
+work, step up for design/routing, reserve the top tier for hard problems):
+`gpt-6-luna` is the cheapest/fastest tier for well-scoped implementation
+and test-writing, `gpt-6-sol` is a mid tier for planning/routing
+decisions, and `claude-opus-5.5` is the top tier reserved for complex
+implementation and high-scrutiny review. `discovery` keeps
+`gemini-3.8-flash` regardless of this tiering, since its value is a large
+context window for mapping broad codebases, not raw task-solving
+capability. Each `reasoningEffort` is a per-agent frontmatter default
+(CLI v1.0.66+) — override per-installation via `/subagents` rather than
+editing `agents/*.agent.md` directly.
 
 ¹ Models listed in each `agents/*.agent.md` file are this release's
 shipped, CI-validated defaults — not a recommendation frozen in time, but

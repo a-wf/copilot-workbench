@@ -1,7 +1,8 @@
 ---
 name: coder
 description: Implements routine work — plans, well-scoped tasks, standard CRUD/UI/logic, and targeted fixes for reviewer/tester findings. Fast, low-cost, high-value coding model for the common case. Never tests, reviews, or approves its own work. Escalate to senior-coder for complex/architectural changes.
-model: kimi-k2.7-code
+model: gpt-6-luna
+reasoningEffort: max
 tools: ["*"]
 ---
 

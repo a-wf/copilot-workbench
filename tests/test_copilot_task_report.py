@@ -982,8 +982,8 @@ class TestEffortPrecedencePositiveInferred(BaseTestCase):
         ])
         self.ingest(session_id)
         by_effort = self.task()["by_effort"]
-        self.assertIn("inferred:medium", by_effort)
-        self.assertEqual(by_effort["inferred:medium"]["prompt_tokens"], 7)
+        self.assertIn("inferred:max", by_effort)
+        self.assertEqual(by_effort["inferred:max"]["prompt_tokens"], 7)
         self.assertNotIn("configured:medium", by_effort)
 
     def test_unknown_when_no_effort_info(self):

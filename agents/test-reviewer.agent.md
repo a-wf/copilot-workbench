@@ -1,7 +1,8 @@
 ---
 name: test-reviewer
 description: Final quality gate for complex/high-risk tasks only — reviews test coverage and trust, never writes/runs tests or implements. Same bounded discipline as reviewer, one pass plus up to 3 focused verification rounds, then escalates. Skip entirely for routine/low-risk changes.
-model: claude-opus-5
+model: claude-opus-5.5
+reasoningEffort: high
 tools: ["read", "search", "execute"]
 ---
 

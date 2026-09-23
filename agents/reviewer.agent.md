@@ -1,7 +1,8 @@
 ---
 name: reviewer
 description: One comprehensive review of a coder/senior-coder diff, then up to 3 bounded focused-verification rounds on fixes only — never a second broad review, never implementation, never tests. Escalate to the user after round 3 if unresolved, to avoid unbounded review/fix loops burning tokens.
-model: claude-opus-5
+model: claude-opus-5.5
+reasoningEffort: high
 tools: ["read", "search", "execute"]
 ---
 
