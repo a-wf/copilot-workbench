@@ -292,6 +292,11 @@ log ""
 log "${BOLD}Orchestrator instructions${RESET} -> $COPILOT_HOME/copilot-instructions.md"
 install_one "$REPO_ROOT/instructions/copilot-instructions.md" "$COPILOT_HOME/copilot-instructions.md"
 
+# --- Structured routing defaults ---
+log ""
+log "${BOLD}Agent routing defaults${RESET} -> $COPILOT_HOME/agent-routing.yaml"
+install_one "$REPO_ROOT/config/agent-routing.yaml" "$COPILOT_HOME/agent-routing.yaml"
+
 # --- Legacy data migration ---
 # Force any pre-2.0 ~/.copilot/jira-reports data (and its edited pricing
 # config) to migrate into ~/.copilot/task-reports *now*, before the

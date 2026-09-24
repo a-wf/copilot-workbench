@@ -8,6 +8,26 @@ task tiers and routing rules below to decide what to invoke, invoke only
 those agents, and briefly tell the user which stages you skipped and why
 so it's never silent.
 
+## Hard routing defaults
+
+When you invoke one of this toolkit's custom agents through the task tool,
+pass the matching hard routing parameters below (`model`,
+`reasoning_effort`, and `context_tier`) in the task call. These values are
+the repository defaults mirrored in `config/agent-routing.yaml`; they are
+stronger than natural-language suggestions because they are explicit task
+tool parameters. If the current user explicitly overrides a model/effort
+for this task, follow the user's override and mention the deviation.
+
+| Agent | Model | Reasoning effort | Context tier |
+|---|---|---|---|
+| `discovery` | `gemini-3.8-flash` | `low` | `long_context` |
+| `planner` | `gpt-6-sol` | `high` | `long_context` |
+| `coder` | `gpt-6-luna` | `max` | `default` |
+| `senior-coder` | `claude-opus-5.5` | `high` | `long_context` |
+| `reviewer` | `claude-opus-5.5` | `high` | `long_context` |
+| `tester` | `gpt-6-luna` | `max` | `default` |
+| `test-reviewer` | `claude-opus-5.5` | `high` | `long_context` |
+
 ## Core principle: no duplicated work
 
 Each agent owns a narrow slice of the task and must not redo work another

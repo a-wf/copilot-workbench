@@ -30,6 +30,11 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
   is available) to match the new defaults.
 - Updated `tests/test_agent_pipeline.py`'s `EXPECTED_AGENTS` and
   `tests/test_copilot_task_report.py`'s inferred-effort fixture to match.
+- Added `config/agent-routing.yaml` as a structured toolkit routing table
+  for hard task-call defaults (`model`, `reasoning_effort`,
+  `context_tier`), mirrored the same table in
+  `instructions/copilot-instructions.md`, and updated the installer/tests
+  to keep it synced locally at `~/.copilot/agent-routing.yaml`.
 
 ### Documentation
 

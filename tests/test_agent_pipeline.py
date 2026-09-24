@@ -31,6 +31,7 @@ import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AGENTS_DIR = os.path.join(REPO_ROOT, "agents")
+ROUTING_CONFIG = os.path.join(REPO_ROOT, "config", "agent-routing.yaml")
 INSTALL_SH = os.path.join(REPO_ROOT, "scripts", "install.sh")
 
 EXPECTED_AGENTS = {
@@ -78,6 +79,51 @@ EXPECTED_AGENTS = {
     },
 }
 
+EXPECTED_ROUTING = {
+    "discovery": {
+        "role": "Codebase Mapping Specialist",
+        "model": "gemini-3.8-flash",
+        "reasoning_effort": "low",
+        "context_tier": "long_context",
+    },
+    "planner": {
+        "role": "Implementation Planner",
+        "model": "gpt-6-sol",
+        "reasoning_effort": "high",
+        "context_tier": "long_context",
+    },
+    "coder": {
+        "role": "Routine Implementation Engineer",
+        "model": "gpt-6-luna",
+        "reasoning_effort": "max",
+        "context_tier": "default",
+    },
+    "senior-coder": {
+        "role": "Senior Software Engineer / Architect",
+        "model": "claude-opus-5.5",
+        "reasoning_effort": "high",
+        "context_tier": "long_context",
+    },
+    "reviewer": {
+        "role": "Code Review Specialist",
+        "model": "claude-opus-5.5",
+        "reasoning_effort": "high",
+        "context_tier": "long_context",
+    },
+    "tester": {
+        "role": "Test Engineer",
+        "model": "gpt-6-luna",
+        "reasoning_effort": "max",
+        "context_tier": "default",
+    },
+    "test-reviewer": {
+        "role": "Test Coverage Reviewer",
+        "model": "claude-opus-5.5",
+        "reasoning_effort": "high",
+        "context_tier": "long_context",
+    },
+}
+
 
 def parse_frontmatter(path):
     """Parse the `key: value` YAML-ish frontmatter block of an agent file.
@@ -105,6 +151,39 @@ def parse_frontmatter(path):
             result[key] = tools_match
         else:
             result[key] = value
+    return result
+
+
+def parse_agent_routing(path):
+    """Parse config/agent-routing.yaml's intentionally-small schema.
+
+    The project avoids a PyYAML dependency for tests. This parser is
+    deliberately limited to the exact repository-owned format:
+    agent-name -> role scalar + one-line copilot map.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    result = {}
+    current = None
+    for raw_line in content.splitlines():
+        line = raw_line.rstrip()
+        agent_match = re.match(r"^  ([a-z][a-z-]*):$", line)
+        if agent_match:
+            current = agent_match.group(1)
+            result[current] = {}
+            continue
+        if current is None:
+            continue
+        role_match = re.match(r"^    role: (.+)$", line)
+        if role_match:
+            result[current]["role"] = role_match.group(1)
+            continue
+        copilot_match = re.match(r"^    copilot: \{ (.+) \}$", line)
+        if copilot_match:
+            for item in copilot_match.group(1).split(", "):
+                key, _, value = item.partition(": ")
+                result[current][key] = value
     return result
 
 
@@ -158,6 +237,18 @@ class TestAgentInventory(unittest.TestCase):
                 self.assertTrue(
                     fm.get("description"),
                     f"{name}.agent.md must have a non-empty description",
+                )
+
+    def test_structured_routing_config_matches_agent_defaults(self):
+        routing = parse_agent_routing(ROUTING_CONFIG)
+        self.assertEqual(routing, EXPECTED_ROUTING)
+
+        for name, expected in EXPECTED_AGENTS.items():
+            with self.subTest(agent=name):
+                self.assertEqual(routing[name]["model"], expected["model"])
+                self.assertEqual(
+                    routing[name]["reasoning_effort"],
+                    expected["reasoningEffort"],
                 )
 
     def test_discovery_description_is_read_only_and_bounded(self):
@@ -348,6 +439,14 @@ class TestRetiredFixerCleanup(BaseHomeTestCase):
         for name in ("discovery", "senior-coder"):
             installed = os.path.join(self.home, ".copilot", "agents", f"{name}.agent.md")
             self.assertTrue(os.path.islink(installed), f"{installed} should be installed")
+
+    def test_agent_routing_config_is_installed(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        installed = os.path.join(self.home, ".copilot", "agent-routing.yaml")
+        self.assertTrue(os.path.islink(installed), f"{installed} should be installed")
+        self.assertEqual(os.path.realpath(installed), os.path.realpath(ROUTING_CONFIG))
 
 
 if __name__ == "__main__":

@@ -306,6 +306,15 @@ capability. Each `reasoningEffort` is a per-agent frontmatter default
 (CLI v1.0.66+) — override per-installation via `/subagents` rather than
 editing `agents/*.agent.md` directly.
 
+Hard routing defaults also live in `config/agent-routing.yaml` and are
+installed to `~/.copilot/agent-routing.yaml`. This YAML file is a toolkit
+convention — not an official Copilot CLI config file — used to make the
+orchestrator's task-tool calls explicit for `model`, `reasoning_effort`,
+and `context_tier`. The same table is mirrored in
+`instructions/copilot-instructions.md`, which is the file Copilot actually
+loads automatically, so the orchestrator can pass those values as hard
+task-call parameters instead of relying only on Markdown suggestions.
+
 ¹ Models listed in each `agents/*.agent.md` file are this release's
 shipped, CI-validated defaults — not a recommendation frozen in time, but
 also not something you need to edit source to change. For a personal

@@ -1,0 +1,35 @@
+# Structured routing defaults for the toolkit orchestrator.
+#
+# This is a toolkit convention, not an official Copilot CLI config file.
+# Official custom-agent definitions still live in agents/*.agent.md; this
+# file exists so the orchestrator can pass hard task-call parameters
+# (model, reasoning_effort, context_tier) instead of relying only on
+# Markdown guidance.
+#
+# Keep this file in sync with:
+# - agents/*.agent.md frontmatter
+# - instructions/copilot-instructions.md
+# - README.md's "Agent pipeline" section
+# - tests/test_agent_pipeline.py EXPECTED_AGENTS / EXPECTED_ROUTING
+agents:
+  discovery:
+    role: Codebase Mapping Specialist
+    copilot: { model: gemini-3.8-flash, reasoning_effort: low, context_tier: long_context }
+  planner:
+    role: Implementation Planner
+    copilot: { model: gpt-6-sol, reasoning_effort: high, context_tier: long_context }
+  coder:
+    role: Routine Implementation Engineer
+    copilot: { model: gpt-6-luna, reasoning_effort: max, context_tier: default }
+  senior-coder:
+    role: Senior Software Engineer / Architect
+    copilot: { model: claude-opus-5.5, reasoning_effort: high, context_tier: long_context }
+  reviewer:
+    role: Code Review Specialist
+    copilot: { model: claude-opus-5.5, reasoning_effort: high, context_tier: long_context }
+  tester:
+    role: Test Engineer
+    copilot: { model: gpt-6-luna, reasoning_effort: max, context_tier: default }
+  test-reviewer:
+    role: Test Coverage Reviewer
+    copilot: { model: claude-opus-5.5, reasoning_effort: high, context_tier: long_context }
