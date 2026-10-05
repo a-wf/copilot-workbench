@@ -28,8 +28,9 @@
 # Idempotent: running this script repeatedly is safe. Any pre-existing file
 # at a destination that isn't already managed by this toolkit is backed up
 # (never deleted) before being replaced. The user's editable pricing config
-# (model-pricing.json) is only ever copied into place if it does not already
-# exist at the destination — it is never overwritten or symlinked.
+# (model-pricing.json) and the company fixed per-request charge config
+# (request-pricing.json) are each only ever copied into place if they do not
+# already exist at the destination — never overwritten or symlinked.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -332,6 +333,24 @@ else
   else
     cp "$REPO_ROOT/config/model-pricing.json" "$pricing_dest"
     log "  ${GREEN}installed${RESET} $pricing_dest (initial copy — edit freely, future installs won't touch it)"
+  fi
+fi
+
+# --- Company fixed per-request charge config: copy-only-if-absent ---
+# Same pattern as the pricing config above: a user/company-editable file
+# that is never overwritten, so local rate edits are always preserved.
+log ""
+log "${BOLD}Company request-pricing config${RESET} -> $COPILOT_HOME/task-reports/request-pricing.json"
+request_pricing_dest="$COPILOT_HOME/task-reports/request-pricing.json"
+mkdir_p "$(dirname "$request_pricing_dest")"
+if [[ -e "$request_pricing_dest" ]]; then
+  log "  ${DIM}skipped${RESET} (already exists — your edits are preserved): $request_pricing_dest"
+else
+  if $DRY_RUN; then
+    run_note "cp $REPO_ROOT/config/request-pricing.json $request_pricing_dest"
+  else
+    cp "$REPO_ROOT/config/request-pricing.json" "$request_pricing_dest"
+    log "  ${GREEN}installed${RESET} $request_pricing_dest (initial copy — edit freely, future installs won't touch it)"
   fi
 fi
 

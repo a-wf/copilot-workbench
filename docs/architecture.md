@@ -25,6 +25,7 @@ flowchart TB
         HELPER["bin/copilot-task-report.py\n(ingest + report renderer)"]
         STATE["~/.copilot/task-reports/\nsession-state.json, tasks/*.json"]
         PRICING["~/.copilot/task-reports/\nmodel-pricing.json (user-editable)"]
+        REQPRICING["~/.copilot/task-reports/\nrequest-pricing.json (company policy, editable)"]
         REPORTS["Task usage reports (Markdown)\ndefault: ~/Desktop/CopilotTaskReports\noverride: $COPILOT_TASK_REPORTS_DIR"]
     end
 
@@ -35,6 +36,7 @@ flowchart TB
     OTEL --> HELPER
     EVENTS --> HELPER
     PRICING --> HELPER
+    REQPRICING --> HELPER
     HELPER --> STATE
     HELPER --> REPORTS
 ```
@@ -96,6 +98,7 @@ aggregate as Markdown.
 | OTEL span files (`~/.copilot/otel/copilot-otel-*.jsonl`) | Per-call model, token counts (prompt/completion/reasoning/cache-read), call duration, and (when present) the per-call reasoning-effort level | This is the **primary** source — the real conversation model calls. `events.jsonl`'s own model-call events only cover small internal utility calls, not the primary chat turns. |
 | `events.jsonl` (per session, under `~/.copilot/session-state/<id>/`) | Configured reasoning-effort timeline (`session.start`/`resume`/`model_change`), cumulative Copilot-internal usage checkpoints (`session.usage_checkpoint`), and subagent start/complete pairs | **Secondary** source, ingested independently of OTEL — a missing/late-arriving file on either side never blocks the other. |
 | `config/model-pricing.json` (installed to `~/.copilot/task-reports/model-pricing.json`, user-editable) | USD/1M-token rates per model, plus an alias map | Turns raw token counts into an approximate, independent USD estimate. Models with no pricing entry (after alias resolution) are reported as "no pricing data", never silently priced at $0. |
+| `config/request-pricing.json` (installed to `~/.copilot/task-reports/request-pricing.json` only if absent, editable) | Company-configured fixed USD per **model request**, keyed by model + reasoning-effort level (company-configured fixed rates; each model entry lists its own source), plus an alias map | Produces the separate "Company Fixed Per-Request Charge" section from the joint `by_model_effort` aggregation. Not official GitHub pricing, never a verified bill, never added to the token estimate. Missing config → *unavailable* (not $0); invalid config (non-numeric, boolean, negative, non-finite, wrong shape) → rejected whole with an explicit error. Unknown effort and unconfigured/`null` rates are unpriced and flagged (partial lower bound). "Requests" = OTEL usage-bearing model spans, incl. retried/failed calls that reported usage — not a guarantee every request was captured. |
 
 ### Ingest semantics (why it's safe to run repeatedly)
 
@@ -117,6 +120,13 @@ aggregate as Markdown.
 - **Timestamped effort timeline** — a mid-session change to the configured
   reasoning effort only relabels calls that happened *after* the change,
   never calls that already happened before it.
+- **Joint model × effort aggregation** — alongside the separate `by_model`
+  and `by_effort` tables, each task stores `by_model_effort`
+  (`{model: {effort_key: aggregate}}`) so per-(model, effort) fixed request
+  charges can be computed exactly. Task files persisted before this field
+  existed get it started empty (with a `by_model_effort_since` timestamp);
+  their earlier requests are reported as explicitly *unattributed*, never
+  backfilled by guessing a split from the two marginal tables.
 - **Atomic, lock-protected writes** — the whole ingest cycle is wrapped in
   a best-effort cross-process file lock (`fcntl.flock`, falling back to
   unlocked operation if unavailable), and every file write goes through a

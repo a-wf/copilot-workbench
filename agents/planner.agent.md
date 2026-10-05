@@ -1,8 +1,8 @@
 ---
 name: planner
 description: Optional planning-only stage for ambiguous or design-heavy tasks. Turns a task (plus any discovery findings) into a concise, ordered implementation plan — never writes code. Skip for unambiguous work to save tokens. Use only when the approach isn't obvious.
-model: gpt-6-sol
-reasoningEffort: high
+model: gpt-6.1-sol
+reasoningEffort: medium
 tools: ["read", "search", "web"]
 ---
 

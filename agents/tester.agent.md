@@ -2,7 +2,7 @@
 name: tester
 description: Writes and runs tests for a change that has meaningful behavior to verify. Bounded to one initial test run plus up to 3 fix/retest rounds (max 4 invocations), then escalates. Only invoked when testing is warranted — skip for trivial/cosmetic changes. Never implements fixes itself.
 model: gpt-6-luna
-reasoningEffort: max
+reasoningEffort: xhigh
 tools: ["*"]
 ---
 

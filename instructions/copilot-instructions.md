@@ -8,6 +8,38 @@ task tiers and routing rules below to decide what to invoke, invoke only
 those agents, and briefly tell the user which stages you skipped and why
 so it's never silent.
 
+## Mandatory stage communication
+
+Stage skipping is a cost-control decision, not an invisible internal
+detail. The user must never have to ask whether the orchestrator or agents
+were used.
+
+Before starting substantive work, send one concise routing update that:
+
+1. names the task tier (`trivial`, `small`, `standard`, `complex`, or
+   `high-risk`);
+2. names the stage being run or says the main session is handling the task
+   directly; and
+3. names every stage or grouped set of stages being skipped, with a short
+   reason for each skip.
+
+Example:
+
+> Small instruction-only change. Skipping discovery/planner because the
+> target and approach are explicit; handling the edit directly. Skipping
+> reviewer/tester/test-reviewer because there is no executable behavior.
+
+If a skip decision is made later rather than during initial routing
+(for example, tests become unnecessary after inspection), communicate it
+at that transition before continuing. Do not wait until the user asks, and
+do not rely only on the final answer. The final answer should also contain
+one compact `Stages:` line recording what ran and what was skipped.
+
+For a pure question or informational request, the same rule applies:
+state that the main session is answering directly and briefly group the
+inapplicable implementation stages with their reason. Keep this to one
+sentence so the communication itself does not waste tokens.
+
 ## Hard routing defaults
 
 When you invoke one of this toolkit's custom agents through the task tool,
@@ -21,12 +53,64 @@ for this task, follow the user's override and mention the deviation.
 | Agent | Model | Reasoning effort | Context tier |
 |---|---|---|---|
 | `discovery` | `gemini-3.8-flash` | `low` | `long_context` |
-| `planner` | `gpt-6-sol` | `high` | `long_context` |
-| `coder` | `gpt-6-luna` | `max` | `default` |
+| `planner` | `gpt-6.1-sol` | `medium` | `long_context` |
+| `coder` | `gpt-6-luna` | `xhigh` | `default` |
 | `senior-coder` | `claude-opus-5.5` | `high` | `long_context` |
 | `reviewer` | `claude-opus-5.5` | `high` | `long_context` |
-| `tester` | `gpt-6-luna` | `max` | `default` |
+| `tester` | `gpt-6-luna` | `xhigh` | `default` |
 | `test-reviewer` | `claude-opus-5.5` | `high` | `long_context` |
+
+### Built-in Task tool route — routine mechanical work
+
+The built-in `task` subagent is not one of this toolkit's seven custom
+agents; it is provided by the Copilot CLI, has no
+`agents/task.agent.md`, and does not appear as an eighth custom agent in
+`/agent`. When a routine shell/git operation is safe and can be stated as
+a bounded command, delegate its execution to this built-in instead of
+spending the main session's more expensive reasoning on the mechanics.
+This is a cost-saving operation even when no coding-agent stage is needed;
+do not skip it just because the change is simple.
+
+| Built-in role | Model | Reasoning effort | Context tier |
+|---|---|---|---|
+| `task` — mechanical shell task executor | `gpt-6-luna` | `low` | `default` |
+
+### Mandatory route — small/casual implementation
+
+For small or casual implementation/edit requests, delegate implementation
+using the `task` tool to invoke the named custom agent `coder`, passing
+`model: gpt-6-luna`, `reasoning_effort: low`, and
+`context_tier: default`. This is a mandatory implementation delegation,
+not a route to the built-in `task` shell executor. The main session defines
+the scope, coordinates the work, and retains oversight of the result.
+`coder` implements only; it does not test or review its own changes.
+Depending on risk and behavior, the main session may additionally invoke
+`reviewer` and/or `tester` when warranted, but neither is required for
+every small implementation.
+
+Simple informational questions should be answered directly in the main
+session. Routine shell/git and other mechanical command execution remains
+the built-in `task` route described above; do not use `coder` for mechanics.
+
+Use it for bounded command execution such as checking git status/diffs,
+running an already-selected formatter, build, or test command, and
+performing an explicitly requested mechanical commit. Keep its assignment
+to the exact operation and scope; it must not expand the request, do broad
+codebase discovery, implement or review code, or start another agent.
+`discovery` is a read-only codebase-mapping role, not a shell runner, and
+must never be selected to execute commands or commits.
+Do not route mechanical shell/git work to `coder`, `senior-coder`, or
+`reviewer` merely because they are available; in particular, never spend
+an Opus/senior-coder call on command execution when the built-in Task
+route is available.
+
+Never commit or push unless the user explicitly asks for that action. For
+an authorized commit, route the mechanical git work to `task` by default,
+limit staging to the requested changes, and preserve unrelated dirty
+edits. Do not delegate destructive operations or unreviewed changes
+without authorization. If the Task tool is unavailable, or a command
+requires security-sensitive or complex judgment that is unsafe to hand
+off mechanically, handle it in the main session and tell the user why.
 
 ## Core principle: no duplicated work
 
@@ -42,6 +126,10 @@ stage already did:
   implementation confidence and any obvious limitations it noticed
   while writing the change, but it may never review, approve, or test
   its own work — that always requires handing off to `reviewer`/`tester`.
+- The main session may delegate bounded mechanical shell/git execution to
+  the built-in `task` subagent using the route above. The main session
+  initiates that delegation and retains oversight; `task` executes only
+  the assigned operation and does not delegate further.
 - `reviewer` does one broad review, then only narrow, bounded
   verification of what came back — never a second broad pass.
 - `tester` tests; it never fixes implementation bugs itself.
@@ -188,8 +276,9 @@ Only after `test-reviewer` approves (or, for tasks that skip it, after
 ## Rules
 
 - Every stage is optional — skip freely when the tier/matrix above says
-  to, but always tell the user which stage(s) were skipped and why, so
-  it's never silent.
+  to, but follow the mandatory stage-communication contract above: report
+  skips before work starts, report later skip decisions at the transition,
+  and include the compact final `Stages:` record.
 - Never let a stage duplicate work another stage already did: don't
   re-explore what `discovery` already mapped, don't re-plan what
   `planner` already decided, don't let `reviewer`/`test-reviewer` restart

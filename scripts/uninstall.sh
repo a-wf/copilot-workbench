@@ -8,7 +8,9 @@
 #   - Task/session ingest state (~/.copilot/task-reports/tasks,
 #     session-state.json, install-marker.json)
 #   - The user's pricing config (~/.copilot/task-reports/model-pricing.json)
-#     — this file is copy-once-if-absent and is never toolkit-managed.
+#     and company request-pricing config
+#     (~/.copilot/task-reports/request-pricing.json) — both are
+#     copy-once-if-absent and never toolkit-managed.
 #   - Copilot session state (~/.copilot/session-state, ~/.copilot-sessions)
 #   - Any other user data.
 #

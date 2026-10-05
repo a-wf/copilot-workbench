@@ -32,7 +32,12 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AGENTS_DIR = os.path.join(REPO_ROOT, "agents")
 ROUTING_CONFIG = os.path.join(REPO_ROOT, "config", "agent-routing.yaml")
+ORCHESTRATOR_INSTRUCTIONS = os.path.join(
+    REPO_ROOT, "instructions", "copilot-instructions.md"
+)
 INSTALL_SH = os.path.join(REPO_ROOT, "scripts", "install.sh")
+UNINSTALL_SH = os.path.join(REPO_ROOT, "scripts", "uninstall.sh")
+REQUEST_PRICING_SOURCE = os.path.join(REPO_ROOT, "config", "request-pricing.json")
 
 EXPECTED_AGENTS = {
     # This is this release's shipped, CI-validated *repository default* for
@@ -48,13 +53,13 @@ EXPECTED_AGENTS = {
         "tools": ["read", "search"],
     },
     "planner": {
-        "model": "gpt-6-sol",
-        "reasoningEffort": "high",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "medium",
         "tools": ["read", "search", "web"],
     },
     "coder": {
         "model": "gpt-6-luna",
-        "reasoningEffort": "max",
+        "reasoningEffort": "xhigh",
         "tools": ["*"],
     },
     "senior-coder": {
@@ -69,7 +74,7 @@ EXPECTED_AGENTS = {
     },
     "tester": {
         "model": "gpt-6-luna",
-        "reasoningEffort": "max",
+        "reasoningEffort": "xhigh",
         "tools": ["*"],
     },
     "test-reviewer": {
@@ -80,47 +85,65 @@ EXPECTED_AGENTS = {
 }
 
 EXPECTED_ROUTING = {
-    "discovery": {
-        "role": "Codebase Mapping Specialist",
-        "model": "gemini-3.8-flash",
-        "reasoning_effort": "low",
-        "context_tier": "long_context",
+    "agents": {
+        "discovery": {
+            "role": "Codebase Mapping Specialist",
+            "model": "gemini-3.8-flash",
+            "reasoning_effort": "low",
+            "context_tier": "long_context",
+        },
+        "planner": {
+            "role": "Implementation Planner",
+            "model": "gpt-6.1-sol",
+            "reasoning_effort": "medium",
+            "context_tier": "long_context",
+        },
+        "coder": {
+            "role": "Routine Implementation Engineer",
+            "model": "gpt-6-luna",
+            "reasoning_effort": "xhigh",
+            "context_tier": "default",
+        },
+        "senior-coder": {
+            "role": "Senior Software Engineer / Architect",
+            "model": "claude-opus-5.5",
+            "reasoning_effort": "high",
+            "context_tier": "long_context",
+        },
+        "reviewer": {
+            "role": "Code Review Specialist",
+            "model": "claude-opus-5.5",
+            "reasoning_effort": "high",
+            "context_tier": "long_context",
+        },
+        "tester": {
+            "role": "Test Engineer",
+            "model": "gpt-6-luna",
+            "reasoning_effort": "xhigh",
+            "context_tier": "default",
+        },
+        "test-reviewer": {
+            "role": "Test Coverage Reviewer",
+            "model": "claude-opus-5.5",
+            "reasoning_effort": "high",
+            "context_tier": "long_context",
+        },
     },
-    "planner": {
-        "role": "Implementation Planner",
-        "model": "gpt-6-sol",
-        "reasoning_effort": "high",
-        "context_tier": "long_context",
+    "built_in_tools": {
+        "task": {
+            "role": "Mechanical Shell Task Executor",
+            "model": "gpt-6-luna",
+            "reasoning_effort": "low",
+            "context_tier": "default",
+        },
     },
-    "coder": {
-        "role": "Routine Implementation Engineer",
-        "model": "gpt-6-luna",
-        "reasoning_effort": "max",
-        "context_tier": "default",
-    },
-    "senior-coder": {
-        "role": "Senior Software Engineer / Architect",
-        "model": "claude-opus-5.5",
-        "reasoning_effort": "high",
-        "context_tier": "long_context",
-    },
-    "reviewer": {
-        "role": "Code Review Specialist",
-        "model": "claude-opus-5.5",
-        "reasoning_effort": "high",
-        "context_tier": "long_context",
-    },
-    "tester": {
-        "role": "Test Engineer",
-        "model": "gpt-6-luna",
-        "reasoning_effort": "max",
-        "context_tier": "default",
-    },
-    "test-reviewer": {
-        "role": "Test Coverage Reviewer",
-        "model": "claude-opus-5.5",
-        "reasoning_effort": "high",
-        "context_tier": "long_context",
+    "task_routing": {
+        "small_casual_implementation": {
+            "agent": "coder",
+            "model": "gpt-6-luna",
+            "reasoning_effort": "low",
+            "context_tier": "default",
+        },
     },
 }
 
@@ -159,35 +182,140 @@ def parse_agent_routing(path):
 
     The project avoids a PyYAML dependency for tests. This parser is
     deliberately limited to the exact repository-owned format:
-    agent-name -> role scalar + one-line copilot map.
+    root section -> route name -> scalar fields + optional one-line
+    copilot map.
     """
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    result = {}
-    current = None
+    result = {"agents": {}, "built_in_tools": {}, "task_routing": {}}
+    current_section = None
+    current_route = None
     for raw_line in content.splitlines():
         line = raw_line.rstrip()
-        agent_match = re.match(r"^  ([a-z][a-z-]*):$", line)
-        if agent_match:
-            current = agent_match.group(1)
-            result[current] = {}
+        section_match = re.match(r"^([a-z_]+):$", line)
+        if section_match:
+            section = section_match.group(1)
+            current_section = section if section in result else None
+            current_route = None
             continue
-        if current is None:
+        route_match = re.match(r"^  ([a-z][a-z_-]*):$", line)
+        if route_match:
+            current_route = route_match.group(1)
+            if current_section is not None:
+                result[current_section][current_route] = {}
             continue
-        role_match = re.match(r"^    role: (.+)$", line)
-        if role_match:
-            result[current]["role"] = role_match.group(1)
+        if current_section is None or current_route is None:
             continue
         copilot_match = re.match(r"^    copilot: \{ (.+) \}$", line)
         if copilot_match:
             for item in copilot_match.group(1).split(", "):
                 key, _, value = item.partition(": ")
-                result[current][key] = value
+                result[current_section][current_route][key] = value
+            continue
+        scalar_match = re.match(r"^    ([a-z_]+): (.+)$", line)
+        if scalar_match:
+            result[current_section][current_route][scalar_match.group(1)] = (
+                scalar_match.group(2)
+            )
     return result
 
 
 class TestAgentInventory(unittest.TestCase):
+    def test_small_casual_implementation_and_questions_have_distinct_routes(self):
+        with open(ORCHESTRATOR_INSTRUCTIONS, "r", encoding="utf-8") as f:
+            instructions = " ".join(f.read().split()).lower()
+
+        required_phrases = (
+            "for small or casual implementation/edit requests, delegate implementation using the `task` tool to invoke the named custom agent `coder`",
+            "model: gpt-6-luna`, `reasoning_effort: low`, and `context_tier: default`",
+            "this is a mandatory implementation delegation, not a route to the built-in `task` shell executor",
+            "the main session defines the scope, coordinates the work, and retains oversight of the result",
+            "simple informational questions should be answered directly in the main session",
+            "routine shell/git and other mechanical command execution remains the built-in `task` route described above; do not use `coder` for mechanics",
+        )
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, instructions)
+
+    def test_orchestrator_requires_explicit_stage_skip_communication(self):
+        with open(ORCHESTRATOR_INSTRUCTIONS, "r", encoding="utf-8") as f:
+            instructions = f.read()
+
+        required_phrases = (
+            "## Mandatory stage communication",
+            "Before starting substantive work",
+            "names every stage or grouped set of stages being skipped",
+            "Do not wait until the user asks",
+            "do not rely only on the final answer",
+            "compact `Stages:` line",
+            "For a pure question or informational request",
+        )
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, instructions)
+
+    def test_task_route_is_a_builtin_not_an_eighth_custom_agent(self):
+        routing = parse_agent_routing(ROUTING_CONFIG)
+
+        self.assertEqual(
+            set(routing), {"agents", "built_in_tools", "task_routing"}
+        )
+        self.assertEqual(set(routing["agents"]), set(EXPECTED_AGENTS))
+        self.assertEqual(len(EXPECTED_AGENTS), 7)
+        self.assertNotIn("task", EXPECTED_AGENTS)
+        self.assertNotIn("task", routing["agents"])
+        self.assertIn("task", routing["built_in_tools"])
+        self.assertFalse(os.path.exists(os.path.join(AGENTS_DIR, "task.agent.md")))
+
+    def test_task_builtin_route_uses_expected_low_cost_parameters(self):
+        task_route = parse_agent_routing(ROUTING_CONFIG)["built_in_tools"]["task"]
+        self.assertEqual(
+            task_route,
+            {
+                "role": "Mechanical Shell Task Executor",
+                "model": "gpt-6-luna",
+                "reasoning_effort": "low",
+                "context_tier": "default",
+            },
+        )
+
+    def test_builtin_task_route_is_documented_as_cost_saving_without_coding_stage(self):
+        with open(os.path.join(REPO_ROOT, "README.md"), "r", encoding="utf-8") as f:
+            readme = " ".join(f.read().split()).lower()
+
+        required_phrases = (
+            "`task` (copilot cli built-in; not a custom agent)",
+            "has no `agents/task.agent.md`",
+            "cost-saving operation, even when no coding-agent stage is warranted",
+            "main session remains responsible for defining scope and checking the result",
+        )
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, readme)
+
+    def test_builtin_task_delegation_safety_policy_is_documented(self):
+        with open(ORCHESTRATOR_INSTRUCTIONS, "r", encoding="utf-8") as f:
+            instructions = " ".join(f.read().split()).lower()
+
+        required_phrases = (
+            "the main session initiates that delegation and retains oversight",
+            "keep its assignment to the exact operation and scope",
+            "or start another agent",
+            "`discovery` is a read-only codebase-mapping role",
+            "must never be selected to execute commands or commits",
+            "never commit or push unless the user explicitly asks",
+            "limit staging to the requested changes, and preserve unrelated dirty edits",
+            "do not delegate destructive operations or unreviewed changes without authorization",
+            "if the task tool is unavailable, or a command requires security-sensitive or complex judgment",
+            "handle it in the main session and tell the user why",
+            "do not route mechanical shell/git work to `coder`, `senior-coder`, or `reviewer`",
+            "never spend an opus/senior-coder call on command execution",
+        )
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, instructions)
+
     def test_exactly_expected_agent_files_exist(self):
         found = {
             os.path.splitext(os.path.splitext(name)[0])[0]
@@ -245,9 +373,11 @@ class TestAgentInventory(unittest.TestCase):
 
         for name, expected in EXPECTED_AGENTS.items():
             with self.subTest(agent=name):
-                self.assertEqual(routing[name]["model"], expected["model"])
                 self.assertEqual(
-                    routing[name]["reasoning_effort"],
+                    routing["agents"][name]["model"], expected["model"]
+                )
+                self.assertEqual(
+                    routing["agents"][name]["reasoning_effort"],
                     expected["reasoningEffort"],
                 )
 
@@ -370,8 +500,21 @@ class BaseHomeTestCase(unittest.TestCase):
             timeout=30,
         )
 
+    def run_uninstall(self):
+        return subprocess.run(
+            ["bash", UNINSTALL_SH],
+            env=self.env(),
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
     def manifest_path(self):
         return os.path.join(self.home, ".copilot-cli-toolkit", "install-manifest.txt")
+
+    def request_pricing_path(self):
+        return os.path.join(self.home, ".copilot", "task-reports", "request-pricing.json")
 
     def fixer_path(self):
         return os.path.join(self.home, ".copilot", "agents", "fixer.agent.md")
@@ -447,6 +590,65 @@ class TestRetiredFixerCleanup(BaseHomeTestCase):
         installed = os.path.join(self.home, ".copilot", "agent-routing.yaml")
         self.assertTrue(os.path.islink(installed), f"{installed} should be installed")
         self.assertEqual(os.path.realpath(installed), os.path.realpath(ROUTING_CONFIG))
+
+
+class TestRequestPricingConfigInstall(BaseHomeTestCase):
+    """The user-editable fixed-request pricing config is copied only when
+    absent and remains user data through reinstall and uninstall."""
+
+    def test_config_is_copied_when_absent_and_user_edits_are_preserved(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        destination = self.request_pricing_path()
+        self.assertTrue(os.path.isfile(destination))
+        self.assertFalse(os.path.islink(destination), "request pricing must be copied, not symlinked")
+        with open(REQUEST_PRICING_SOURCE, "rb") as f:
+            shipped_contents = f.read()
+        with open(destination, "rb") as f:
+            self.assertEqual(f.read(), shipped_contents)
+
+        edited_contents = b'{"company": "custom rate policy"}\n'
+        with open(destination, "wb") as f:
+            f.write(edited_contents)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(destination, "rb") as f:
+            self.assertEqual(f.read(), edited_contents)
+
+    def test_preexisting_request_pricing_symlink_is_preserved(self):
+        destination = self.request_pricing_path()
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        target = os.path.join(self.home, "custom-request-pricing.json")
+        target_contents = b'{"custom": true}\n'
+        with open(target, "wb") as f:
+            f.write(target_contents)
+        os.symlink(target, destination)
+
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.islink(destination))
+        self.assertEqual(os.path.realpath(destination), os.path.realpath(target))
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), target_contents)
+
+    def test_uninstall_does_not_remove_request_pricing_config(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        destination = self.request_pricing_path()
+        self.assertTrue(os.path.isfile(destination))
+
+        with open(destination, "rb") as f:
+            original_contents = f.read()
+        with open(self.manifest_path(), "r", encoding="utf-8") as f:
+            manifest = f.read().splitlines()
+        self.assertNotIn(destination, manifest)
+
+        result = self.run_uninstall()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(os.path.isfile(destination))
+        with open(destination, "rb") as f:
+            self.assertEqual(f.read(), original_contents)
 
 
 if __name__ == "__main__":

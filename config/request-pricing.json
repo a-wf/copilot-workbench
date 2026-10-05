@@ -1,0 +1,32 @@
+{
+  "_readme": "Company-configured FIXED per-model-request charge policy, used by copilot-task-report.py for the 'Company Fixed Per-Request Charge' report section. The company charges a fixed USD amount per MODEL REQUEST (one OTEL usage-bearing model span, including retried/failed calls that reported usage), keyed by model id and reasoning-effort level. Rates are company-configured fixed per-request amounts; each model entry lists its own 'source' (e.g. the company price list or an Artificial Analysis page). They are NOT official GitHub/Copilot pricing, and the resulting amount is never a verified bill. This file is SEPARATE from model-pricing.json (the independent, approximate token-based USD estimate); the two figures are reported independently and must not be added together. Format: models.<model-id>.rates.<effort-level> = finite, nonnegative number (USD per request) or null (explicitly unpriced). Booleans, strings, negative or non-finite values make the WHOLE file invalid (reported explicitly, never treated as $0). Requests whose effort level is unknown are never priced (no fallback level is assumed). 'aliases' maps another model id spelling to an entry key (or null for explicitly unpriced); alias chains are followed with a cycle guard. Edit freely — the installer only copies this file if it is absent and never overwrites your edits.",
+  "policy_label": "Company-configured fixed per-request rates (per-model sources listed below) — not official GitHub pricing",
+  "unit": "model_request",
+  "currency": "USD",
+  "updated_at": "2026-10-05",
+  "models": {
+    "gpt-6-luna": {
+      "rates": { "xhigh": 0.04 },
+      "source": "Company price list (2026-09-30 screenshot; user-confirmed per-request billing 2026-10-05)"
+    },
+    "gpt-6.1-sol": {
+      "rates": { "medium": 0.21, "xhigh": 0.39 },
+      "source": "Company price list (2026-09-30 screenshot; user-confirmed per-request billing 2026-10-05)"
+    },
+    "claude-opus-5.5": {
+      "rates": { "high": 1.82 },
+      "source": "https://artificialanalysis.ai/models/claude-opus-5-5-high",
+      "note": "AA 'high' variant (AA's Default Fallback); only requests with a known 'high' effort level are priced at this rate"
+    },
+    "gemini-3.8-flash": {
+      "rates": { "low": null },
+      "source": "https://artificialanalysis.ai/models/gemini-3-8-flash-low",
+      "note": "UNPRICED — AA publishes no cost/task figure for this variant; no rate is invented"
+    }
+  },
+  "aliases": {
+    "gpt-6-1-sol": "gpt-6.1-sol",
+    "claude-opus-5-5": "claude-opus-5.5",
+    "gemini-3-8-flash": "gemini-3.8-flash"
+  }
+}

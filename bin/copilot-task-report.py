@@ -99,6 +99,17 @@ for the user-facing summary):
   `null` to mean "intentionally unpriced"). Any model still missing pricing
   after alias resolution is reported as "no pricing data" rather than
   silently priced at $0.
+- A SEPARATE company fixed per-request charge (request-pricing.json) is
+  computed from a joint model x effort-key aggregation (`by_model_effort`):
+  a company-configured USD amount per model request keyed by (model,
+  effort level), with the source of each rate listed per model in the
+  config — NOT official GitHub pricing, never a verified bill, and never
+  mixed into the token-based estimate. A missing/invalid config is
+  reported as unavailable (never $0); unknown effort, unconfigured or
+  null rates are excluded and flagged (partial lower bound); requests
+  recorded before joint tracking existed are reported as unattributed,
+  never backfilled. "Requests" means OTEL usage-bearing model spans,
+  including retried/failed calls that reported usage.
 - Whole read-modify-write ingest cycles are wrapped in a cross-process file
   lock (best-effort via fcntl.flock) so concurrent copilot-s invocations
   never race on the same state/task files. To stay crash-safe, the
@@ -133,6 +144,7 @@ import filecmp
 import glob
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -151,6 +163,14 @@ TASKS_DIR = os.path.join(SUPPORT_DIR, "tasks")
 STATE_FILE = os.path.join(SUPPORT_DIR, "session-state.json")
 INSTALL_MARKER_FILE = os.path.join(SUPPORT_DIR, "install-marker.json")
 PRICING_FILE = os.path.join(SUPPORT_DIR, "model-pricing.json")
+# Company-configured fixed per-model-request charge table (see
+# config/request-pricing.json). Deliberately left as None so the path is
+# resolved at CALL time from SUPPORT_DIR (see request_pricing_path()),
+# meaning any override of SUPPORT_DIR (e.g. a different HOME, or a caller
+# that repoints SUPPORT_DIR) is respected. Set this to an explicit path to
+# override the location entirely.
+REQUEST_PRICING_FILE = None
+REQUEST_PRICING_FILENAME = "request-pricing.json"
 LOCK_FILE = os.path.join(SUPPORT_DIR, ".ingest.lock")
 REPORTS_DIR = os.environ.get(
     "COPILOT_TASK_REPORTS_DIR",
@@ -162,7 +182,8 @@ OTEL_DIR = os.path.join(HOME, ".copilot", "otel")
 UNASSIGNED = "UNASSIGNED"
 TASK_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")
 
-# Custom agent -> inferred reasoning-effort intent (NOT measured telemetry).
+# Custom agent or built-in Task route -> inferred reasoning-effort intent
+# (NOT measured telemetry).
 # Only ever consulted for calls falling inside a fully-CLOSED subagent
 # interval (both started+completed observed) — never a live/open guess.
 #
@@ -171,14 +192,15 @@ TASK_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")
 # events.jsonl still references it continue to get a reasonable inferred
 # label; it is never installed/loaded by current copilot-instructions.md.
 CUSTOM_AGENT_EFFORT_MAP = {
-    "planner": "high",
+    "planner": "medium",
     "discovery": "low",
+    "task": "low",
     "reviewer": "high",
     "test-reviewer": "high",
     "senior-coder": "high",
-    "coder": "max",
+    "coder": "xhigh",
     "fixer": "high",
-    "tester": "max",
+    "tester": "xhigh",
 }
 
 # Cap on how many closed agent intervals we keep per session, to bound
@@ -1650,6 +1672,10 @@ def build_delta(session_id, sess_state, events_path):
     delta = {
         "by_model": {},
         "by_effort": {},
+        # Joint model x effort-key aggregation ({model: {effort_key: agg}}),
+        # needed for per-(model, effort) fixed request charges: by_model and
+        # by_effort alone cannot be cross-multiplied back into joint counts.
+        "by_model_effort": {},
         "agent_summaries": [],
         "repositories": set(),
         "min_ts": None,
@@ -1704,6 +1730,9 @@ def build_delta(session_id, sess_state, events_path):
         add_agg(delta["by_model"][model], mc)
         delta["by_effort"].setdefault(effort_key, blank_agg())
         add_agg(delta["by_effort"][effort_key], mc)
+        joint = delta["by_model_effort"].setdefault(model, {})
+        joint.setdefault(effort_key, blank_agg())
+        add_agg(joint[effort_key], mc)
         delta["model_calls"] += 1
 
     delta["min_ts"] = min_ts
@@ -1750,6 +1779,24 @@ def merge_delta_into_task(task, delta, session_id, task_id):
         dst = by_effort.setdefault(key, blank_agg())
         for k in blank_agg():
             dst[k] += agg[k]
+
+    # Joint model x effort aggregation. Task files persisted before this
+    # field existed simply lack it: we start it empty and record when joint
+    # tracking began, and NEVER backfill/guess a joint split for earlier
+    # calls (the report shows those as explicitly unattributed requests —
+    # see joint_unattributed_calls()). `.get(..., {})` also tolerates a
+    # delta built by an older code path that lacks the key.
+    delta_joint = delta.get("by_model_effort", {})
+    if "by_model_effort" not in task:
+        task["by_model_effort"] = {}
+        task["by_model_effort_since"] = now_iso()
+    by_model_effort = task["by_model_effort"]
+    for model, per_effort in delta_joint.items():
+        model_dst = by_model_effort.setdefault(model, {})
+        for key, agg in per_effort.items():
+            dst = model_dst.setdefault(key, blank_agg())
+            for k in blank_agg():
+                dst[k] += agg[k]
 
     by_agent = task.setdefault("by_agent", {})
     for summary in delta["agent_summaries"]:
@@ -1850,6 +1897,419 @@ def estimate_usd(by_model):
 
 
 # --------------------------------------------------------------------------
+# Company fixed per-request charge policy
+# --------------------------------------------------------------------------
+#
+# A SEPARATE billing view from the token-based USD estimate above. The
+# company charges a fixed USD amount per MODEL REQUEST, keyed by
+# (model, reasoning-effort level), using company-configured fixed
+# per-request rates (each model entry lists its own source). This is a
+# company policy, NOT official GitHub/Copilot pricing, and the computed
+# amount is never a verified bill.
+#
+# Rules (deliberately strict — a wrong charge is worse than no charge):
+#   - Missing config file -> "unavailable", never $0.
+#   - Invalid config (bad JSON, non-finite/negative/boolean/non-numeric
+#     rates, wrong shape) -> rejected as a whole with an explicit error;
+#     nothing is computed from a partially valid file.
+#   - A request is priced only when its model resolves to a configured
+#     entry AND its effort level is known AND a non-null rate exists for
+#     that exact level. Unknown effort is never priced (no fallback level).
+#   - Effort source (measured/configured/inferred) is kept distinct per
+#     row and per subtotal; configured/inferred-effort charges are labeled
+#     as estimates because the effort level itself was not measured.
+#   - Requests recorded before joint model+effort tracking existed are
+#     reported as explicitly unattributed — never backfilled/guessed.
+
+FIXED_CHARGE_EFFORT_SOURCES = ("measured", "configured", "inferred")
+FIXED_CHARGE_SOURCE_LABELS = {
+    "measured": "measured effort (per-call OTEL `gen_ai.request.reasoning.level`)",
+    "configured": "configured effort — ESTIMATE (session-level effort setting at call time, not per-call telemetry)",
+    "inferred": "inferred effort — ESTIMATE (guessed from custom-agent role mapping, not telemetry)",
+}
+REQUEST_PRICING_UNIT = "model_request"
+
+
+class RequestPricingError(ValueError):
+    """Raised for an invalid company request-pricing config."""
+
+
+def request_pricing_path():
+    """Resolve the company request-pricing config path at call time, so a
+    repointed SUPPORT_DIR (or an explicit REQUEST_PRICING_FILE override)
+    is always respected."""
+    if REQUEST_PRICING_FILE:
+        return REQUEST_PRICING_FILE
+    return os.path.join(SUPPORT_DIR, REQUEST_PRICING_FILENAME)
+
+
+def _reject_json_constant(name):
+    raise RequestPricingError("non-finite number %r is not allowed" % name)
+
+
+def _validate_request_rate(value, where):
+    """A rate is either null (explicitly unpriced) or a finite, nonnegative
+    int/float. Booleans are rejected even though bool is an int subclass."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RequestPricingError(
+            "%s must be a finite nonnegative number or null (got %s %r)"
+            % (where, type(value).__name__, value)
+        )
+    if not math.isfinite(value):
+        raise RequestPricingError("%s must be finite (got %r)" % (where, value))
+    if value < 0:
+        raise RequestPricingError("%s must be nonnegative (got %r)" % (where, value))
+    return float(value)
+
+
+def _validate_optional_str(value, where):
+    if value is not None and not isinstance(value, str):
+        raise RequestPricingError("%s must be a string if present (got %s)" % (where, type(value).__name__))
+    return value
+
+
+def validate_request_pricing(raw):
+    """Validate a parsed request-pricing document and return a normalized
+    dict. Raises RequestPricingError on ANY problem — the whole file is
+    rejected rather than partially used."""
+    if not isinstance(raw, dict):
+        raise RequestPricingError("top level must be a JSON object")
+    unit = raw.get("unit", REQUEST_PRICING_UNIT)
+    if unit != REQUEST_PRICING_UNIT:
+        raise RequestPricingError("'unit' must be %r (got %r)" % (REQUEST_PRICING_UNIT, unit))
+    currency = raw.get("currency", "USD")
+    if currency != "USD":
+        raise RequestPricingError("'currency' must be 'USD' (got %r)" % (currency,))
+    policy_label = _validate_optional_str(raw.get("policy_label"), "'policy_label'")
+    updated_at = _validate_optional_str(raw.get("updated_at"), "'updated_at'")
+
+    models = raw.get("models")
+    if not isinstance(models, dict):
+        raise RequestPricingError("'models' must be an object mapping model id -> {\"rates\": {...}}")
+    norm_models = {}
+    for model, entry in models.items():
+        where = "models[%r]" % model
+        if not isinstance(entry, dict):
+            raise RequestPricingError("%s must be an object" % where)
+        rates = entry.get("rates")
+        if not isinstance(rates, dict):
+            raise RequestPricingError("%s.rates must be an object mapping effort level -> USD per request" % where)
+        norm_rates = {}
+        for level, value in rates.items():
+            norm_level = level.strip().lower() if isinstance(level, str) else ""
+            if not norm_level or norm_level.startswith("unknown"):
+                raise RequestPricingError("%s.rates has an invalid effort level key %r" % (where, level))
+            if norm_level in norm_rates:
+                raise RequestPricingError("%s.rates has a duplicate effort level %r" % (where, norm_level))
+            norm_rates[norm_level] = _validate_request_rate(value, "%s.rates[%r]" % (where, level))
+        norm_models[model] = {
+            "rates": norm_rates,
+            "source": _validate_optional_str(entry.get("source"), "%s.source" % where),
+            "note": _validate_optional_str(entry.get("note"), "%s.note" % where),
+        }
+
+    aliases = raw.get("aliases", {})
+    if aliases is None:
+        aliases = {}
+    if not isinstance(aliases, dict):
+        raise RequestPricingError("'aliases' must be an object mapping alias -> model id (or null)")
+    for alias, target in aliases.items():
+        if target is not None and not isinstance(target, str):
+            raise RequestPricingError("aliases[%r] must be a model id string or null" % alias)
+
+    return {
+        "policy_label": policy_label,
+        "updated_at": updated_at or "unknown",
+        "currency": currency,
+        "models": norm_models,
+        "aliases": dict(aliases),
+    }
+
+
+def load_request_pricing():
+    """Load the company request-pricing config. Always returns a dict with
+    'status' in {'ok', 'missing', 'invalid'} and 'path'; 'invalid' also
+    carries 'error'. A missing/invalid config is NEVER treated as $0."""
+    path = request_pricing_path()
+    if not os.path.exists(path):
+        return {"status": "missing", "path": path}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f, parse_constant=_reject_json_constant)
+        cfg = validate_request_pricing(raw)
+    except RequestPricingError as ex:
+        return {"status": "invalid", "path": path, "error": str(ex)}
+    except json.JSONDecodeError as ex:
+        return {"status": "invalid", "path": path, "error": "invalid JSON: %s" % ex}
+    except (OSError, UnicodeDecodeError) as ex:
+        # Must precede the ValueError handler: UnicodeDecodeError is a
+        # ValueError subclass and would otherwise be misreported as a
+        # numeric error.
+        return {"status": "invalid", "path": path, "error": "unreadable: %s" % ex}
+    except (ValueError, OverflowError) as ex:
+        # e.g. an integer literal too large for float conversion in
+        # math.isfinite (OverflowError), or an overlong numeric literal
+        # exceeding the int digit limit (ValueError). Reported as invalid,
+        # never allowed to crash the report.
+        return {"status": "invalid", "path": path, "error": "invalid numeric value: %s" % ex}
+    cfg["status"] = "ok"
+    cfg["path"] = path
+    return cfg
+
+
+def resolve_request_rate_entry(model, models, aliases):
+    """Returns (entry_or_None, canonical_model_or_None, reason_if_None).
+    Alias chains are followed with a cycle guard; an alias to null means
+    "explicitly unpriced"."""
+    seen = set()
+    cur = model
+    while True:
+        if cur in seen:
+            return None, None, "alias cycle while resolving model '%s'" % model
+        seen.add(cur)
+        if cur in models:
+            return models[cur], cur, None
+        if cur in aliases:
+            target = aliases[cur]
+            if target is None:
+                return None, None, "model '%s' is explicitly unpriced (alias -> null)" % model
+            cur = target
+            continue
+        return None, None, "no request rate configured for model '%s'" % model
+
+
+def parse_effort_key(effort_key):
+    """Split a stored effort key ('source:level' or 'unknown') into
+    (source, level_or_None). Any 'unknown...' level yields None."""
+    if not isinstance(effort_key, str) or ":" not in effort_key:
+        return "unknown", None
+    source, level = effort_key.split(":", 1)
+    source = source.strip().lower()
+    level = level.strip().lower()
+    if not level or level.startswith("unknown"):
+        level = None
+    return source, level
+
+
+def joint_unattributed_calls(task):
+    """Per-model count of requests that have NO joint model+effort record
+    (recorded before joint tracking existed). Returns (dict model->count,
+    list_of_inconsistency_warnings). Never guesses a split."""
+    by_model = task.get("by_model") or {}
+    joint = task.get("by_model_effort") or {}
+    unattributed = {}
+    warnings = []
+    for model in sorted(set(by_model) | set(joint)):
+        model_calls = int((by_model.get(model) or {}).get("call_count", 0) or 0)
+        joint_calls = sum(int((agg or {}).get("call_count", 0) or 0) for agg in (joint.get(model) or {}).values())
+        diff = model_calls - joint_calls
+        if diff > 0:
+            unattributed[model] = diff
+        elif diff < 0:
+            warnings.append(
+                "model '%s': joint model+effort records (%d requests) exceed by-model total (%d); "
+                "joint rows are shown as recorded, totals may be inconsistent" % (model, joint_calls, model_calls)
+            )
+    return unattributed, warnings
+
+
+def compute_fixed_charges(task, cfg):
+    """Compute company fixed per-request charges from the joint
+    model+effort aggregation. `cfg` must be a load_request_pricing() result
+    with status 'ok'."""
+    models = cfg["models"]
+    aliases = cfg["aliases"]
+    rows = []
+    by_source = {src: {"charge": 0.0, "requests": 0} for src in FIXED_CHARGE_EFFORT_SOURCES}
+    priced_requests = 0
+    unpriced_requests = 0
+    missing = {}  # reason -> request count
+    used_models = {}  # canonical model -> entry (for rate-source notes)
+
+    joint = task.get("by_model_effort") or {}
+    for model in sorted(joint):
+        entry, canonical, model_reason = resolve_request_rate_entry(model, models, aliases)
+        for effort_key in sorted(joint[model]):
+            agg = joint[model][effort_key] or {}
+            n = int(agg.get("call_count", 0) or 0)
+            if n <= 0:
+                continue
+            source, level = parse_effort_key(effort_key)
+            row = {
+                "model": model,
+                "canonical_model": canonical,
+                "effort_key": effort_key,
+                "source": source,
+                "level": level,
+                "requests": n,
+                "rate": None,
+                "charge": None,
+                "reason": None,
+            }
+            if source not in FIXED_CHARGE_EFFORT_SOURCES or level is None:
+                row["reason"] = "effort unknown — not priced (no fallback effort level is assumed)"
+            elif entry is None:
+                row["reason"] = model_reason
+            elif level not in entry["rates"]:
+                row["reason"] = "no configured rate for model '%s' at effort '%s'" % (canonical, level)
+            elif entry["rates"][level] is None:
+                detail = entry.get("note") or "rate configured as null"
+                row["reason"] = "explicitly unpriced: '%s' at effort '%s' (%s)" % (canonical, level, detail)
+            else:
+                rate = entry["rates"][level]
+                row["rate"] = rate
+                row["charge"] = rate * n
+                used_models[canonical] = entry
+            if row["charge"] is None:
+                unpriced_requests += n
+                missing[row["reason"]] = missing.get(row["reason"], 0) + n
+            else:
+                priced_requests += n
+                by_source[source]["charge"] += row["charge"]
+                by_source[source]["requests"] += n
+            rows.append(row)
+
+    unattributed, consistency_warnings = joint_unattributed_calls(task)
+    unattributed_requests = sum(unattributed.values())
+    total_requests = int((task.get("totals") or {}).get("call_count", 0) or 0)
+    total_charge = sum(v["charge"] for v in by_source.values())
+    return {
+        "rows": rows,
+        "by_source": by_source,
+        "priced_requests": priced_requests,
+        "unpriced_requests": unpriced_requests,
+        "unattributed": unattributed,
+        "unattributed_requests": unattributed_requests,
+        "total_requests": total_requests,
+        "total_charge": total_charge,
+        "missing": missing,
+        "used_models": used_models,
+        "consistency_warnings": consistency_warnings,
+        "complete": unpriced_requests == 0 and unattributed_requests == 0,
+    }
+
+
+def render_fixed_charge_section(task):
+    """Markdown lines for the company fixed per-request charge section."""
+    lines = []
+    lines.append("## Company Fixed Per-Request Charge (company-configured policy — NOT official GitHub pricing)")
+    lines.append("")
+    lines.append("_A company-configured policy: a fixed USD amount per **model request**, keyed by "
+                  "model + reasoning-effort level, using company-configured fixed per-request rates "
+                  "(the source of each rate is listed per model below). This is **not** official GitHub/Copilot pricing and "
+                  "is **never a verified bill**. Requests counted are the OTEL usage-bearing model "
+                  "(`chat *`) spans recorded for this task — including retried/failed calls that "
+                  "reported usage; spans without usage data are not counted, so this cannot claim that "
+                  "every request was captured. Kept entirely separate from (and not comparable/additive "
+                  "with) the token-based USD estimate._")
+    lines.append("")
+
+    cfg = load_request_pricing()
+    if cfg["status"] == "missing":
+        lines.append("**UNAVAILABLE** — no company request-pricing config found at `%s`. "
+                      "This is *not* a $0 charge. Install it with `scripts/install.sh` (copied only "
+                      "if absent) or copy `config/request-pricing.json` there." % cfg["path"])
+        lines.append("")
+        return lines
+    if cfg["status"] == "invalid":
+        print("Warning: invalid company request-pricing config %s: %s" % (cfg["path"], cfg["error"]),
+              file=sys.stderr)
+        lines.append("**UNAVAILABLE** — invalid company request-pricing config at `%s`: %s. "
+                      "The whole file is rejected (no charge is computed from a partially valid "
+                      "config); this is *not* a $0 charge." % (cfg["path"], cfg["error"]))
+        lines.append("")
+        return lines
+
+    result = compute_fixed_charges(task, cfg)
+    n_total = result["total_requests"]
+    lines.append("| Metric | Value |")
+    lines.append("|---|---|")
+    lines.append("| Policy | %s (config updated %s) |" % (
+        cfg.get("policy_label") or "Company-configured fixed per-request rates (per-model sources listed below) — not official GitHub pricing",
+        cfg["updated_at"]))
+    lines.append("| Model requests recorded (OTEL usage-bearing model spans, incl. retried/failed calls that reported usage) | %d |" % n_total)
+    lines.append("| ...priced with a configured rate | %d |" % result["priced_requests"])
+    lines.append("| ...not priced (unknown effort / no configured rate / explicitly unpriced) | %d |" % result["unpriced_requests"])
+    lines.append("| ...unattributed (recorded before joint model+effort tracking — no backfill, not priced) | %d |" % result["unattributed_requests"])
+    for src in FIXED_CHARGE_EFFORT_SOURCES:
+        sub = result["by_source"][src]
+        lines.append("| Charge — %s | $%.4f (%d requests) |" % (FIXED_CHARGE_SOURCE_LABELS[src], sub["charge"], sub["requests"]))
+    if n_total == 0 and not result["rows"]:
+        total_str = "$0.0000 (no model requests recorded)"
+    elif result["priced_requests"] == 0:
+        total_str = "N/A — none of the recorded requests could be priced (see warnings below); this is *not* $0"
+    elif result["complete"]:
+        total_str = "$%.4f — all %d recorded requests priced (company policy amount, not a verified bill)" % (
+            result["total_charge"], result["priced_requests"])
+    else:
+        total_str = ("$%.4f — **PARTIAL (lower bound)**: excludes %d not-priced and %d unattributed "
+                     "requests (company policy amount, not a verified bill)" % (
+                         result["total_charge"], result["unpriced_requests"], result["unattributed_requests"]))
+    lines.append("| Total company fixed charge | %s |" % total_str)
+    lines.append("")
+
+    lines.append("### By Model + Effort (fixed per-request charge)")
+    lines.append("")
+    if task.get("by_model_effort_since"):
+        lines.append("_Joint model+effort tracking for this task started at %s; requests recorded "
+                      "earlier have no joint attribution and are listed as unattributed._"
+                      % task["by_model_effort_since"])
+        lines.append("")
+    lines.append("| Model | Effort source | Effort level | Requests | Rate (USD/request) | Charge | Status |")
+    lines.append("|---|---|---|---|---|---|---|")
+    for row in result["rows"]:
+        if row["charge"] is not None:
+            status = "priced"
+            if row["source"] != "measured":
+                status = "priced — ESTIMATE (%s effort, not measured)" % row["source"]
+            rate_str = "$%.4f" % row["rate"]
+            charge_str = "$%.4f" % row["charge"]
+        else:
+            status = "not priced: %s" % row["reason"]
+            rate_str = "—"
+            charge_str = "not priced"
+        lines.append("| %s | %s | %s | %d | %s | %s | %s |" % (
+            row["model"], row["source"], row["level"] or "unknown", row["requests"], rate_str, charge_str, status))
+    for model, n in sorted(result["unattributed"].items()):
+        lines.append("| %s | — | — | %d | — | not priced | unattributed: recorded before joint "
+                      "model+effort tracking (no backfill/guess) |" % (model, n))
+    lines.append("")
+
+    warnings = []
+    for reason, n in sorted(result["missing"].items()):
+        warnings.append("%s — %d request(s) not priced" % (reason, n))
+    if result["unattributed_requests"]:
+        warnings.append("%d request(s) recorded before joint model+effort tracking cannot be priced "
+                        "(no backfill)" % result["unattributed_requests"])
+    warnings.extend(result["consistency_warnings"])
+    if warnings:
+        lines.append("### Missing-rate / partial-total warnings")
+        lines.append("")
+        for w in warnings:
+            lines.append("- %s" % w)
+        lines.append("")
+
+    if result["used_models"]:
+        lines.append("### Configured rate sources")
+        lines.append("")
+        for model, entry in sorted(result["used_models"].items()):
+            rates = ", ".join(
+                "%s=%s" % (lvl, ("$%.4f" % r) if r is not None else "unpriced")
+                for lvl, r in sorted(entry["rates"].items())
+            )
+            extra = []
+            if entry.get("source"):
+                extra.append("source: %s" % entry["source"])
+            if entry.get("note"):
+                extra.append(entry["note"])
+            lines.append("- %s: %s%s" % (model, rates, (" — " + "; ".join(extra)) if extra else ""))
+        lines.append("")
+    return lines
+
+
+# --------------------------------------------------------------------------
 # Rendering
 # --------------------------------------------------------------------------
 
@@ -1917,6 +2377,8 @@ def render_markdown(task):
         lines.append("| Estimated USD cost (independent pricing table, approximate) | N/A — no pricing data for any model used (%s) |" % ", ".join(sorted(set(unpriced))))
     lines.append("")
 
+    lines.extend(render_fixed_charge_section(task))
+
     lines.append("## By Model")
     lines.append("")
     lines.append("| Model | Calls | Prompt | Cache-read | Completion | Reasoning | Total Tokens | Model-call Time | Est. USD |")
@@ -1939,8 +2401,8 @@ def render_markdown(task):
                   "`configured:*` is the session-level reasoning-effort setting in effect "
                   "at call time (real telemetry, but not call-specific). `inferred:*` is a "
                   "guess based on our custom-agent role mapping "
-                  "(planner/reviewer/test-reviewer=max, senior-coder=high, "
-                  "coder/tester=medium, discovery=low; legacy fixer=high, kept only "
+                  "(planner=medium, reviewer/test-reviewer/senior-coder=high, "
+                  "coder/tester=xhigh, discovery=low; legacy fixer=high, kept only "
                   "for historical sessions recorded before the fixer role was retired "
                   "and folded into coder/senior-coder), "
                   "applied only when the call falls inside a fully-completed subagent "
@@ -1994,6 +2456,16 @@ def render_markdown(task):
                   "Copilot invoice and may drift from actual billing. Cache-read tokens are "
                   "priced at a model's `cache_read_per_million` rate when configured, "
                   "otherwise at the normal input rate.")
+    lines.append("- The company fixed per-request charge is a company-configured policy "
+                  "(request-pricing.json; fixed USD per model request by model + effort level, "
+                  "company-configured fixed rates with per-model sources) — not official "
+                  "GitHub pricing and never a verified bill. It counts only OTEL usage-bearing "
+                  "model spans (including retried/failed calls that reported usage), so it cannot "
+                  "claim every request was captured. Requests with unknown effort, no configured "
+                  "rate, or an explicitly unpriced rate are excluded (the total is then a labeled "
+                  "partial lower bound), and requests recorded before joint model+effort tracking "
+                  "are reported as unattributed rather than guessed. It is independent of, and not "
+                  "additive with, the token-based USD estimate.")
     lines.append("- If an OTEL file is truncated/rewound (rare), the gap is skipped with a "
                   "warning rather than being silently lost forever or risking a double count.")
     lines.append("")

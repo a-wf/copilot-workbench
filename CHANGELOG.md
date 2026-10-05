@@ -6,6 +6,84 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — mandatory small implementation delegation
+
+- Added structured `task_routing.small_casual_implementation` defaults for
+  invoking the named custom agent `coder` through the task tool
+  (`gpt-6-luna`, low reasoning effort, default context). Clarified in the
+  orchestrator instructions and README that the main session coordinates
+  and oversees delegated implementation, while `coder` does not test or
+  review; reviewer/tester remain optional according to risk. Informational
+  questions stay direct, and routine shell/mechanical work stays on the
+  separate built-in `task` route. The seven custom-agent inventory is
+  unchanged.
+
+### Changed — low-cost mechanical task delegation
+
+- Added a separate built-in `task` route for bounded shell/git mechanics
+  (`gpt-6-luna`, low effort, default context), so routine command execution
+  is delegated for cost savings even when no coding-agent stage is needed.
+  It is a Copilot CLI built-in, not an eighth toolkit custom agent; the
+  seven `agents/*.agent.md` roles remain unchanged.
+- Clarified that `discovery` is read-only mapping, never the command or
+  commit runner, and that the main session initiates Task delegation and
+  retains oversight. Commits/pushes require explicit user authorization;
+  authorized commits must preserve unrelated dirty edits and stage only
+  the requested changes. Unavailable tools or unsafe
+  security-sensitive/complex judgment stay in the main session with the
+  reason communicated.
+
+### Added — company fixed per-request charge
+
+- New, separate "Company Fixed Per-Request Charge" report section: a
+  company-configured policy charging a fixed USD amount per **model
+  request**, keyed by model + reasoning-effort level, using
+  company-configured fixed rates with the source listed per model. Clearly labeled
+  as **not** official GitHub pricing and never a verified bill; kept
+  independent of (and never added to) the existing approximate token-based
+  USD estimate, which is unchanged.
+- New `config/request-pricing.json`, installed to
+  `~/.copilot/task-reports/request-pricing.json` **only if absent** (edits
+  preserved, same pattern as `model-pricing.json`). Defaults:
+  `gpt-6-luna` xhigh $0.04; `gpt-6.1-sol` medium $0.21, xhigh $0.39
+  (company price list, 2026-09-30 screenshot; per-request billing
+  user-confirmed 2026-10-05); `claude-opus-5.5` high $1.82 (AA high /
+  Default Fallback); `gemini-3.8-flash` low explicitly **unpriced** (AA
+  publishes no cost/task figure).
+- Config validation: rates must be finite, nonnegative numbers or `null`
+  (booleans, strings, negative, NaN/Infinity, and numeric literals too
+  large/long to convert rejected); an invalid file is
+  rejected as a whole with an explicit error, and a missing file is shown
+  as *unavailable* — never as $0.
+- Reports now track a joint model × effort aggregation (`by_model_effort`)
+  and render a model+effort breakdown with per-source subtotals
+  (measured / configured-estimate / inferred-estimate), partial-total
+  labeling, and missing-rate warnings. Unknown effort is never priced.
+  Requests recorded before joint tracking existed are reported as
+  unattributed (no backfill). "Requests" are OTEL usage-bearing model spans,
+  including retried/failed calls that reported usage — the report does not
+  claim every request was captured.
+
+### Changed — October routing refresh
+
+- Updated planner to GPT-6.1 Sol with medium effort and coder/tester to
+  GPT-6 Luna with xhigh effort. Kept senior-coder, reviewer, and
+  test-reviewer on Claude Opus 5.5/high, and discovery on Gemini 3.8
+  Flash/low. Context tiers are unchanged.
+- Synced agent profiles, structured routing, loaded instructions,
+  documentation, tests, and the reporter's fallback effort labels.
+
+### Changed — explicit agent-stage communication
+
+- Strengthened the orchestrator instructions so stage skipping can no
+  longer be an invisible internal decision. Before substantive work it
+  must announce the task tier, the stage being run (or direct main-session
+  handling), and every skipped stage/group with a short reason.
+- Skip decisions made later must be communicated at the transition rather
+  than only after completion, and final responses now include a compact
+  `Stages:` record of what ran and what was skipped. Pure informational
+  requests use the same rule in a single concise sentence.
+
 ### Changed — model/effort remap (Sept 2026 cost-efficiency tiers)
 
 - Remapped agent default models to a 3-tier cost/capability scheme aligned

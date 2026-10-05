@@ -42,6 +42,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULE_PATH = os.path.join(REPO_ROOT, "bin", "copilot-task-report.py")
 SCRIPT_PATH = os.path.join(REPO_ROOT, "bin", "copilot-s")
 PRICING_PATH = os.path.join(REPO_ROOT, "config", "model-pricing.json")
+REQUEST_PRICING_PATH = os.path.join(REPO_ROOT, "config", "request-pricing.json")
 
 
 def load_module():
@@ -150,6 +151,21 @@ class BaseTestCase(unittest.TestCase):
 
     def task(self, task="TEST-1"):
         return self.mod.load_json(self.mod.task_path(task), {})
+
+    def write_request_pricing(self, data=None):
+        """Write request-pricing input only under this test's temp support dir."""
+        if data is None:
+            with open(REQUEST_PRICING_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+        path = self.mod.request_pricing_path()
+        self.mod.atomic_write(path, json.dumps(data, indent=2))
+        return path
+
+    def write_request_pricing_raw(self, text):
+        """Write raw request-pricing text only under this test's temp dir."""
+        path = self.mod.request_pricing_path()
+        self.mod.atomic_write(path, text)
+        return path
 
 
 class TestOtelInstallEpochGating(BaseTestCase):
@@ -852,6 +868,658 @@ class TestShippedPricingParses(unittest.TestCase):
         self.assertIsInstance(data["aliases"], dict)
 
 
+class TestShippedRequestPricingSchema(BaseTestCase):
+    """The company request-pricing config must ship valid model+effort rates
+    with explicit policy metadata; these checks never read a user's config."""
+
+    def test_shipped_request_pricing_schema_and_rates(self):
+        with open(REQUEST_PRICING_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+
+        self.assertEqual(raw["unit"], "model_request")
+        self.assertEqual(raw["currency"], "USD")
+        self.assertIn("not official GitHub pricing", raw["policy_label"])
+        self.assertIsInstance(raw["models"], dict)
+
+        config = self.mod.validate_request_pricing(raw)
+        expected_rates = {
+            "gpt-6-luna": {"xhigh": 0.04},
+            "gpt-6.1-sol": {"medium": 0.21, "xhigh": 0.39},
+            "claude-opus-5.5": {"high": 1.82},
+            "gemini-3.8-flash": {"low": None},
+        }
+        for model, rates in expected_rates.items():
+            with self.subTest(model=model):
+                self.assertEqual(config["models"][model]["rates"], rates)
+        self.assertEqual(config["aliases"]["gpt-6-1-sol"], "gpt-6.1-sol")
+        self.assertEqual(config["aliases"]["claude-opus-5-5"], "claude-opus-5.5")
+
+
+class TestFixedRequestChargesFromOtel(BaseTestCase):
+    """Fixed charges are per usage-bearing OTEL model request and require
+    the joint model+effort counts; token pricing stays an independent report."""
+
+    def test_mixed_models_efforts_and_unpriced_requests_have_exact_totals(self):
+        self.write_request_pricing()
+        session_id = "sess-fixed-mixed"
+        first = self.t0 + timedelta(minutes=1)
+        spans = []
+        calls = [
+            ("gpt-6-luna", "xhigh", 2, 1, 1),
+            ("gpt-6.1-sol", "medium", 2, 1, 1),
+            ("gpt-6.1-sol", "xhigh", 3, 1, 1),
+            ("claude-opus-5.5", "high", 1, 1, 1),
+            ("gemini-3.8-flash", "low", 1, 1, 1),
+            # Known effort but no configured rate for this model+level.
+            ("gpt-6.1-sol", "high", 1, 1, 1),
+            # The request must not fall back to any configured effort rate.
+            ("gpt-6.1-sol", None, 1, 1, 1),
+            # This model is token-priced by the separate legacy table, but
+            # has no company fixed-request rate.
+            ("gpt-5.4", "medium", 1, 1_000_000, 1_000_000),
+        ]
+        for model, level, count, prompt, completion in calls:
+            for _ in range(count):
+                start = first + timedelta(seconds=len(spans) * 2)
+                spans.append(otel_span(
+                    session_id,
+                    "chat " + model,
+                    start,
+                    start + timedelta(seconds=1),
+                    usage_attrs(model, prompt=prompt, completion=completion, level=level),
+                ))
+
+        # A chat span with no gen_ai.usage.* attributes is not a recorded
+        # usage-bearing request and must not add a request or charge.
+        no_usage_start = first + timedelta(seconds=len(spans) * 2)
+        spans.append(otel_span(
+            session_id,
+            "chat gpt-6-luna",
+            no_usage_start,
+            no_usage_start + timedelta(seconds=1),
+            {"gen_ai.response.model": "gpt-6-luna"},
+        ))
+        write_jsonl(self.otel_path(), spans)
+
+        self.assertEqual(self.ingest(session_id, "FIXED-MIXED"), 0)
+        task = self.task("FIXED-MIXED")
+        joint = task["by_model_effort"]
+        self.assertEqual(task["totals"]["call_count"], 12)
+        self.assertEqual(task["by_model"]["gpt-6-luna"]["call_count"], 2)
+        self.assertEqual(joint["gpt-6.1-sol"]["measured:medium"]["call_count"], 2)
+        self.assertEqual(joint["gpt-6.1-sol"]["measured:xhigh"]["call_count"], 3)
+
+        config = self.mod.load_request_pricing()
+        self.assertEqual(config["status"], "ok")
+        result = self.mod.compute_fixed_charges(task, config)
+        self.assertEqual(result["total_requests"], 12)
+        self.assertEqual(result["priced_requests"], 8)
+        self.assertEqual(result["unpriced_requests"], 4)
+        self.assertEqual(result["unattributed_requests"], 0)
+        self.assertEqual(result["by_source"]["measured"]["requests"], 8)
+        self.assertAlmostEqual(result["total_charge"], 3.49)
+        self.assertFalse(result["complete"])
+
+        rows = {(row["model"], row["effort_key"]): row for row in result["rows"]}
+        self.assertAlmostEqual(rows[("gpt-6-luna", "measured:xhigh")]["rate"], 0.04)
+        self.assertAlmostEqual(rows[("gpt-6.1-sol", "measured:medium")]["rate"], 0.21)
+        self.assertAlmostEqual(rows[("gpt-6.1-sol", "measured:xhigh")]["rate"], 0.39)
+        self.assertAlmostEqual(rows[("claude-opus-5.5", "measured:high")]["rate"], 1.82)
+        self.assertIn("explicitly unpriced", rows[("gemini-3.8-flash", "measured:low")]["reason"])
+        self.assertIn("no configured rate", rows[("gpt-6.1-sol", "measured:high")]["reason"])
+        self.assertIn("effort unknown", rows[("gpt-6.1-sol", "unknown")]["reason"])
+        self.assertIn("no request rate configured", rows[("gpt-5.4", "measured:medium")]["reason"])
+
+        # A $11.75 token estimate remains separate from the $3.49 partial
+        # fixed-request subtotal; the figures are not added together.
+        token_total, _, _ = self.mod.estimate_usd(task["by_model"])
+        self.assertAlmostEqual(token_total, 11.75)
+        markdown = self.mod.render_markdown(task)
+        self.assertIn("Estimated USD cost (independent pricing table, approximate", markdown)
+        self.assertIn("$11.7500", markdown)
+        total_charge_line = next(
+            (line for line in markdown.splitlines() if "$3.4900 — **PARTIAL (lower bound)**" in line),
+            None,
+        )
+        self.assertIsNotNone(total_charge_line)
+        self.assertIn(
+            "$3.4900 — **PARTIAL (lower bound)**: excludes 4 not-priced and 0 unattributed requests",
+            total_charge_line,
+        )
+        self.assertNotIn("$15.2400", markdown)
+
+
+class TestFixedRequestEffortSourceLabels(BaseTestCase):
+    """Measured effort is distinguished from configured/inferred effort
+    estimates in both the stored aggregation and rendered charge section."""
+
+    def test_measured_configured_and_inferred_sources_render_distinctly(self):
+        self.write_request_pricing()
+        first = self.t0 + timedelta(minutes=1)
+
+        configured_session = "sess-fixed-configured"
+        write_jsonl(self.events_path(configured_session), [
+            {
+                "type": "session.start",
+                "timestamp": iso(first + timedelta(seconds=1)),
+                "data": {"reasoningEffort": "medium"},
+            },
+            {
+                "type": "session.model_change",
+                "timestamp": iso(first + timedelta(seconds=15)),
+                "data": {"reasoningEffort": "xhigh"},
+            },
+        ])
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                configured_session,
+                "chat gpt-6.1-sol",
+                first + timedelta(seconds=10),
+                first + timedelta(seconds=11),
+                usage_attrs("gpt-6.1-sol", level="medium"),
+            ),
+            otel_span(
+                configured_session,
+                "chat gpt-6.1-sol",
+                first + timedelta(seconds=20),
+                first + timedelta(seconds=21),
+                usage_attrs("gpt-6.1-sol"),
+            ),
+        ])
+        self.assertEqual(self.ingest(configured_session, "FIXED-SOURCES"), 0)
+
+        inferred_session = "sess-fixed-inferred"
+        write_jsonl(self.events_path(inferred_session), [
+            {
+                "type": "subagent.started",
+                "agentId": "senior-1",
+                "timestamp": iso(first + timedelta(seconds=30)),
+                "data": {"agentName": "senior-coder"},
+            },
+            {
+                "type": "subagent.completed",
+                "agentId": "senior-1",
+                "timestamp": iso(first + timedelta(seconds=60)),
+                "data": {"agentName": "senior-coder", "totalTokens": 4, "durationMs": 30000},
+            },
+        ])
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                inferred_session,
+                "chat claude-opus-5.5",
+                first + timedelta(seconds=40),
+                first + timedelta(seconds=41),
+                usage_attrs("claude-opus-5.5"),
+            ),
+        ])
+        self.assertEqual(self.ingest(inferred_session, "FIXED-SOURCES"), 0)
+
+        task = self.task("FIXED-SOURCES")
+        joint = task["by_model_effort"]
+        self.assertEqual(joint["gpt-6.1-sol"]["measured:medium"]["call_count"], 1)
+        self.assertEqual(joint["gpt-6.1-sol"]["configured:xhigh"]["call_count"], 1)
+        self.assertEqual(joint["claude-opus-5.5"]["inferred:high"]["call_count"], 1)
+
+        result = self.mod.compute_fixed_charges(task, self.mod.load_request_pricing())
+        self.assertEqual(result["priced_requests"], 3)
+        self.assertAlmostEqual(result["by_source"]["measured"]["charge"], 0.21)
+        self.assertAlmostEqual(result["by_source"]["configured"]["charge"], 0.39)
+        self.assertAlmostEqual(result["by_source"]["inferred"]["charge"], 1.82)
+        self.assertAlmostEqual(result["total_charge"], 2.42)
+        self.assertTrue(result["complete"])
+
+        section = "\n".join(self.mod.render_fixed_charge_section(task))
+        self.assertIn("| gpt-6.1-sol | measured | medium | 1 | $0.2100 | $0.2100 | priced |", section)
+        self.assertIn("priced — ESTIMATE (configured effort, not measured)", section)
+        self.assertIn("priced — ESTIMATE (inferred effort, not measured)", section)
+        self.assertIn("configured effort — ESTIMATE", section)
+        self.assertIn("inferred effort — ESTIMATE", section)
+        self.assertIn("never a verified bill", section)
+        self.assertIn("$2.4200 — all 3 recorded requests priced", section)
+
+
+class TestFixedRequestIncrementalIngestion(BaseTestCase):
+    """Ingesting appended usage adds only new joint requests; a no-op
+    re-ingest does not duplicate their counts or fixed charge."""
+
+    def test_appends_and_reingests_do_not_duplicate_joint_request_counts(self):
+        self.write_request_pricing()
+        session_id = "sess-fixed-incremental"
+        first = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id,
+                "chat gpt-6.1-sol",
+                first,
+                first + timedelta(seconds=1),
+                usage_attrs("gpt-6.1-sol", level="medium"),
+            ),
+        ])
+
+        self.assertEqual(self.ingest(session_id, "FIXED-INCREMENTAL"), 0)
+        self.assertEqual(self.ingest(session_id, "FIXED-INCREMENTAL"), 0)
+        second = first + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id,
+                "chat gpt-6.1-sol",
+                second,
+                second + timedelta(seconds=1),
+                usage_attrs("gpt-6.1-sol", level="xhigh"),
+            ),
+        ])
+        self.assertEqual(self.ingest(session_id, "FIXED-INCREMENTAL"), 0)
+        self.assertEqual(self.ingest(session_id, "FIXED-INCREMENTAL"), 0)
+
+        task = self.task("FIXED-INCREMENTAL")
+        self.assertEqual(task["totals"]["call_count"], 2)
+        self.assertEqual(task["by_model_effort"]["gpt-6.1-sol"]["measured:medium"]["call_count"], 1)
+        self.assertEqual(task["by_model_effort"]["gpt-6.1-sol"]["measured:xhigh"]["call_count"], 1)
+        result = self.mod.compute_fixed_charges(task, self.mod.load_request_pricing())
+        self.assertEqual(result["total_requests"], 2)
+        self.assertEqual(result["priced_requests"], 2)
+        self.assertAlmostEqual(result["total_charge"], 0.60)
+
+
+class TestFixedRequestAliasResolution(BaseTestCase):
+    """Fixed request charges resolve model aliases without inventing rates."""
+
+    def test_measured_alias_call_uses_the_canonical_model_rate(self):
+        # Copy the shipped fixture into this test's private support directory;
+        # the test never reads or changes a user's installed pricing file.
+        self.write_request_pricing()
+        session_id = "sess-fixed-alias"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id,
+                "chat gpt-6-1-sol",
+                start,
+                start + timedelta(seconds=1),
+                usage_attrs("gpt-6-1-sol", level="medium"),
+            ),
+        ])
+
+        self.assertEqual(self.ingest(session_id, "FIXED-ALIAS"), 0)
+        task = self.task("FIXED-ALIAS")
+        alias_agg = task["by_model_effort"]["gpt-6-1-sol"]["measured:medium"]
+        self.assertEqual(alias_agg["call_count"], 1)
+
+        result = self.mod.compute_fixed_charges(task, self.mod.load_request_pricing())
+        self.assertEqual(result["priced_requests"], 1)
+        self.assertAlmostEqual(result["total_charge"], 0.21, places=4)
+        row = next(row for row in result["rows"] if row["model"] == "gpt-6-1-sol")
+        self.assertEqual(row["canonical_model"], "gpt-6.1-sol")
+        self.assertAlmostEqual(row["rate"], 0.21, places=4)
+
+        section = "\n".join(self.mod.render_fixed_charge_section(task))
+        self.assertIn(
+            "| gpt-6-1-sol | measured | medium | 1 | $0.2100 | $0.2100 | priced |",
+            section,
+        )
+
+    def test_null_alias_and_alias_cycle_are_unpriced(self):
+        self.write_request_pricing({
+            "unit": "model_request",
+            "currency": "USD",
+            "models": {"canonical-model": {"rates": {"medium": 0.21}}},
+            "aliases": {
+                "null-alias": None,
+                "cycle-a": "cycle-b",
+                "cycle-b": "cycle-a",
+            },
+        })
+        task = {
+            "totals": {"call_count": 2},
+            "by_model": {
+                "null-alias": {"call_count": 1},
+                "cycle-a": {"call_count": 1},
+            },
+            "by_model_effort": {
+                "null-alias": {"measured:medium": {"call_count": 1}},
+                "cycle-a": {"measured:medium": {"call_count": 1}},
+            },
+        }
+
+        # Computing the report must terminate even for the cyclic alias and
+        # must not apply the unrelated canonical model's rate to either call.
+        result = self.mod.compute_fixed_charges(task, self.mod.load_request_pricing())
+        self.assertEqual(result["priced_requests"], 0)
+        self.assertEqual(result["unpriced_requests"], 2)
+        self.assertEqual(result["unattributed_requests"], 0)
+        self.assertEqual(result["total_charge"], 0.0)
+        reasons = {row["model"]: row["reason"] for row in result["rows"]}
+        self.assertIn("explicitly unpriced", reasons["null-alias"])
+        self.assertIn("alias cycle", reasons["cycle-a"])
+
+
+class TestLegacyFixedRequestAttribution(BaseTestCase):
+    """Old task JSON without joint model+effort counts cannot be backfilled
+    from the independent model/effort marginals."""
+
+    def test_legacy_calls_are_unattributed_not_retroactively_priced(self):
+        self.write_request_pricing()
+        task_id = "FIXED-LEGACY"
+        model = "gpt-6-luna"
+        old_agg = self.mod.blank_agg()
+        old_agg.update({
+            "call_count": 1,
+            "prompt_tokens": 10,
+            "total_tokens": 10,
+        })
+        old_task = {
+            "task_id": task_id,
+            "totals": {
+                **old_agg,
+                "first_call_ts": None,
+                "last_call_ts": None,
+                "nano_aiu": 0,
+                "premium_requests": 0,
+            },
+            "by_model": {model: dict(old_agg)},
+            # Legacy format had these independent marginals but no
+            # by_model_effort field, so its joint split is unknowable.
+            "by_effort": {"measured:xhigh": dict(old_agg)},
+        }
+        self.mod.atomic_write(
+            self.mod.task_path(task_id),
+            json.dumps(old_task, indent=2),
+        )
+
+        session_id = "sess-fixed-after-legacy"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id,
+                "chat " + model,
+                start,
+                start + timedelta(seconds=1),
+                usage_attrs(model, level="xhigh"),
+            ),
+        ])
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+
+        task = self.task(task_id)
+        self.assertEqual(task["totals"]["call_count"], 2)
+        self.assertEqual(task["by_model"][model]["call_count"], 2)
+        self.assertEqual(task["by_effort"]["measured:xhigh"]["call_count"], 2)
+        self.assertEqual(task["by_model_effort"][model]["measured:xhigh"]["call_count"], 1)
+        self.assertIn("by_model_effort_since", task)
+
+        result = self.mod.compute_fixed_charges(task, self.mod.load_request_pricing())
+        self.assertEqual(result["total_requests"], 2)
+        self.assertEqual(result["priced_requests"], 1)
+        self.assertEqual(result["unattributed"], {model: 1})
+        self.assertEqual(result["unattributed_requests"], 1)
+        self.assertAlmostEqual(result["total_charge"], 0.04)
+        self.assertFalse(result["complete"])
+        section = "\n".join(self.mod.render_fixed_charge_section(task))
+        self.assertIn("unattributed (recorded before joint model+effort tracking", section)
+        self.assertIn("excludes 0 not-priced and 1 unattributed requests", section)
+
+    def test_old_report_without_joint_counts_stays_unattributed_and_n_a(self):
+        self.write_request_pricing()
+        task_id = "FIXED-LEGACY-ONLY"
+        model = "gpt-6-luna"
+        old_agg = self.mod.blank_agg()
+        old_agg.update({
+            "call_count": 2,
+            "prompt_tokens": 20,
+            "total_tokens": 20,
+        })
+        old_task = {
+            "task_id": task_id,
+            "totals": dict(old_agg),
+            "by_model": {model: dict(old_agg)},
+            # The independent marginal cannot reconstruct the missing joint
+            # model+effort counts, even when it happens to match by_model.
+            "by_effort": {"measured:xhigh": dict(old_agg)},
+        }
+        task_path = self.mod.task_path(task_id)
+        self.mod.atomic_write(task_path, json.dumps(old_task, indent=2))
+        with open(task_path, "rb") as f:
+            original_bytes = f.read()
+
+        task = self.mod.load_json(task_path, {})
+        self.assertNotIn("by_model_effort", task)
+        markdown = self.mod.render_markdown(task)
+
+        # Rendering an old task report must not silently ingest, migrate, or
+        # rewrite joint attribution into the persisted task.
+        with open(task_path, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
+        self.assertEqual(task["by_model"][model]["call_count"], 2)
+        self.assertIn(
+            "| gpt-6-luna | — | — | 2 | — | not priced | unattributed:",
+            markdown,
+        )
+        self.assertIn(
+            "| Total company fixed charge | N/A — none of the recorded requests could be priced",
+            markdown,
+        )
+        self.assertNotIn("| gpt-6-luna | measured | xhigh |", markdown)
+        self.assertNotIn("| Total company fixed charge | $0.0000", markdown)
+
+
+class TestRequestPricingAvailabilityAndValidation(BaseTestCase):
+    """Missing/invalid policy data must be unavailable, never silently
+    rendered as a zero charge or partially applied."""
+
+    def _assert_invalid_numeric_pricing_preserves_token_estimate(self, raw):
+        self.write_request_pricing_raw(raw)
+        session_id = "sess-invalid-numeric-pricing"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id,
+                "chat gpt-5.4",
+                start,
+                start + timedelta(seconds=1),
+                usage_attrs("gpt-5.4", prompt=1_000_000, completion=1_000_000),
+            ),
+        ])
+        ingest_stderr = io.StringIO()
+        with contextlib.redirect_stderr(ingest_stderr):
+            self.assertEqual(self.ingest(session_id, "INVALID-PRICING"), 0)
+        self.assertIn("invalid", ingest_stderr.getvalue().lower())
+        task = self.task("INVALID-PRICING")
+
+        config = self.mod.load_request_pricing()
+        self.assertEqual(config["status"], "invalid")
+        self.assertTrue(config["error"].startswith("invalid numeric value:"))
+
+        token_total, _, _ = self.mod.estimate_usd(task["by_model"])
+        self.assertAlmostEqual(token_total, 11.75)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            markdown = self.mod.render_markdown(task)
+
+        self.assertIn("invalid", stderr.getvalue().lower())
+        self.assertIn("request-pricing.json", stderr.getvalue())
+        self.assertIn("**UNAVAILABLE**", markdown)
+        self.assertIn(
+            "Estimated USD cost (independent pricing table, approximate",
+            markdown,
+        )
+        self.assertIn("$11.7500", markdown)
+
+    def test_missing_request_pricing_is_unavailable_not_zero(self):
+        self.assertFalse(os.path.exists(self.mod.request_pricing_path()))
+        self.assertEqual(self.mod.load_request_pricing()["status"], "missing")
+        section = "\n".join(self.mod.render_fixed_charge_section({"totals": {"call_count": 0}}))
+        self.assertIn("**UNAVAILABLE**", section)
+        self.assertIn("*not* a $0 charge", section)
+        self.assertNotIn("$0.0000", section)
+
+    def test_bad_json_and_invalid_rates_reject_the_entire_file(self):
+        invalid_inputs = [
+            ("invalid JSON", "{not valid JSON"),
+            ("negative rate", {"xhigh": -0.01}),
+            ("boolean rate", {"xhigh": True}),
+            ("string rate", {"xhigh": "0.04"}),
+            ("infinite rate", {"xhigh": float("inf")}),
+            ("NaN rate", {"xhigh": float("nan")}),
+        ]
+        for case, bad_rates in invalid_inputs:
+            with self.subTest(case=case):
+                if case == "invalid JSON":
+                    self.write_request_pricing_raw(bad_rates)
+                else:
+                    self.write_request_pricing({
+                        "models": {
+                            # A valid entry must not be applied when any
+                            # other entry makes the document invalid.
+                            "gpt-6-luna": {"rates": {"xhigh": 0.04}},
+                            "invalid-model": {"rates": bad_rates},
+                        },
+                    })
+                config = self.mod.load_request_pricing()
+                self.assertEqual(config["status"], "invalid")
+                self.assertTrue(config.get("error"))
+
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    section = "\n".join(
+                        self.mod.render_fixed_charge_section({
+                            "totals": {"call_count": 1},
+                            "by_model": {"gpt-6-luna": {"call_count": 1}},
+                            "by_model_effort": {
+                                "gpt-6-luna": {
+                                    "measured:xhigh": {"call_count": 1},
+                                },
+                            },
+                        })
+                    )
+                self.assertIn("**UNAVAILABLE**", section)
+                self.assertIn("whole file is rejected", section)
+                self.assertIn("*not* a $0 charge", section)
+                self.assertFalse(any(line.startswith("|") for line in section.splitlines()))
+                self.assertNotIn("$0.0000", section)
+
+    def test_invalid_utf8_request_pricing_is_reported_as_unreadable(self):
+        with open(self.mod.request_pricing_path(), "wb") as f:
+            f.write(b'{"models":\xff}')
+
+        config = self.mod.load_request_pricing()
+        self.assertEqual(config["status"], "invalid")
+        self.assertTrue(config["error"].startswith("unreadable:"), config["error"])
+        self.assertNotIn("invalid numeric value", config["error"])
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            section = "\n".join(
+                self.mod.render_fixed_charge_section({"totals": {"call_count": 1}})
+            )
+        self.assertIn("**UNAVAILABLE**", section)
+        self.assertIn("unreadable:", stderr.getvalue())
+        self.assertNotIn("invalid numeric value", stderr.getvalue())
+
+    def test_invalid_unit_currency_schema_and_duplicate_normalized_efforts(self):
+        valid_model = {"valid-model": {"rates": {"medium": 0.21}}}
+        invalid_documents = [
+            ("unit", {
+                "unit": "request",
+                "currency": "USD",
+                "models": valid_model,
+            }, "'unit'"),
+            ("currency", {
+                "unit": "model_request",
+                "currency": "EUR",
+                "models": valid_model,
+            }, "'currency'"),
+            ("schema", {
+                "unit": "model_request",
+                "currency": "USD",
+                "models": [],
+            }, "'models'"),
+            ("case/whitespace duplicate effort levels", {
+                "unit": "model_request",
+                "currency": "USD",
+                "models": {
+                    "duplicate-levels": {
+                        "rates": {"Medium": 0.21, " medium ": 0.42},
+                    },
+                },
+            }, "duplicate effort level"),
+        ]
+        for case, document, expected_error in invalid_documents:
+            with self.subTest(case=case):
+                self.write_request_pricing(document)
+                config = self.mod.load_request_pricing()
+                self.assertEqual(config["status"], "invalid")
+                self.assertIn(expected_error, config["error"])
+
+    def test_valid_all_unpriced_rates_render_n_a_not_zero(self):
+        self.write_request_pricing({
+            "unit": "model_request",
+            "currency": "USD",
+            "models": {
+                # A null rate is valid policy data, not a $0 rate.
+                "gemini-3.8-flash": {"rates": {"low": None}},
+            },
+            "aliases": {},
+        })
+        task = {
+            "totals": {"call_count": 2},
+            "by_model": {
+                "gemini-3.8-flash": {"call_count": 1},
+                "unknown-model": {"call_count": 1},
+            },
+            "by_model_effort": {
+                "gemini-3.8-flash": {"measured:low": {"call_count": 1}},
+                "unknown-model": {"measured:medium": {"call_count": 1}},
+            },
+        }
+
+        self.assertEqual(self.mod.load_request_pricing()["status"], "ok")
+        section = "\n".join(self.mod.render_fixed_charge_section(task))
+        self.assertIn(
+            "| Total company fixed charge | N/A — none of the recorded requests could be priced",
+            section,
+        )
+        self.assertIn("explicitly unpriced", section)
+        self.assertIn("no request rate configured", section)
+        self.assertNotIn("| Total company fixed charge | $0.0000", section)
+
+    def test_unrepresentable_integer_rate_is_unavailable_and_preserves_token_estimate(self):
+        # This remains below CPython's minimum configurable digit limit, but
+        # is too large for math.isfinite() to convert to a float.
+        raw = (
+            '{"models":{"invalid-model":{"rates":{"xhigh":'
+            + ("9" * 400)
+            + "}}}}"
+        )
+        self._assert_invalid_numeric_pricing_preserves_token_estimate(raw)
+
+    def test_overlong_json_integer_is_unavailable_and_preserves_token_estimate(self):
+        get_digit_limit = getattr(sys, "get_int_max_str_digits", None)
+        if get_digit_limit is None:
+            self.skipTest("Python does not expose the integer conversion digit limit")
+        digit_limit = get_digit_limit()
+        if digit_limit <= 0:
+            self.skipTest("Python's integer conversion digit limit is disabled")
+
+        raw = (
+            '{"models":{"invalid-model":{"rates":{"xhigh":'
+            + ("9" * (digit_limit + 1))
+            + "}}}}"
+        )
+        self._assert_invalid_numeric_pricing_preserves_token_estimate(raw)
+
+    def test_zero_and_null_rates_are_valid_values(self):
+        config_path = self.write_request_pricing({
+            "models": {
+                "free-model": {"rates": {"xhigh": 0.0}},
+                "unpriced-model": {"rates": {"low": None}},
+            },
+        })
+        config = self.mod.load_request_pricing()
+        self.assertEqual(config["status"], "ok", config)
+        self.assertEqual(config["path"], config_path)
+        self.assertEqual(config["models"]["free-model"]["rates"]["xhigh"], 0.0)
+        self.assertIsNone(config["models"]["unpriced-model"]["rates"]["low"])
+
+
 class TestInstalledArtifactsOptional(unittest.TestCase):
     """Optional, best-effort smoke checks against a *live installation* on
     this machine (~/.copilot/task-reports/model-pricing.json and
@@ -965,6 +1633,31 @@ class TestCacheAndReasoningCostMath(BaseTestCase):
 class TestEffortPrecedencePositiveInferred(BaseTestCase):
     """measured > configured > inferred > unknown."""
 
+    def test_builtin_task_agent_type_infers_low_effort(self):
+        session_id = "sess-inferred-task"
+        t_start = self.t0 + timedelta(minutes=1)
+        t_call = self.t0 + timedelta(minutes=2)
+        t_end = self.t0 + timedelta(minutes=3)
+        write_jsonl(self.events_path(session_id), [
+            {"type": "subagent.started", "agentId": "a1", "timestamp": iso(t_start),
+             "data": {"agentType": "task"}},
+            {"type": "subagent.completed", "agentId": "a1", "timestamp": iso(t_end),
+             "data": {"agentType": "task", "totalTokens": 10, "durationMs": 1000}},
+        ])
+        write_jsonl(self.otel_path(), [
+            otel_span(session_id, "chat claude-sonnet-5", t_call, t_call + timedelta(seconds=1),
+                      usage_attrs("claude-sonnet-5", prompt=7, completion=3)),
+        ])
+
+        self.ingest(session_id)
+        by_effort = self.task()["by_effort"]
+        self.assertIn("inferred:low", by_effort)
+        self.assertEqual(by_effort["inferred:low"]["prompt_tokens"], 7)
+        self.assertFalse(
+            any("unknown" in effort for effort in by_effort),
+            "a built-in task interval should be routed to inferred:low, not unknown",
+        )
+
     def test_inferred_effort_when_no_configured_effort(self):
         session_id = "sess-inferred"
         t_start = self.t0 + timedelta(minutes=1)
@@ -982,8 +1675,8 @@ class TestEffortPrecedencePositiveInferred(BaseTestCase):
         ])
         self.ingest(session_id)
         by_effort = self.task()["by_effort"]
-        self.assertIn("inferred:max", by_effort)
-        self.assertEqual(by_effort["inferred:max"]["prompt_tokens"], 7)
+        self.assertIn("inferred:xhigh", by_effort)
+        self.assertEqual(by_effort["inferred:xhigh"]["prompt_tokens"], 7)
         self.assertNotIn("configured:medium", by_effort)
 
     def test_unknown_when_no_effort_info(self):
