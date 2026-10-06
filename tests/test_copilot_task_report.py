@@ -219,7 +219,7 @@ class BaseTestCase(unittest.TestCase):
         return self.mod.cmd_ingest(args)
 
     def task(self, task="TEST-1"):
-        return self.mod.load_json(self.mod.task_path(task), {})
+        return self.mod.load_json(self.mod.task_path(self.mod.normalize_task_id(task) or task), {})
 
     def write_request_pricing(self, data=None):
         """Write request-pricing input only under this test's temp support dir."""
@@ -1604,13 +1604,16 @@ class TestOfficialCostIngestion(BaseTestCase):
         })
         task_id = "OFFICIAL-LEGACY"
         old_task = {
-            "task_id": task_id,
+            "task_id": self.mod.normalize_task_id(task_id),
             "totals": dict(old_agg),
             "by_model": {model: dict(old_agg)},
             "by_effort": {"unknown": dict(old_agg)},
             "sessions": [],
         }
-        self.mod.atomic_write(self.mod.task_path(task_id), json.dumps(old_task, indent=2))
+        self.mod.atomic_write(
+            self.mod.task_path(self.mod.normalize_task_id(task_id)),
+            json.dumps(old_task, indent=2),
+        )
 
         session_id = "sess-official-after-legacy"
         start = self.t0 + timedelta(minutes=1)
@@ -1977,7 +1980,7 @@ class TestLegacyFixedRequestAttribution(BaseTestCase):
             "total_tokens": 10,
         })
         old_task = {
-            "task_id": task_id,
+            "task_id": self.mod.normalize_task_id(task_id),
             "totals": {
                 **old_agg,
                 "first_call_ts": None,
@@ -1991,7 +1994,7 @@ class TestLegacyFixedRequestAttribution(BaseTestCase):
             "by_effort": {"measured:xhigh": dict(old_agg)},
         }
         self.mod.atomic_write(
-            self.mod.task_path(task_id),
+            self.mod.task_path(self.mod.normalize_task_id(task_id)),
             json.dumps(old_task, indent=2),
         )
 
