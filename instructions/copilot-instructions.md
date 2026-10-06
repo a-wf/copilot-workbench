@@ -23,11 +23,13 @@ Before starting substantive work, send one concise routing update that:
 3. names every stage or grouped set of stages being skipped, with a short
    reason for each skip.
 
-Example:
+Example of the initial routing update, followed by a separate approval
+request when the gate above applies:
 
-> Small instruction-only change. Skipping discovery/planner because the
-> target and approach are explicit; handling the edit directly. Skipping
-> reviewer/tester/test-reviewer because there is no executable behavior.
+> Small instruction-only change. Recommended route: coder
+> (`gpt-6-luna`, low, default). Skipping discovery/planner because the
+> target and approach are explicit; skipping reviewer/tester/test-reviewer
+> because there is no executable behavior.
 
 If a skip decision is made later rather than during initial routing
 (for example, tests become unnecessary after inspection), communicate it
@@ -39,6 +41,58 @@ For a pure question or informational request, the same rule applies:
 state that the main session is answering directly and briefly group the
 inapplicable implementation stages with their reason. Keep this to one
 sentence so the communication itself does not waste tokens.
+
+## Mandatory pre-work routing approval
+
+For **standard, complex, and high-risk** tasks, and for any task that
+would require **broad discovery or design planning regardless of tier**,
+obtain explicit user approval of the routing before substantive work.
+Preliminary minimal reads needed to classify the request are allowed; do
+not begin broad Jira/Figma imports, codebase exploration, implementation,
+or other substantive work before approval. Do not use this gate for simple
+questions or routine small/casual implementation work, which keeps its
+automatic `coder` route below.
+
+Present a concise proposed route and ask the user to choose using
+`ask_user`:
+
+1. **Approve recommended delegation** — list the proposed stages in order,
+   their configured agent/model/reasoning-effort/context values, and every
+   skipped stage or grouped set with a brief reason.
+2. **Main-session alternative** — state which work the main session would
+   handle directly and list the stages skipped, with reasons.
+3. **Custom routing** — invite the user to specify stages, ownership, or
+   model/effort/context overrides.
+
+For main-session work with model `Auto`, report exactly that it is
+**“Auto dynamically selected; underlying model not identified”**; never
+invent a model or claim a tool is unavailable without evidence. Wait for
+explicit approval before continuing. Cancellation means no work. A decline
+is not consent: stop, briefly explain that work is paused, and do not infer
+approval of another route. If `ask_user` is unavailable, pause and request
+plain-text approval only if the runtime supports user replies; otherwise
+stop without doing the substantive work.
+
+Routing approval authorizes only the approved stages, ownership, and
+model route. It is distinct from plan-mode approval and does not authorize
+code edits, tests, commits, pushes, or other actions that separately need
+user permission. If plan mode is active, approval of routing is not
+approval to implement. Do not start implementation until any required
+plan approval is also given.
+
+If a significant change to stage ownership, routing, or model tier becomes
+necessary, stop and obtain renewed routing approval before that change.
+Routine file reads and bounded fixes/retests performed by already-approved
+roles do not require repeated approval. Honor a user's explicit
+authorization of the exact route without asking redundantly. Once approved,
+perform the approved discovery/planning as assigned; do not silently
+replace a delegated stage with main-session exploration. If an approved
+stage is genuinely unavailable, explain the limitation and request
+approval for an adjusted route before substituting.
+
+Do not turn this gate into an automatic heavy pipeline: use the tier
+matrix, conditional stages, and skip reasons to recommend only justified
+work.
 
 ## Hard routing defaults
 
@@ -136,9 +190,10 @@ stage already did:
 - `test-reviewer` checks test quality only, on complex/high-risk tasks
   only; it never writes/runs tests or implements.
 
-If a stage's agent is unavailable or fails to load, perform that stage's
-responsibilities directly in the main session, but say clearly that you
-did so instead of silently skipping it.
+If an approved stage's agent is unavailable or fails to load, follow the
+pre-work routing-approval rule: explain the limitation and obtain approval
+for an adjusted route before substituting main-session work. Do not silently
+replace an approved delegation.
 
 ## Task tiers and stage-selection matrix
 
@@ -147,7 +202,7 @@ when the specifics warrant it, but state the deviation to the user.
 
 | Tier | Examples | discovery | planner | coder | senior-coder | reviewer | tester | test-reviewer |
 |---|---|---|---|---|---|---|---|---|
-| **Trivial** | typo/docs/comment fix, one-line config/copy change, formatting-only diff | skip | skip | ✅ (or answer directly) | escalation only | skip | skip | skip |
+| **Trivial** | typo/docs/comment fix, one-line config/copy change, formatting-only diff | skip | skip | ✅ | escalation only | skip | skip | skip |
 | **Small** | small well-scoped change in familiar code, obvious approach, no meaningful behavior to test | skip | skip | ✅ | escalation only | skip (implementer may note its own confidence/limitations, but does not review/approve) | skip unless behavior changed | skip |
 | **Standard** | routine feature/bug fix, familiar codebase area, CRUD/UI/standard logic, clear approach | skip unless area is unfamiliar | skip if approach is obvious, else ✅ | ✅ | escalation only | ✅ (one pass) if risk/behavior warrants it or it isn't directly verifiable by inspection; otherwise skip | ✅ if behavior changed | skip |
 | **Complex** | multi-file architecture, async/state management, schema/data-model changes, deep structural bug, new service | ✅ if area is broad/unfamiliar | ✅ | — | ✅ | ✅ (one pass + up to 3 verification rounds) | ✅ | recommended |
@@ -279,6 +334,10 @@ Only after `test-reviewer` approves (or, for tasks that skip it, after
   to, but follow the mandatory stage-communication contract above: report
   skips before work starts, report later skip decisions at the transition,
   and include the compact final `Stages:` record.
+- Apply the mandatory pre-work routing-approval gate above to standard,
+  complex, and high-risk work and to broad discovery/design planning at
+  any tier. Approval is for routing only, never a substitute for required
+  plan or action authorization.
 - Never let a stage duplicate work another stage already did: don't
   re-explore what `discovery` already mapped, don't re-plan what
   `planner` already decided, don't let `reviewer`/`test-reviewer` restart

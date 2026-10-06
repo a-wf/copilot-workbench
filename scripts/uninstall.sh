@@ -10,7 +10,9 @@
 #   - The user's pricing config (~/.copilot/task-reports/model-pricing.json)
 #     and company request-pricing config
 #     (~/.copilot/task-reports/request-pricing.json) — both are
-#     copy-once-if-absent and never toolkit-managed.
+#     copy-once-if-absent and never toolkit-managed — and the runtime
+#     official pricing cache (official-pricing-cache.json,
+#     official-pricing-refresh-state.json) in the same directory.
 #   - Copilot session state (~/.copilot/session-state, ~/.copilot-sessions)
 #   - Any other user data.
 #

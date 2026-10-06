@@ -27,10 +27,14 @@
 #
 # Idempotent: running this script repeatedly is safe. Any pre-existing file
 # at a destination that isn't already managed by this toolkit is backed up
-# (never deleted) before being replaced. The user's editable pricing config
-# (model-pricing.json) and the company fixed per-request charge config
+# (never deleted) before being replaced. The legacy pricing config
+# (model-pricing.json) and the legacy company fixed per-request charge config
 # (request-pricing.json) are each only ever copied into place if they do not
-# already exist at the destination — never overwritten or symlinked.
+# already exist at the destination — never overwritten or symlinked. Both are
+# INACTIVE: the report now uses GitHub's official per-token rates, which
+# copilot-task-report.py fetches and caches at runtime
+# (~/.copilot/task-reports/official-pricing-cache.json) — the installer
+# makes no network request and writes no pricing cache.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -320,9 +324,11 @@ elif command -v python3 >/dev/null 2>&1; then
   fi
 fi
 
-# --- Pricing config: copy-only-if-absent, never overwrite user edits ---
+# --- Legacy pricing config: copy-only-if-absent, never overwrite user edits ---
+# Inactive (kept for reference/compatibility): the report's USD estimate
+# comes from the official GitHub pricing cache managed at runtime.
 log ""
-log "${BOLD}Pricing config${RESET} -> $COPILOT_HOME/task-reports/model-pricing.json"
+log "${BOLD}Pricing config${RESET} (legacy, inactive — official GitHub rates are fetched automatically) -> $COPILOT_HOME/task-reports/model-pricing.json"
 pricing_dest="$COPILOT_HOME/task-reports/model-pricing.json"
 mkdir_p "$(dirname "$pricing_dest")"
 if [[ -e "$pricing_dest" ]]; then
@@ -336,11 +342,11 @@ else
   fi
 fi
 
-# --- Company fixed per-request charge config: copy-only-if-absent ---
-# Same pattern as the pricing config above: a user/company-editable file
-# that is never overwritten, so local rate edits are always preserved.
+# --- Legacy company fixed per-request charge config: copy-only-if-absent ---
+# Same pattern as the pricing config above: never overwritten, so local
+# edits are preserved. Inactive: no longer rendered in the default report.
 log ""
-log "${BOLD}Company request-pricing config${RESET} -> $COPILOT_HOME/task-reports/request-pricing.json"
+log "${BOLD}Company request-pricing config${RESET} (legacy, inactive) -> $COPILOT_HOME/task-reports/request-pricing.json"
 request_pricing_dest="$COPILOT_HOME/task-reports/request-pricing.json"
 mkdir_p "$(dirname "$request_pricing_dest")"
 if [[ -e "$request_pricing_dest" ]]; then

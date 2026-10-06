@@ -26,6 +26,7 @@ path constants are monkeypatched to point inside it).
 """
 
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -35,7 +36,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import ssl
+import urllib.error
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -91,6 +95,61 @@ def usage_attrs(model, prompt=100, completion=50, reasoning=0, cache_read=0, cac
     return a
 
 
+# Small, offline fixture using the official article's Markdown section,
+# provider headings, table headers, and row shapes. Test values are fixed so
+# parser/price calculations never depend on docs.github.com or on installed
+# user pricing files.
+OFFICIAL_PRICING_MARKDOWN = """\
+## Pricing tables
+
+Prices are in USD per 1 million tokens.
+
+### OpenAI
+| Model | Release status | Category | Tier | Threshold (input tokens) | Input | Cached input | Cache write | Output |
+|---|---|---|---|---|---|---|---|---|
+| GPT-6 Luna | GA | Chat | Default | Not applicable | $0.1 | $0.01 | $0.125 | $0.5 |
+| GPT-6.1 Sol | GA | Chat | Default | ≤ 272K | $2 | $0.1 | $2.5 | $10 |
+| GPT-6.1 Sol | GA | Chat | Long context | > 272K | $4 | $0.2 | $5 | $15 |
+
+### Anthropic
+| Model | Release status | Category | Tier | Threshold (input tokens) | Input | Cached input | Cache write | Output |
+|---|---|---|---|---|---|---|---|---|
+| Claude Opus 4 | GA | Chat | Default | ≤ 272K | $4 | $0.2 | Not applicable | $20 |
+| Claude Opus 4 | GA | Chat | Long context | > 272K | $4 | $0.2 | Not applicable | $15 |
+| Claude Sonnet 5 | GA | Chat | Default | Not applicable | $3 | $0.3 | Not applicable | $15 |
+
+### Google
+| Model | Release status | Category | Input | Cached input | Output |
+|---|---|---|---|---|---|
+| Gemini 3.8 Flash | GA | Chat | $0.075 | $0.01 | $0.3 |
+
+### DeepSeek
+| Model | Release status | Category | Input | Cached input | Cache write | Output |
+|---|---|---|---|---|---|---|
+| DeepSeek V4 | GA | Chat | $0.5 | $0.1 | $0.75 | $2 |
+
+### Moonshot
+| Model | Release status | Category | Input | Cached input | Cache write | Output |
+|---|---|---|---|---|---|---|
+| Kimi K3 | GA | Chat | $1 | $0.2 | $1.25 | $5 |
+
+### xAI
+| Model | Release status | Category | Input | Cached input | Output |
+|---|---|---|---|---|---|
+| Grok 4.7 | GA | Chat | $2 | $0.2 | $10 |
+
+### Meta
+| Model | Release status | Category | Input | Cached input | Output |
+|---|---|---|---|---|---|
+| Llama 4 | GA | Chat | $0.2 | $0.02 | $1 |
+
+### Mistral AI
+| Model | Release status | Category | Input | Cached input | Output |
+|---|---|---|---|---|---|
+| Mistral Large | GA | Chat | $1 | $0.1 | $4 |
+"""
+
+
 class BaseTestCase(unittest.TestCase):
     """Sets up an isolated fake ~/.copilot + support dir per test by
     monkeypatching the module's path constants (never touches the real
@@ -107,6 +166,8 @@ class BaseTestCase(unittest.TestCase):
     }
 
     def setUp(self):
+        self._old_pricing_fetch = os.environ.get("COPILOT_TASK_REPORT_PRICING_FETCH")
+        os.environ["COPILOT_TASK_REPORT_PRICING_FETCH"] = "0"
         self.mod = load_module()
         self.tmp = tempfile.mkdtemp(prefix="copilot-task-report-test-")
 
@@ -120,6 +181,10 @@ class BaseTestCase(unittest.TestCase):
         self.mod.REPORTS_DIR = os.path.join(self.tmp, "Reports")
         self.mod.SESSION_STATE_DIR = os.path.join(self.tmp, "session-state")
         self.mod.OTEL_DIR = os.path.join(self.tmp, "otel")
+        self.mod.PRICING_FETCHER = lambda *_args: self.fail(
+            "unexpected pricing fetch; tests must inject a fixture transport"
+        )
+        self.mod._OFFICIAL_REFRESH_RESULTS.clear()
         self.mod.ensure_dirs()
 
         # Hermetic pricing fixture: tests must not depend on the user's
@@ -133,6 +198,10 @@ class BaseTestCase(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._old_pricing_fetch is None:
+            os.environ.pop("COPILOT_TASK_REPORT_PRICING_FETCH", None)
+        else:
+            os.environ["COPILOT_TASK_REPORT_PRICING_FETCH"] = self._old_pricing_fetch
 
     def otel_path(self, name="copilot-otel-test.jsonl"):
         return os.path.join(self.mod.OTEL_DIR, name)
@@ -166,6 +235,33 @@ class BaseTestCase(unittest.TestCase):
         path = self.mod.request_pricing_path()
         self.mod.atomic_write(path, text)
         return path
+
+    def official_snapshot(self, fetched_epoch=None, markdown=OFFICIAL_PRICING_MARKDOWN):
+        if fetched_epoch is None:
+            fetched_epoch = time.time()
+        return self.mod.build_official_snapshot(markdown.encode("utf-8"), fetched_epoch)
+
+    def write_official_snapshot(self, fetched_epoch=None, markdown=OFFICIAL_PRICING_MARKDOWN):
+        snapshot = self.official_snapshot(fetched_epoch, markdown)
+        self.mod.atomic_write(
+            self.mod.official_pricing_cache_path(),
+            json.dumps(snapshot, indent=2, sort_keys=True),
+        )
+        self.mod._OFFICIAL_REFRESH_RESULTS.clear()
+        return snapshot
+
+    def use_fake_pricing_fetcher(self, result=OFFICIAL_PRICING_MARKDOWN.encode("utf-8")):
+        os.environ["COPILOT_TASK_REPORT_PRICING_FETCH"] = "1"
+        self.mod._OFFICIAL_REFRESH_RESULTS.clear()
+        if isinstance(result, Exception):
+            def fetcher(*_args):
+                raise result
+        elif callable(result):
+            fetcher = result
+        else:
+            def fetcher(*_args):
+                return result
+        self.mod.PRICING_FETCHER = fetcher
 
 
 class TestOtelInstallEpochGating(BaseTestCase):
@@ -723,6 +819,7 @@ class TestReportRendering(BaseTestCase):
     values, and cmd_report must print that report (not just return 0)."""
 
     def _seed_report_data(self, session_id, task):
+        self.write_official_snapshot()
         t = self.t0 + timedelta(minutes=1)
         write_jsonl(self.otel_path(), [
             otel_span(session_id, "chat claude-sonnet-5", t, t + timedelta(seconds=2),
@@ -752,7 +849,11 @@ class TestReportRendering(BaseTestCase):
         self.assertIn("measured:high", md)
         self.assertIn("Model-call time", md)
         self.assertIn("2.0s", md)
-        self.assertIn("$0.0100", md)  # fixture pricing: (800*3 + 200*0.3 + 500*15)/1e6
+        self.assertIn("$0.0100", md)  # official fixture: (800*3 + 200*0.3 + 500*15)/1e6
+        self.assertIn("Estimated USD cost (official GitHub per-token rates recorded at ingestion", md)
+        self.assertIn("Official rate source", md)
+        self.assertIn("Estimated Cost Coverage", md)
+        self.assertNotIn("Total company fixed charge", md)
         self.assertIn("1.000000 AIU", md)
 
     def test_cmd_report_outputs_rendered_content(self):
@@ -773,6 +874,7 @@ class TestReportRendering(BaseTestCase):
         self.assertIn("claude-sonnet-5", md)
         self.assertIn("measured:high", md)
         self.assertIn("$0.0100", md)
+        self.assertNotIn("Total company fixed charge", md)
         self.assertIn("(report file:", err_buf.getvalue())
 
 
@@ -866,6 +968,680 @@ class TestShippedPricingParses(unittest.TestCase):
         self.assertIn("aliases", data)
         self.assertIsInstance(data["models"], dict)
         self.assertIsInstance(data["aliases"], dict)
+
+
+class TestOfficialPricingParsing(BaseTestCase):
+    def test_provider_headers_model_ids_rates_and_thresholds(self):
+        snapshot = self.official_snapshot(fetched_epoch=10_000)
+        self.assertEqual(
+            snapshot["providers"],
+            ["OpenAI", "Anthropic", "Google", "DeepSeek", "Moonshot", "xAI", "Meta", "Mistral AI"],
+        )
+        self.assertEqual(
+            set(snapshot["models"]),
+            {
+                "gpt-6-luna", "gpt-6.1-sol", "claude-opus-4", "claude-sonnet-5",
+                "gemini-3.8-flash", "deepseek-v4", "kimi-k3", "grok-4.7",
+                "llama-4", "mistral-large",
+            },
+        )
+
+        luna = snapshot["models"]["gpt-6-luna"]["tiers"]["default"]
+        self.assertEqual(
+            (luna["input"], luna["cached_input"], luna["cache_write"], luna["output"]),
+            (0.1, 0.01, 0.125, 0.5),
+        )
+        sol = snapshot["models"]["gpt-6.1-sol"]
+        self.assertEqual(sol["threshold"], {
+            "label": "272K",
+            "tokens": 272_000,
+            "ambiguous_upper_tokens": 272 * 1024,
+        })
+        self.assertEqual(
+            tuple(sol["tiers"]["default"][k] for k in ("input", "cached_input", "cache_write", "output")),
+            (2.0, 0.1, 2.5, 10.0),
+        )
+        self.assertEqual(
+            tuple(sol["tiers"]["long_context"][k] for k in ("input", "cached_input", "cache_write", "output")),
+            (4.0, 0.2, 5.0, 15.0),
+        )
+        opus = snapshot["models"]["claude-opus-4"]
+        self.assertEqual(
+            tuple(opus["tiers"]["default"][k] for k in ("input", "cached_input", "cache_write", "output")),
+            (4.0, 0.2, None, 20.0),
+        )
+        self.assertEqual(opus["tiers"]["default"]["cache_write_status"], self.mod.CACHE_WRITE_NOT_APPLICABLE)
+        self.assertEqual(
+            tuple(opus["tiers"]["long_context"][k] for k in ("input", "cached_input", "cache_write", "output")),
+            (4.0, 0.2, None, 15.0),
+        )
+        self.assertEqual(
+            snapshot["models"]["gemini-3.8-flash"]["tiers"]["default"]["cache_write_status"],
+            self.mod.CACHE_WRITE_NOT_LISTED,
+        )
+        self.assertEqual(snapshot["models"]["gemini-3.8-flash"]["provider"], "Google")
+
+    def test_malformed_markdown_rejects_entire_snapshot(self):
+        malformed = [
+            OFFICIAL_PRICING_MARKDOWN.replace("## Pricing tables", "## Prices"),
+            OFFICIAL_PRICING_MARKDOWN.replace("$2 | $0.1 | $2.5 | $10", "$bad | $0.1 | $2.5 | $10"),
+            OFFICIAL_PRICING_MARKDOWN.replace("≤ 272K", "< 272K"),
+        ]
+        for page in malformed:
+            with self.subTest(page=page[:40]):
+                with self.assertRaises(self.mod.OfficialPricingError):
+                    self.mod.build_official_snapshot(page.encode("utf-8"), 10_000)
+
+    def test_snapshot_validation_rejects_bool_negative_and_nonfinite_rates(self):
+        valid = self.official_snapshot(fetched_epoch=10_000)
+        for invalid in (True, -0.01, float("inf"), float("nan")):
+            with self.subTest(rate=invalid):
+                candidate = copy.deepcopy(valid)
+                candidate["models"]["gpt-6-luna"]["tiers"]["default"]["input"] = invalid
+                with self.assertRaises(self.mod.OfficialPricingError):
+                    self.mod.validate_official_snapshot(candidate)
+
+    def test_snapshot_metadata_provider_hash_and_lookup_are_validated(self):
+        valid = self.official_snapshot(fetched_epoch=10_000)
+        corruptions = [
+            ("providers is not a list", lambda snap: snap.update(providers="OpenAI")),
+            ("provider list contains an empty name", lambda snap: snap["providers"].__setitem__(0, "")),
+            ("model provider is empty", lambda snap: snap["models"]["gpt-6-luna"].update(provider="")),
+            ("fetched timestamp disagrees with epoch", lambda snap: snap.update(fetched_at="1970-01-01T00:00:00Z")),
+            ("content hash is malformed", lambda snap: snap.update(content_sha256="not-a-sha256")),
+            ("snapshot id disagrees with hash", lambda snap: snap.update(snapshot_id="sha256:" + "0" * 16)),
+            ("lookup disagrees with models", lambda snap: snap["lookup"].update({"gpt-6-luna": "not-a-model"})),
+        ]
+        for label, corrupt in corruptions:
+            with self.subTest(corruption=label):
+                candidate = copy.deepcopy(valid)
+                corrupt(candidate)
+                with self.assertRaises(self.mod.OfficialPricingError):
+                    self.mod.validate_official_snapshot(candidate)
+
+    def test_malformed_notes_reject_cache_but_null_notes_are_safe(self):
+        valid = self.official_snapshot(fetched_epoch=time.time())
+        for malformed_notes in ("not-a-list", ["valid note", 7], {"note": "unexpected"}):
+            with self.subTest(notes=malformed_notes):
+                candidate = copy.deepcopy(valid)
+                candidate["models"]["gpt-6-luna"]["notes"] = malformed_notes
+                self.mod.atomic_write(
+                    self.mod.official_pricing_cache_path(),
+                    json.dumps(candidate),
+                )
+                cached, error = self.mod.read_official_snapshot_cache()
+                self.assertIsNone(cached)
+                self.assertIn("'notes' must be a list of strings", error)
+
+        null_notes = copy.deepcopy(valid)
+        null_notes["models"]["gpt-6-luna"]["notes"] = None
+        self.mod.atomic_write(
+            self.mod.official_pricing_cache_path(),
+            json.dumps(null_notes),
+        )
+        cached, error = self.mod.read_official_snapshot_cache()
+        self.assertIsNone(error)
+        self.assertEqual(cached["models"]["gpt-6-luna"]["notes"], None)
+
+        call = {
+            "model": "gpt-6-luna",
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "usage_present": {"input": True, "output": True},
+        }
+        delta = self.mod.build_official_cost_delta(
+            [call],
+            {"snapshot": cached, "status": "fresh", "age_seconds": 1},
+        )
+        self.assertEqual(delta["by_model"]["gpt-6-luna"]["priced"][cached["snapshot_id"]]["calls"], 1)
+        self.assertNotIn("gpt-6-luna", delta["snapshot"]["notes"])
+
+    def test_cache_read_write_output_and_reasoning_are_priced_once(self):
+        snapshot = self.official_snapshot(fetched_epoch=10_000)
+        call = {
+            "model": "gpt-6-luna",
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "reasoning_tokens": 100,
+            "cache_read_tokens": 300,
+            "cache_write_tokens": 200,
+            "usage_present": {"input": True, "output": True},
+        }
+        result, reason = self.mod.price_call_official(call, snapshot)
+        self.assertIsNone(reason)
+        self.assertEqual(result["components"], {
+            "input_usd": 500 * 0.1 / 1_000_000,
+            "cached_input_usd": 300 * 0.01 / 1_000_000,
+            "cache_write_usd": 200 * 0.125 / 1_000_000,
+            "output_usd": 200 * 0.5 / 1_000_000,
+        })
+        self.assertAlmostEqual(result["usd"], 178 / 1_000_000)
+
+        # Official "Not applicable" means cache-write tokens are charged at
+        # the ordinary input rate. A missing cache-write column is different:
+        # a positive cache-write count cannot be priced exactly.
+        opus_call = dict(call, model="claude-opus-4", prompt_tokens=1000,
+                         completion_tokens=0, reasoning_tokens=0,
+                         cache_read_tokens=0, cache_write_tokens=100)
+        opus, reason = self.mod.price_call_official(opus_call, snapshot)
+        self.assertIsNone(reason)
+        self.assertAlmostEqual(opus["components"]["cache_write_usd"], 100 * 4 / 1_000_000)
+        unlisted_call = dict(opus_call, model="gemini-3.8-flash")
+        unlisted, reason = self.mod.price_call_official(unlisted_call, snapshot)
+        self.assertIsNone(unlisted)
+        self.assertEqual(reason, self.mod.UNPRICED_CACHE_WRITE_NOT_LISTED)
+
+    def test_tier_threshold_ambiguous_band_and_exact_edges(self):
+        snapshot = self.official_snapshot(fetched_epoch=10_000)
+        upper = 272 * 1024
+        expected = [
+            (272_000, self.mod.TIER_DEFAULT, None),
+            (272_001, None, self.mod.UNPRICED_TIER_AMBIGUOUS),
+            (upper, None, self.mod.UNPRICED_TIER_AMBIGUOUS),
+            (upper + 1, self.mod.TIER_LONG, None),
+        ]
+        for prompt, tier, reason_expected in expected:
+            with self.subTest(prompt=prompt):
+                result, reason = self.mod.price_call_official({
+                    "model": "gpt-6.1-sol",
+                    "prompt_tokens": prompt,
+                    "completion_tokens": 1,
+                    "usage_present": {"input": True, "output": True},
+                }, snapshot)
+                self.assertEqual(reason, reason_expected)
+                self.assertEqual(result["tier"] if result else None, tier)
+
+    def test_unknown_missing_and_inconsistent_usage_are_explicitly_unpriced(self):
+        snapshot = self.official_snapshot(fetched_epoch=10_000)
+        good = {
+            "model": "gpt-6-luna", "prompt_tokens": 10, "completion_tokens": 5,
+            "reasoning_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0,
+            "usage_present": {"input": True, "output": True},
+        }
+        cases = [
+            (None, self.mod.UNPRICED_NO_SNAPSHOT),
+            (dict(good, model="auto"), self.mod.UNPRICED_UNKNOWN_MODEL),
+            (dict(good, usage_present={"input": False, "output": True}), self.mod.UNPRICED_NO_INPUT),
+            (dict(good, usage_present={"input": True, "output": False}), self.mod.UNPRICED_NO_OUTPUT),
+            (dict(good, prompt_tokens=-1), self.mod.UNPRICED_NEGATIVE),
+            (dict(good, cache_read_tokens=11), self.mod.UNPRICED_CACHE_EXCEEDS_INPUT),
+            (dict(good, reasoning_tokens=6), self.mod.UNPRICED_REASONING_EXCEEDS_OUTPUT),
+        ]
+        for call, expected_reason in cases:
+            with self.subTest(reason=expected_reason):
+                result, reason = self.mod.price_call_official(call, snapshot if call is not None else None)
+                self.assertIsNone(result)
+                self.assertEqual(reason, expected_reason)
+
+
+class TestOfficialPricingTlsFallback(unittest.TestCase):
+    """The system-curl path is only a verified fallback for Python CA-bundle
+    failures. All transport behavior is mocked; these tests never use a
+    network connection."""
+
+    def setUp(self):
+        self.mod = load_module()
+
+    def test_only_raw_or_wrapped_certificate_verification_errors_fallback(self):
+        url = self.mod.OFFICIAL_PRICING_API_URL
+        timeout = 7
+        max_bytes = 4096
+        failures = [
+            ssl.SSLCertVerificationError("certificate verify failed"),
+            urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")),
+        ]
+
+        for failure in failures:
+            with self.subTest(error=type(failure).__name__):
+                with mock.patch.object(
+                    self.mod, "_default_pricing_fetch_inner", side_effect=failure
+                ), mock.patch.object(
+                    self.mod, "_curl_pricing_fetch", return_value=b"curl body"
+                ) as curl_fetch, contextlib.redirect_stderr(io.StringIO()):
+                    result = self.mod._default_pricing_fetch(url, timeout, max_bytes)
+
+                self.assertEqual(result, b"curl body")
+                curl_fetch.assert_called_once()
+                args = curl_fetch.call_args.args
+                self.assertEqual(args[:3], (url, timeout, max_bytes))
+                self.assertIn("certificate verify failed", args[3])
+
+    def test_non_certificate_errors_never_fallback(self):
+        url = self.mod.OFFICIAL_PRICING_API_URL
+        failures = [
+            urllib.error.URLError(OSError("connection refused")),
+            TimeoutError("request timed out"),
+            ssl.SSLError("TLS handshake failed"),
+            urllib.error.HTTPError(url, 503, "Unavailable", {}, io.BytesIO(b"")),
+        ]
+
+        for failure in failures:
+            with self.subTest(error=type(failure).__name__):
+                with mock.patch.object(
+                    self.mod, "_default_pricing_fetch_inner", side_effect=failure
+                ), mock.patch.object(self.mod, "_curl_pricing_fetch") as curl_fetch:
+                    with self.assertRaises(type(failure)):
+                        self.mod._default_pricing_fetch(url, 7, 4096)
+                curl_fetch.assert_not_called()
+
+    class FakeCurlProcess:
+        def __init__(self, output, returncode=0):
+            self.stdout = io.BytesIO(output)
+            self.returncode = returncode
+            self.wait_timeout = None
+
+        def wait(self, timeout=None):
+            self.wait_timeout = timeout
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            raise AssertionError("unexpected curl process kill")
+
+    def _curl_output(self, body, status="200", effective_url=None):
+        url = self.mod.OFFICIAL_PRICING_API_URL
+        if effective_url is None:
+            effective_url = url
+        trailer = "%s%s %s" % (self.mod._CURL_STATUS_MARKER, status, effective_url)
+        return body + trailer.encode("ascii")
+
+    def test_system_curl_uses_verified_https_without_shell_or_redirect_options(self):
+        url = self.mod.OFFICIAL_PRICING_API_URL
+        body = b"mocked official pricing"
+        process = self.FakeCurlProcess(self._curl_output(body))
+
+        with mock.patch.object(self.mod, "_find_system_curl", return_value="/usr/bin/curl"), \
+             mock.patch("subprocess.Popen", return_value=process) as popen:
+            result = self.mod._curl_pricing_fetch(url, 7, 4096, "certificate error")
+
+        self.assertEqual(result, body)
+        argv = popen.call_args.args[0]
+        options = argv[1:]
+        kwargs = popen.call_args.kwargs
+        self.assertEqual(options[0], "-q")
+        self.assertIn("--proto", options)
+        self.assertEqual(options[options.index("--proto") + 1], "=https")
+        self.assertIn("--proto-redir", options)
+        self.assertEqual(options[options.index("--proto-redir") + 1], "=https")
+        self.assertFalse({"-k", "--insecure", "-L", "--location", "--location-trusted"} & set(options))
+        self.assertIs(kwargs["shell"], False)
+
+    def test_system_curl_rejects_bad_status_redirect_oversize_and_missing_trailer(self):
+        url = self.mod.OFFICIAL_PRICING_API_URL
+        cases = [
+            ("non-200", self._curl_output(b"body", status="503"), 4096, "unexpected HTTP status"),
+            (
+                "effective URL mismatch",
+                self._curl_output(b"body", effective_url="https://docs.github.com/other"),
+                4096,
+                "unexpected final URL",
+            ),
+            ("oversized body", self._curl_output(b"12345"), 4, "response too large"),
+            ("missing status trailer", b"body without trailer", 4096, "missing HTTP status trailer"),
+        ]
+
+        for label, output, max_bytes, expected_error in cases:
+            with self.subTest(case=label):
+                process = self.FakeCurlProcess(output)
+                with mock.patch.object(
+                    self.mod, "_find_system_curl", return_value="/usr/bin/curl"
+                ), mock.patch("subprocess.Popen", return_value=process):
+                    with self.assertRaisesRegex(self.mod.OfficialPricingError, expected_error):
+                        self.mod._curl_pricing_fetch(url, 7, max_bytes, "certificate error")
+
+    def test_missing_system_curl_is_a_bounded_error(self):
+        with mock.patch.object(self.mod, "_find_system_curl", return_value=None), \
+             mock.patch("subprocess.Popen") as popen:
+            with self.assertRaisesRegex(self.mod.OfficialPricingError, "no system curl was found"):
+                self.mod._curl_pricing_fetch(
+                    self.mod.OFFICIAL_PRICING_API_URL, 7, 4096, "certificate error"
+                )
+        popen.assert_not_called()
+
+
+class TestOfficialPricingRefresh(BaseTestCase):
+    def test_fresh_cache_skips_fetch_and_expired_cache_refreshes_from_injected_transport(self):
+        fetched_epoch = 50_000
+        snapshot = self.write_official_snapshot(fetched_epoch=fetched_epoch)
+        calls = []
+        self.use_fake_pricing_fetcher(
+            lambda url, timeout, max_bytes: calls.append((url, timeout, max_bytes))
+            or OFFICIAL_PRICING_MARKDOWN.encode("utf-8")
+        )
+
+        fresh = self.mod.refresh_official_pricing_if_due(
+            now=fetched_epoch + self.mod.OFFICIAL_PRICING_TTL_SECONDS - 1,
+        )
+        self.assertEqual(fresh["status"], "fresh")
+        self.assertFalse(fresh["attempted"])
+        self.assertEqual(calls, [])
+
+        self.mod._OFFICIAL_REFRESH_RESULTS.clear()
+        expired_at = fetched_epoch + self.mod.OFFICIAL_PRICING_TTL_SECONDS
+        refreshed = self.mod.refresh_official_pricing_if_due(now=expired_at)
+        self.assertEqual(refreshed["status"], "refreshed")
+        self.assertTrue(refreshed["attempted"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], (
+            self.mod.OFFICIAL_PRICING_API_URL,
+            self.mod.OFFICIAL_PRICING_TIMEOUT_SECONDS,
+            self.mod.OFFICIAL_PRICING_MAX_BYTES,
+        ))
+        cached, error = self.mod.read_official_snapshot_cache()
+        self.assertIsNone(error)
+        # Snapshot identity is content-addressed: the fixture contains the
+        # same official document, so a refresh updates fetched_at without
+        # manufacturing a new content id.
+        self.assertEqual(snapshot["snapshot_id"], cached["snapshot_id"])
+        self.assertEqual(cached["fetched_epoch"], float(expired_at))
+
+    def test_failed_refresh_keeps_last_good_cache_marks_stale_and_suppresses_retry(self):
+        fetched_epoch = 80_000
+        snapshot = self.write_official_snapshot(fetched_epoch=fetched_epoch)
+        cache_path = self.mod.official_pricing_cache_path()
+        with open(cache_path, "rb") as stream:
+            before = stream.read()
+
+        failed_at = fetched_epoch + self.mod.OFFICIAL_PRICING_TTL_SECONDS + 10
+        self.use_fake_pricing_fetcher(OSError("offline fixture"))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = self.mod.refresh_official_pricing_if_due(now=failed_at)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("offline fixture", stderr.getvalue())
+        self.assertIn("last valid snapshot", stderr.getvalue())
+        with open(cache_path, "rb") as stream:
+            self.assertEqual(stream.read(), before)
+        ctx = self.mod.load_official_pricing_context(now=failed_at)
+        self.assertEqual(ctx["status"], "stale")
+        self.assertEqual(ctx["snapshot"]["snapshot_id"], snapshot["snapshot_id"])
+
+        retry_calls = []
+        self.mod.PRICING_FETCHER = lambda *_args: retry_calls.append(True) or OFFICIAL_PRICING_MARKDOWN.encode()
+        self.mod._OFFICIAL_REFRESH_RESULTS.clear()
+        suppressed = self.mod.refresh_official_pricing_if_due(
+            now=failed_at + self.mod.OFFICIAL_PRICING_RETRY_BACKOFF_SECONDS - 1,
+        )
+        self.assertEqual(suppressed["status"], "suppressed")
+        self.assertFalse(suppressed["attempted"])
+        self.assertEqual(retry_calls, [])
+
+    def test_first_fetch_failure_and_malformed_cache_remain_unpriced_without_replacement(self):
+        self.use_fake_pricing_fetcher(OSError("offline fixture"))
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = self.mod.refresh_official_pricing_if_due(now=90_000)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("no cached snapshot exists", stderr.getvalue())
+        self.assertIn("not $0", stderr.getvalue())
+        self.assertEqual(self.mod.load_official_pricing_context(now=90_000)["status"], "unavailable")
+        self.assertFalse(os.path.exists(self.mod.official_pricing_cache_path()))
+
+        # An invalid pre-existing cache is never silently overwritten by a
+        # failed Markdown parse; a valid refresh is required to replace it.
+        malformed_cache = b'{"models": [not-json]}'
+        self.mod.atomic_write(self.mod.official_pricing_cache_path(), malformed_cache.decode())
+        self.use_fake_pricing_fetcher(b"not a pricing article")
+        self.mod._OFFICIAL_REFRESH_RESULTS.clear()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = self.mod.refresh_official_pricing_if_due(now=100_000)
+        self.assertEqual(result["status"], "failed")
+        with open(self.mod.official_pricing_cache_path(), "rb") as stream:
+            self.assertEqual(stream.read(), malformed_cache)
+        ctx = self.mod.load_official_pricing_context(now=100_000)
+        self.assertEqual(ctx["status"], "unavailable")
+        self.assertTrue(ctx["cache_error"])
+
+    def test_corrupt_refresh_state_never_breaks_ingest_or_replaces_pricing_cache(self):
+        snapshot = self.write_official_snapshot(fetched_epoch=time.time() - 60)
+        state_path = self.mod.official_pricing_state_path()
+        invalid_states = [
+            ("malformed JSON", b'{"last_success_epoch":'),
+            ("invalid UTF-8", b"\xff\xfe"),
+            ("bad last success", json.dumps({"last_success_epoch": "recent"}).encode("utf-8")),
+            ("bad consecutive failures", json.dumps({"consecutive_failures": True}).encode("utf-8")),
+        ]
+        fetch_calls = []
+        self.use_fake_pricing_fetcher(
+            lambda *_args: fetch_calls.append(True) or OFFICIAL_PRICING_MARKDOWN.encode("utf-8")
+        )
+
+        for index, (label, raw_state) in enumerate(invalid_states):
+            with self.subTest(state=label):
+                self.mod._OFFICIAL_REFRESH_RESULTS.clear()
+                with open(state_path, "wb") as stream:
+                    stream.write(raw_state)
+
+                session_id = "sess-corrupt-pricing-state-%d" % index
+                start = self.t0 + timedelta(minutes=index + 1)
+                write_jsonl(self.otel_path(), [
+                    otel_span(
+                        session_id,
+                        "chat gpt-6-luna",
+                        start,
+                        start + timedelta(seconds=1),
+                        usage_attrs("gpt-6-luna", prompt=100, completion=50),
+                    ),
+                ])
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(self.ingest(session_id, "CORRUPT-STATE-%d" % index), 0)
+
+                self.assertIn("retry metadata is ignored and reset", stderr.getvalue())
+                with open(state_path, encoding="utf-8") as stream:
+                    self.assertEqual(json.load(stream), {})
+                task = self.task("CORRUPT-STATE-%d" % index)
+                self.assertEqual(task["official_cost"]["by_model"]["gpt-6-luna"]["priced"][snapshot["snapshot_id"]]["calls"], 1)
+                self.assertEqual(task["totals"]["call_count"], 1)
+
+        self.assertEqual(fetch_calls, [], "a fresh validated cache must not be replaced")
+        cached, error = self.mod.read_official_snapshot_cache()
+        self.assertIsNone(error)
+        self.assertEqual(cached["snapshot_id"], snapshot["snapshot_id"])
+
+
+class TestOfficialCostIngestion(BaseTestCase):
+    def test_stale_snapshot_is_priced_until_seven_days_then_unpriced_without_losing_cost(self):
+        now = time.time()
+        max_age = self.mod.OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS
+        snapshot = self.write_official_snapshot(fetched_epoch=now - max_age + 3600)
+        session_id = "sess-stale-official-pricing"
+
+        def span_at(minute):
+            start = self.t0 + timedelta(minutes=minute)
+            return otel_span(
+                session_id,
+                "chat gpt-6-luna",
+                start,
+                start + timedelta(seconds=1),
+                usage_attrs("gpt-6-luna", prompt=1000, completion=200),
+            )
+
+        self.assertEqual(self.mod.load_official_pricing_context()["status"], "stale")
+        write_jsonl(self.otel_path(), [span_at(1)])
+        self.assertEqual(self.ingest(session_id, "STALE-THEN-EXPIRED"), 0)
+        task = self.task("STALE-THEN-EXPIRED")
+        model_cost = task["official_cost"]["by_model"]["gpt-6-luna"]
+        self.assertEqual(model_cost["priced"][snapshot["snapshot_id"]]["calls"], 1)
+        self.assertTrue(task["official_cost"]["snapshots"][snapshot["snapshot_id"]]["used_while_stale"])
+
+        # Keep the same content-addressed pricing document but age its fetch
+        # time past the seven-day maximum. New calls must stay in the token
+        # totals and be explicitly unpriced without erasing earlier estimates.
+        self.write_official_snapshot(fetched_epoch=now - max_age - 1)
+        self.assertEqual(self.mod.load_official_pricing_context()["status"], "expired")
+        write_jsonl(self.otel_path(), [span_at(2)])
+        self.assertEqual(self.ingest(session_id, "STALE-THEN-EXPIRED"), 0)
+
+        task = self.task("STALE-THEN-EXPIRED")
+        model_cost = task["official_cost"]["by_model"]["gpt-6-luna"]
+        self.assertEqual(model_cost["priced"][snapshot["snapshot_id"]]["calls"], 1)
+        self.assertAlmostEqual(model_cost["priced"][snapshot["snapshot_id"]]["usd"], 200 / 1_000_000)
+        self.assertEqual(
+            model_cost["unpriced"][self.mod.UNPRICED_SNAPSHOT_TOO_OLD],
+            {"calls": 1, "total_tokens": 1200},
+        )
+        summary = self.mod.summarize_official_cost(task)
+        self.assertEqual(summary["totals"]["calls"], 2)
+        self.assertEqual(summary["totals"]["priced_calls"], 1)
+        self.assertEqual(summary["totals"]["unpriced_calls"], 1)
+        self.assertEqual(task["totals"]["call_count"], 2)
+
+    def test_gemini_reasoning_calls_are_unpriced_without_dropping_tokens(self):
+        snapshot = self.write_official_snapshot(fetched_epoch=time.time() - 60)
+        model = "gemini-3.8-flash"
+        session_id = "sess-gemini-reasoning-pricing"
+        calls = [
+            (1, 50),   # reasoning is a positive subset of output
+            (50, 50),  # reasoning equals reported output
+            (51, 50),  # reasoning exceeds reported output
+        ]
+        spans = []
+        for index, (reasoning, completion) in enumerate(calls):
+            start = self.t0 + timedelta(minutes=index + 1)
+            spans.append(otel_span(
+                session_id,
+                "chat " + model,
+                start,
+                start + timedelta(seconds=1),
+                usage_attrs(model, prompt=100, completion=completion, reasoning=reasoning),
+            ))
+        write_jsonl(self.otel_path(), spans)
+        self.assertEqual(self.ingest(session_id, "GEMINI-REASONING-UNPRICED"), 0)
+
+        task = self.task("GEMINI-REASONING-UNPRICED")
+        aggregate = task["by_model"][model]
+        self.assertEqual(aggregate["call_count"], 3)
+        self.assertEqual(aggregate["prompt_tokens"], 300)
+        self.assertEqual(aggregate["completion_tokens"], 150)
+        self.assertEqual(aggregate["reasoning_tokens"], 102)
+        self.assertEqual(aggregate["total_tokens"], 450)
+        reason_record = task["official_cost"]["by_model"][model]["unpriced"][self.mod.UNPRICED_GEMINI_REASONING]
+        self.assertEqual(reason_record, {"calls": 3, "total_tokens": 450})
+        self.assertNotIn(snapshot["snapshot_id"], task["official_cost"]["by_model"][model]["priced"])
+
+    def test_incremental_calls_keep_their_ingestion_snapshot_cost_and_do_not_duplicate(self):
+        first_snapshot = self.write_official_snapshot(fetched_epoch=time.time() - 60)
+        session_id = "sess-official-snapshots"
+        first = self.t0 + timedelta(minutes=1)
+        span = lambda start: otel_span(
+            session_id,
+            "chat gpt-6-luna",
+            start,
+            start + timedelta(seconds=1),
+            usage_attrs(
+                "gpt-6-luna",
+                prompt=1000,
+                completion=200,
+                reasoning=100,
+                cache_read=300,
+                cache_write=100,
+            ),
+        )
+        write_jsonl(self.otel_path(), [span(first)])
+        self.assertEqual(self.ingest(session_id, "OFFICIAL-FROZEN"), 0)
+        task = self.task("OFFICIAL-FROZEN")
+        first_bucket = task["official_cost"]["by_model"]["gpt-6-luna"]["priced"][first_snapshot["snapshot_id"]]
+        self.assertEqual(first_bucket["calls"], 1)
+        self.assertAlmostEqual(first_bucket["usd"], 175.5 / 1_000_000)
+
+        # A second official document changes every Luna rate. Only the newly
+        # appended call may use those rates; the first per-call estimate stays
+        # recorded against its original snapshot.
+        changed_markdown = OFFICIAL_PRICING_MARKDOWN.replace(
+            "| $0.1 | $0.01 | $0.125 | $0.5 |",
+            "| $0.2 | $0.02 | $0.25 | $1 |",
+        )
+        second_snapshot = self.write_official_snapshot(
+            fetched_epoch=time.time(),
+            markdown=changed_markdown,
+        )
+        self.assertNotEqual(first_snapshot["snapshot_id"], second_snapshot["snapshot_id"])
+        second = first + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [span(second)])
+        self.assertEqual(self.ingest(session_id, "OFFICIAL-FROZEN"), 0)
+        self.assertEqual(self.ingest(session_id, "OFFICIAL-FROZEN"), 0)
+
+        task = self.task("OFFICIAL-FROZEN")
+        model_cost = task["official_cost"]["by_model"]["gpt-6-luna"]
+        self.assertEqual(model_cost["priced"][first_snapshot["snapshot_id"]]["calls"], 1)
+        self.assertAlmostEqual(
+            model_cost["priced"][first_snapshot["snapshot_id"]]["usd"],
+            175.5 / 1_000_000,
+        )
+        self.assertEqual(model_cost["priced"][second_snapshot["snapshot_id"]]["calls"], 1)
+        self.assertAlmostEqual(
+            model_cost["priced"][second_snapshot["snapshot_id"]]["usd"],
+            351 / 1_000_000,
+        )
+        summary = self.mod.summarize_official_cost(task)
+        self.assertEqual(summary["totals"]["calls"], 2)
+        self.assertEqual(summary["totals"]["priced_calls"], 2)
+        self.assertEqual(summary["totals"]["legacy_calls"], 0)
+        self.assertAlmostEqual(summary["totals"]["usd"], 526.5 / 1_000_000)
+
+        markdown = self.mod.render_markdown(task)
+        self.assertIn("Official rate source", markdown)
+        self.assertIn("Estimated Cost Coverage", markdown)
+        self.assertIn(first_snapshot["snapshot_id"], markdown)
+        self.assertIn(second_snapshot["snapshot_id"], markdown)
+        self.assertIn(first_snapshot["fetched_at"], markdown)
+        self.assertIn(second_snapshot["fetched_at"], markdown)
+        self.assertNotIn("Total company fixed charge", markdown)
+
+    def test_legacy_aggregate_calls_remain_unpriced_and_are_never_backfilled(self):
+        snapshot = self.write_official_snapshot()
+        model = "gpt-6-luna"
+        old_agg = self.mod.blank_agg()
+        old_agg.update({
+            "call_count": 2,
+            "prompt_tokens": 200,
+            "completion_tokens": 100,
+            "total_tokens": 300,
+        })
+        task_id = "OFFICIAL-LEGACY"
+        old_task = {
+            "task_id": task_id,
+            "totals": dict(old_agg),
+            "by_model": {model: dict(old_agg)},
+            "by_effort": {"unknown": dict(old_agg)},
+            "sessions": [],
+        }
+        self.mod.atomic_write(self.mod.task_path(task_id), json.dumps(old_task, indent=2))
+
+        session_id = "sess-official-after-legacy"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id,
+                "chat " + model,
+                start,
+                start + timedelta(seconds=1),
+                usage_attrs(model, prompt=1000, completion=200),
+            ),
+        ])
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+
+        task = self.task(task_id)
+        summary = self.mod.summarize_official_cost(task)
+        self.assertEqual(task["totals"]["call_count"], 3)
+        self.assertEqual(summary["totals"]["priced_calls"], 1)
+        self.assertEqual(summary["totals"]["legacy_calls"], 2)
+        self.assertAlmostEqual(
+            summary["totals"]["usd"],
+            (1000 * 0.1 + 200 * 0.5) / 1_000_000,
+        )
+        self.assertEqual(
+            task["official_cost"]["by_model"][model]["priced"][snapshot["snapshot_id"]]["calls"],
+            1,
+        )
+        markdown = self.mod.render_markdown(task)
+        self.assertIn("| gpt-6-luna | 3 | 1 | $0.0002 | 0 | 2 | gpt-6-luna (Default×1) |", markdown)
+        self.assertIn("2 call(s) are legacy: recorded before official per-token pricing existed", markdown)
+        self.assertNotIn("Total company fixed charge", markdown)
 
 
 class TestShippedRequestPricingSchema(BaseTestCase):
@@ -970,22 +1746,15 @@ class TestFixedRequestChargesFromOtel(BaseTestCase):
         self.assertIn("effort unknown", rows[("gpt-6.1-sol", "unknown")]["reason"])
         self.assertIn("no request rate configured", rows[("gpt-5.4", "measured:medium")]["reason"])
 
-        # A $11.75 token estimate remains separate from the $3.49 partial
-        # fixed-request subtotal; the figures are not added together.
+        # The legacy estimate helper remains callable for compatibility,
+        # but it is no longer rendered as a second/default bill.
         token_total, _, _ = self.mod.estimate_usd(task["by_model"])
         self.assertAlmostEqual(token_total, 11.75)
         markdown = self.mod.render_markdown(task)
-        self.assertIn("Estimated USD cost (independent pricing table, approximate", markdown)
-        self.assertIn("$11.7500", markdown)
-        total_charge_line = next(
-            (line for line in markdown.splitlines() if "$3.4900 — **PARTIAL (lower bound)**" in line),
-            None,
-        )
-        self.assertIsNotNone(total_charge_line)
-        self.assertIn(
-            "$3.4900 — **PARTIAL (lower bound)**: excludes 4 not-priced and 0 unattributed requests",
-            total_charge_line,
-        )
+        self.assertIn("Estimated USD cost (official GitHub per-token rates recorded at ingestion", markdown)
+        self.assertNotIn("Estimated USD cost (independent pricing table, approximate", markdown)
+        self.assertNotIn("Total company fixed charge", markdown)
+        self.assertNotIn("$3.4900", markdown)
         self.assertNotIn("$15.2400", markdown)
 
 
@@ -1289,16 +2058,11 @@ class TestLegacyFixedRequestAttribution(BaseTestCase):
         with open(task_path, "rb") as f:
             self.assertEqual(f.read(), original_bytes)
         self.assertEqual(task["by_model"][model]["call_count"], 2)
-        self.assertIn(
-            "| gpt-6-luna | — | — | 2 | — | not priced | unattributed:",
-            markdown,
-        )
-        self.assertIn(
-            "| Total company fixed charge | N/A — none of the recorded requests could be priced",
-            markdown,
-        )
+        self.assertIn("| gpt-6-luna | 2 | 0 | not priced | 0 | 2 | — |", markdown)
+        self.assertIn("2 call(s) are legacy: recorded before official per-token pricing existed", markdown)
+        self.assertIn("Estimated USD cost (official GitHub per-token rates recorded at ingestion", markdown)
+        self.assertNotIn("Total company fixed charge", markdown)
         self.assertNotIn("| gpt-6-luna | measured | xhigh |", markdown)
-        self.assertNotIn("| Total company fixed charge | $0.0000", markdown)
 
 
 class TestRequestPricingAvailabilityAndValidation(BaseTestCase):
@@ -1321,7 +2085,7 @@ class TestRequestPricingAvailabilityAndValidation(BaseTestCase):
         ingest_stderr = io.StringIO()
         with contextlib.redirect_stderr(ingest_stderr):
             self.assertEqual(self.ingest(session_id, "INVALID-PRICING"), 0)
-        self.assertIn("invalid", ingest_stderr.getvalue().lower())
+        self.assertEqual(ingest_stderr.getvalue(), "")
         task = self.task("INVALID-PRICING")
 
         config = self.mod.load_request_pricing()
@@ -1334,14 +2098,17 @@ class TestRequestPricingAvailabilityAndValidation(BaseTestCase):
         with contextlib.redirect_stderr(stderr):
             markdown = self.mod.render_markdown(task)
 
-        self.assertIn("invalid", stderr.getvalue().lower())
-        self.assertIn("request-pricing.json", stderr.getvalue())
+        # The fixed-request config and its validation helpers are dormant in
+        # the default report, so malformed values cannot inject an obsolete
+        # charge section or suppress official per-token coverage.
+        self.assertEqual(stderr.getvalue(), "")
         self.assertIn("**UNAVAILABLE**", markdown)
         self.assertIn(
-            "Estimated USD cost (independent pricing table, approximate",
+            "Estimated USD cost (official GitHub per-token rates recorded at ingestion",
             markdown,
         )
-        self.assertIn("$11.7500", markdown)
+        self.assertNotIn("$11.7500", markdown)
+        self.assertNotIn("Total company fixed charge", markdown)
 
     def test_missing_request_pricing_is_unavailable_not_zero(self):
         self.assertFalse(os.path.exists(self.mod.request_pricing_path()))
@@ -1520,12 +2287,10 @@ class TestRequestPricingAvailabilityAndValidation(BaseTestCase):
         self.assertIsNone(config["models"]["unpriced-model"]["rates"]["low"])
 
 
+@unittest.skip("tests must not inspect the invoking user's real HOME")
 class TestInstalledArtifactsOptional(unittest.TestCase):
-    """Optional, best-effort smoke checks against a *live installation* on
-    this machine (~/.copilot/task-reports/model-pricing.json and
-    ~/.local/bin/copilot-s). These are separate from the hermetic repo
-    checks above: they never assume the toolkit has been installed, and
-    they skip cleanly (rather than fail) when it hasn't."""
+    """Live-install checks are intentionally skipped: this suite is
+    hermetic and must never inspect files under the invoking user's HOME."""
 
     def test_installed_pricing_json_if_present(self):
         installed_pricing = os.path.join(
@@ -1813,10 +2578,20 @@ class TestConcurrentIngestNoClobber(BaseTestCase):
         session_id = "sess-concurrent"
         ticket = "CONCUR-1"
         procs = []
+        child_env = dict(os.environ)
+        for var in (
+            "COPILOT_HOME",
+            "COPILOT_TASK_REPORTS_DIR",
+            "COPILOT_TASK_REPORT_HELPER",
+            "COPILOT_OTEL_DIR",
+        ):
+            child_env.pop(var, None)
+        child_env["HOME"] = home
+        child_env["COPILOT_TASK_REPORT_PRICING_FETCH"] = "0"
         for i in range(2):
             code = self._worker_code(home, session_id, ticket, i)
             procs.append(subprocess.Popen([sys.executable, "-c", code],
-                                          env={**os.environ, "HOME": home}))
+                                          env=child_env))
         for p in procs:
             p.wait(timeout=30)
             self.assertEqual(p.returncode, 0)
@@ -1917,6 +2692,7 @@ sys.exit(2)
     def _run(self, snippet, stdin_text=None, cwd=None, env=None):
         full_env = os.environ.copy()
         full_env["HOME"] = self.home
+        full_env["COPILOT_TASK_REPORT_PRICING_FETCH"] = "0"
         # These tests exercise task-reporting *behavior* against a fake
         # helper, not helper-path *resolution* (covered separately in
         # tests/test_copilot_s.py) — so always point copilot-s at the fake

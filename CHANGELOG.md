@@ -6,6 +6,76 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — approval before substantive routed work
+
+- The orchestrator now requires explicit routing approval before substantive
+  work on standard, complex, or high-risk tasks, and before broad discovery
+  or design planning at any tier. It presents the proposed stages and
+  configured agent/model/effort/context, every skipped group with reasons,
+  and choices for recommended delegation, main-session handling, or custom
+  routing. Only minimal classification reads are allowed first; cancellation
+  or decline stops the work.
+- Clarified that routing approval is distinct from plan/action approval,
+  significant route changes require renewed approval, and unavailable
+  approval interaction pauses rather than silently proceeding. Small/casual
+  implementation keeps its automatic coder route, and simple questions stay
+  direct. This is an instruction/config convention, not deterministic CLI
+  enforcement.
+
+### Changed — official GitHub per-token pricing, refreshed automatically
+
+- The report's estimated USD cost now uses GitHub's **official** per-token
+  rates from [Models and pricing for GitHub Copilot](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
+  (input, cached input, cache write, output; Default and Long-context
+  tiers). `copilot-task-report.py` fetches the docs article-body API (stdlib
+  `urllib`, 1 MB cap, 10s timeout per socket operation and a 20s total
+  deadline checked between body reads — best-effort limits, not a hard
+  deadline: a slowly streaming server, slow DNS resolution or a
+  pricing-lock wait can exceed the nominal timeout; only when Python cannot
+  verify the TLS certificate it retries once via the system `curl`, with
+  certificate verification still on, HTTPS only, no redirects, and the same
+  limits, and notes this on stderr), parses every
+  provider table strictly, and caches a validated snapshot (fetch time,
+  source URL, content SHA-256) in
+  `~/.copilot/task-reports/official-pricing-cache.json` for 24h. Refresh
+  runs at most once per `ingest`/`report` command, under its own lock,
+  before the ingest lock; render/import/`ensure-marker` never fetch. A
+  failed fetch or unparseable page keeps the last valid cache (labeled
+  **stale** in the report), warns on stderr, and suppresses retries for 1h
+  (retried at most hourly while failing, not once per 24h). A snapshot more
+  than 7 days past its fetch time (download time, not a rate effective
+  date) is kept for reference only: newly ingested calls are recorded as
+  unpriced with a fixed reason. A corrupted cache is rejected whole (every
+  field used later is validated, incl. notes, names, lookup and
+  `snapshot_id`/hash consistency) and re-fetched; a corrupted refresh-state
+  file is reset with a warning without affecting the cache or task costs.
+  `COPILOT_TASK_REPORT_PRICING_FETCH=0` disables the network;
+  `PRICING_FETCHER` is an injectable transport for fixtures. No rate is
+  hardcoded.
+- Each call is priced **at ingestion**, with the tier chosen from that
+  call's own input tokens, and recorded additively in the task JSON
+  (`official_cost`: per-model buckets keyed by snapshot id plus unpriced
+  counts by reason, snapshot metadata stored once) — a later refresh never
+  reprices past estimates. Cache-read and cache-write tokens are treated as
+  subsets of input (verified on real Copilot CLI OTEL spans), reasoning
+  tokens are priced once as part of output. Unlisted models, missing
+  input/output counts, inconsistent usage, tier-ambiguous calls,
+  cache-write tokens without a listed rate, reasoning > output, and every
+  Gemini/Google-provider call with reasoning tokens (its output may exclude
+  reasoning) are reported as unpriced with a reason (partial lower bound,
+  never $0; token counts kept).
+  Calls recorded before this existed are shown as **legacy** (token counts
+  kept, never backfilled or repriced).
+- Removed the "Company Fixed Per-Request Charge" section from the default
+  report: its rates were partly benchmark-derived (Artificial Analysis) and
+  misleading next to official pricing. `request-pricing.json`, the
+  fixed-charge helpers and the recorded `by_model_effort` data are kept,
+  dormant. The old approximate `model-pricing.json` table is likewise
+  inactive; installed copies are never modified, migrated or deleted, and
+  the installer still copies both only if absent.
+- The By Model table gains a cache-write column; the summary's cache-write
+  row is now a subset of input tokens rather than "informational".
+
 ### Changed — mandatory small implementation delegation
 
 - Added structured `task_routing.small_casual_implementation` defaults for

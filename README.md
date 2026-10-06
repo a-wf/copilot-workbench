@@ -65,8 +65,11 @@ guarantee that every prompt follows an identical sequence.
 
 For work that requires strict process enforcement, explicitly invoke the
 desired agent (for example, `/agent reviewer`) and verify delegated work with
-`/tasks`. For routine work, the cost-aware automatic routing is intentionally
-allowed to skip stages.
+`/tasks`. For standard, complex, and high-risk work—and any task requiring
+broad discovery or design planning at any tier—the orchestrator requests
+approval of the proposed routing before substantive work. Routine small
+implementation remains on its automatic coder route; simple questions stay
+direct.
 
 ## Features
 
@@ -83,15 +86,15 @@ allowed to skip stages.
   straight to the right implementer while complex/high-risk work gets
   discovery, planning, review, and testing — with every stage optional and
   bounded to avoid duplicated, token-burning work.
-- **User-editable pricing table** — add or correct model USD rates in one
-  JSON file; unpriced models are reported as "no pricing data", never
-  silently as $0.
-- **Company fixed per-request charge** — a separate, company-configured
-  policy (`request-pricing.json`) charging a fixed USD amount per model
-  request by model + reasoning-effort level, using company-configured fixed
-  rates whose source is listed per model in the config. Reported in its own
-  section with a model+effort breakdown, partial-total and missing-rate
-  warnings — **not** official GitHub pricing and never a verified bill.
+- **Official GitHub per-token pricing, refreshed automatically** — the
+  estimated USD cost uses GitHub's published
+  [Copilot models and pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
+  rates (input / cached input / cache write / output, Default and
+  Long-context tiers), fetched from docs.github.com, strictly validated and
+  cached for 24h. Each call is priced at ingestion and recorded with the
+  snapshot that priced it, so later rate changes never reprice the past.
+  Unlisted models or unpriceable usage are reported as partial coverage,
+  never silently as $0.
 - **Symlink-based install** — the repo is the source of truth; `git pull`
   (or `scripts/update.sh`) updates your live tools immediately, no
   re-install step required.
@@ -131,23 +134,18 @@ including the multi-agent pipeline diagram and ingest/idempotency design.
 | Completion (output) tokens | 24,517 |
 | Total tokens | 210,721 |
 | Model-call time | 18m 32s |
-| Estimated USD cost (independent pricing table, approximate) | $1.84 |
+| Estimated USD cost (official GitHub per-token rates recorded at ingestion — estimate, NOT a bill) | $0.41 — **PARTIAL (lower bound)**: 40 of 42 calls priced; excludes 2 unpriced |
+| Official rate source | GitHub Copilot models and pricing — cache fresh (3.2h old, snapshot `sha256:…` fetched 2026-09-20T10:51:02Z) |
 
-## Company Fixed Per-Request Charge (company-configured policy — NOT official GitHub pricing)
+## Estimated Cost Coverage (official GitHub Copilot per-token rates)
 
-| Metric | Value |
-|---|---|
-| Model requests recorded (OTEL usage-bearing model spans) | 42 |
-| ...priced with a configured rate | 38 |
-| ...not priced (unknown effort / no configured rate / explicitly unpriced) | 4 |
-| ...unattributed (recorded before joint model+effort tracking) | 0 |
-| Total company fixed charge | $9.12 — **PARTIAL (lower bound)**: excludes 4 not-priced and 0 unattributed requests |
+| Model | Calls | Priced calls | Est. USD (official rates) | Unpriced calls | Legacy calls | Official model / tiers used |
+|---|---|---|---|---|---|---|
+| claude-sonnet-5 | 30 | 30 | $0.36 | 0 | 0 | claude-sonnet-5 (Default×30) |
+| gpt-5.4-mini | 10 | 10 | $0.05 | 0 | 0 | gpt-5.4-mini (Default×10) |
+| some-unlisted-model | 2 | 0 | not priced | 2 | 0 | — |
 
-## By Model
-| Model | Calls | Total Tokens | Est. USD |
-|---|---|---|---|
-| claude-sonnet-5 | 30 | 175,004 | $1.42 |
-| gpt-5.4-mini | 12 | 35,717 | $0.42 |
+- 2 call(s) not priced: model not listed in the official GitHub pricing snapshot used at ingestion
 ```
 
 (Illustrative — no real task IDs, tokens, or costs; generated from
@@ -178,15 +176,16 @@ This installs:
 | `copilot-s`, `copilot-task-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
 | 7 agent definitions | `~/.copilot/agents/` | symlink (or copy with `--copy`) |
 | Orchestrator instructions | `~/.copilot/copilot-instructions.md` | symlink (or copy with `--copy`) |
-| Pricing table | `~/.copilot/task-reports/model-pricing.json` | **copied once, only if absent** — your edits are never overwritten |
-| Company request-pricing policy | `~/.copilot/task-reports/request-pricing.json` | **copied once, only if absent** — your edits are never overwritten |
+| Legacy pricing table (inactive) | `~/.copilot/task-reports/model-pricing.json` | **copied once, only if absent** — your edits are never overwritten; no longer used by the report |
+| Legacy company request-pricing policy (inactive) | `~/.copilot/task-reports/request-pricing.json` | **copied once, only if absent** — your edits are never overwritten; no longer used by the report |
+| Official pricing cache | `~/.copilot/task-reports/official-pricing-cache.json` | **created automatically at runtime** (not by the installer) from docs.github.com; refreshed when older than 24h |
 
 Make sure `~/.local/bin` is on your `PATH`. Any pre-existing file at an
 install destination is backed up (never deleted) before being replaced —
 see `scripts/install.sh --help`.
 
 > **Symlink mode and your checkout are linked.** By default every installed
-> file (except the pricing table) is a symlink pointing back into *this*
+> file (except the copied pricing configs) is a symlink pointing back into *this*
 > repo checkout. That's what makes `git pull` / `scripts/update.sh`
 > instantly update the live tools — but it also means **moving or deleting
 > this checkout breaks the installed commands** (`copilot-s` will fail with
@@ -239,26 +238,68 @@ prompted to keep, rename, or delete it.
 
 - `COPILOT_TASK_REPORTS_DIR` — override where Markdown reports are written
   (default: `~/Desktop/CopilotTaskReports`).
-- `~/.copilot/task-reports/model-pricing.json` — edit freely to add new
-  models, correct rates, or map an alternate model id to an existing priced
-  entry via the `aliases` map. This file is never overwritten by
-  `scripts/install.sh` once it exists.
-- `~/.copilot/task-reports/request-pricing.json` — the company fixed
-  per-request charge policy: `models.<model>.rates.<effort-level>` is a
-  finite, nonnegative USD amount per model request, or `null` for
-  explicitly unpriced. The shipped defaults (from `config/request-pricing.json`)
-  are company-configured fixed per-request rates, each with its own source:
-  `gpt-6-luna` xhigh $0.04 and `gpt-6.1-sol` medium $0.21 / xhigh $0.39
-  (company price list, 2026-09-30 screenshot; per-request billing
-  user-confirmed 2026-10-05), `claude-opus-5.5` high $1.82
-  ([AA, high/Default Fallback](https://artificialanalysis.ai/models/claude-opus-5-5-high)),
-  and `gemini-3.8-flash` low **unpriced** (AA publishes no cost/task figure —
-  none is invented). The file is resolved under the same support directory
-  as the other report state (`~/.copilot/task-reports/`, i.e. under your
-  `$HOME`), copied only if absent, and never overwritten. A missing file is
-  reported as *unavailable* (never $0); an invalid one (bad JSON, booleans,
-  strings, negative or non-finite rates, wrong shape) is rejected as a
-  whole with an explicit error.
+- **Official pricing (automatic, no setup).** The estimated USD cost uses
+  GitHub's official per-token rates, read from the docs article-body API
+  (`https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-billing/models-and-pricing`,
+  public page:
+  [Models and pricing for GitHub Copilot](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing))
+  and cached in `~/.copilot/task-reports/official-pricing-cache.json` with
+  its fetch time, source URL and content SHA-256. The cache is refreshed at
+  most once per `ingest`/`report` command and only when older than 24h
+  (stdlib only, 1 MB size cap). The time limits are best effort, not a hard
+  deadline: each socket operation (connect, each receive) has a 10s timeout
+  and the 20s total deadline is only checked between body reads, so a
+  server that streams headers or body slowly, slow DNS resolution, or a wait
+  for the pricing lock can make an attempt exceed the nominal timeout.
+  If (and only if) Python itself cannot verify the docs.github.com TLS
+  certificate (e.g. a python.org build on macOS whose CA bundle was never
+  installed), the fetch is retried once with the system `curl` — HTTPS
+  only, certificate verification still on (never `--insecure`), no
+  redirects, `~/.curlrc` ignored, same 1 MB cap and 20s limit — and a note
+  is printed on stderr. Without `curl`, the warning tells you to repair
+  Python's certificates (`Install Certificates.command` or `SSL_CERT_FILE`).
+  A failed fetch or a page whose tables don't parse cleanly never replaces
+  the last valid cache: it is kept (the report labels it **stale**), a
+  warning is printed, and retries are suppressed for 1h — so while the
+  source keeps failing, a refresh is retried at most hourly (not once per
+  24h). A stale snapshot keeps pricing new calls only until it is **7 days**
+  past its fetch time; after that it is kept for reference only and newly
+  ingested calls are recorded as unpriced with an explicit reason. The
+  cache's `fetched_at` is when this tool downloaded the page, not a date
+  from which GitHub's rates were effective. With no valid snapshot at all,
+  newly ingested calls are recorded as unpriced (not $0). A corrupted cache
+  is rejected as a whole and re-fetched; a corrupted
+  `official-pricing-refresh-state.json` (retry metadata only) is reset with
+  a warning without touching the cache or recorded task costs.
+- `COPILOT_TASK_REPORT_PRICING_FETCH=0` (or `off`/`false`/`no`) — disable
+  all network fetching (offline use, hermetic test fixtures); an existing
+  cache is still used.
+- **Pricing rules.** Each call is priced individually at ingestion: the
+  tier (Default / Long context) comes from that call's own input tokens
+  (thresholds like `≤ 272K` are read as 272,000; a call landing between the
+  K=1,000 and K=1,024 readings is left unpriced as tier-ambiguous);
+  cache-read and cache-write tokens are subsets of input tokens priced at
+  their own rates (a cache write listed "Not applicable" is ordinary input);
+  reasoning tokens are part of output and priced once. Model ids must match
+  an official model name (lowercased, spaces → `-`, e.g. `GPT-6.1 Sol` →
+  `gpt-6.1-sol`), optionally with dashes for version dots
+  (`claude-opus-4-8`); nothing else is aliased or guessed. Missing
+  input/output counts, inconsistent usage, cache-write tokens on a model
+  whose table lists no cache-write rate, or reasoning > output make that
+  call unpriced (listed with its reason). Every Gemini/Google-provider call
+  that reports reasoning tokens is also unpriced, conservatively, because
+  its reported output may exclude reasoning (token counts are kept).
+- **Recorded, never repriced.** Costs are stored in the task JSON under the
+  snapshot id that priced them; a later refresh only affects calls ingested
+  afterwards. Delayed ingestion uses the rates published at ingestion time.
+  Calls recorded before this feature existed for a task are shown as
+  **legacy** (token counts kept, no price provenance, never backfilled).
+- `~/.copilot/task-reports/model-pricing.json` and
+  `~/.copilot/task-reports/request-pricing.json` — **legacy, inactive.**
+  The old approximate per-token table and the company fixed per-request
+  charge (whose rates were partly benchmark-derived) are no longer used by
+  the report. Existing copies are left exactly as you edited them (nothing
+  is migrated or deleted); the installer still copies them only if absent.
 
 ### Limitations
 
@@ -283,20 +324,23 @@ prompted to keep, rename, or delete it.
   data) is a known, deliberately-unimplemented gap — see
   [`docs/architecture.md`](docs/architecture.md) — rather than something
   this toolkit currently risks doing automatically.
-- The estimated USD cost is an independent approximation from a
-  locally-maintained pricing table — not an official Copilot invoice, and
-  it will drift from actual billing.
-- The company fixed per-request charge is a separate company-configured
-  policy, not official GitHub pricing and never a verified bill. It counts
-  OTEL usage-bearing model spans (including retried/failed calls that
-  reported usage); spans without usage data are not counted, so it cannot
-  claim every request was captured. Requests whose effort is unknown (no
-  fallback level), or whose model/effort has no configured or a `null`
-  rate, are excluded and flagged, making the total a labeled partial
-  lower bound. Effort source stays distinct: charges based on
-  `configured:` or `inferred:` effort are labeled estimates. Reports
-  persisted before joint model+effort tracking existed show those earlier
-  requests as unattributed — never backfilled or guessed.
+- The estimated USD cost applies official list prices to the usage this
+  toolkit observed; it is not an invoice. It does not deduct the GitHub AI
+  Credits allowances included in your plan, it counts only OTEL
+  usage-bearing model spans, and unpriceable calls make it a labeled
+  partial lower bound. Rates are those published when the call was
+  ingested (not necessarily when it ran), and promotional rates noted on
+  the official page (e.g. Gemini Flash until 2026-12-31) are shown as
+  notes. Copilot code review and code completions are not covered.
+- Some providers' telemetry may report output tokens excluding reasoning
+  tokens (observed for some Gemini calls, where reasoning > output). Since
+  that can't be detected when reasoning ≤ output, every Gemini/Google-provider
+  call with reasoning tokens is left unpriced; for other providers only
+  reasoning > output is unpriced, so an undetectable gap there could still
+  underestimate.
+- The official page format is parsed strictly; if GitHub changes the table
+  layout in an unsupported way, refreshes fail (last valid cache kept and
+  labeled stale) until the parser is updated.
 - **Legacy Desktop-reports migration only looks in the hardcoded default
   pre-2.0 location** (`~/Desktop/CopilotJiraTaskReports`). If you had
   customized the old `COPILOT_JIRA_REPORTS_DIR` env var to point your
@@ -414,6 +458,18 @@ pulls in discovery, `senior-coder`, and `test-reviewer`. There is no
 whichever tier originally implemented the code, so there's no hand-off
 duplication.
 
+For standard, complex, and high-risk tasks, and for broad discovery or
+design planning at any tier, the orchestrator asks the user to approve
+routing before substantive work. The proposal names configured stages and
+their agent/model/effort/context, plus every skipped group and reason; the
+user can approve delegation, choose main-session handling, or give custom
+routing. Only minimal classification reads are allowed first. Declining or
+cancelling stops work, and routing approval does not itself approve a plan,
+implementation, tests, commits, or pushes. Significant route changes need
+renewed approval. The toolkit instructions describe this as an
+orchestrator convention; they do not claim the CLI enforces it
+deterministically.
+
 The orchestrator must communicate those decisions rather than skipping
 silently. Before substantive work it reports the task tier, which stage
 will run (or that the main session will handle it directly), and every
@@ -434,8 +490,10 @@ Verify the pipeline is loaded:
 | Setting | Where | Default |
 |---|---|---|
 | Task reports directory | `COPILOT_TASK_REPORTS_DIR` env var | `~/Desktop/CopilotTaskReports` |
-| Model pricing | `~/.copilot/task-reports/model-pricing.json` | copied from `config/model-pricing.json` on first install |
-| Company fixed per-request charge policy | `~/.copilot/task-reports/request-pricing.json` | copied from `config/request-pricing.json` on first install (only if absent) |
+| Official pricing cache | `~/.copilot/task-reports/official-pricing-cache.json` (+ `official-pricing-refresh-state.json`) | fetched automatically from docs.github.com; 24h TTL, retried at most hourly while failing; a snapshot more than 7 days past its fetch time is never used to price new calls |
+| Disable pricing network fetch | `COPILOT_TASK_REPORT_PRICING_FETCH=0` env var | fetching enabled |
+| Legacy model pricing (inactive) | `~/.copilot/task-reports/model-pricing.json` | copied from `config/model-pricing.json` on first install (only if absent); unused |
+| Legacy company fixed per-request policy (inactive) | `~/.copilot/task-reports/request-pricing.json` | copied from `config/request-pricing.json` on first install (only if absent); unused |
 | Executables install prefix | `scripts/install.sh --prefix DIR` | `~/.local/bin` |
 | Install method | `scripts/install.sh --copy` | symlink |
 
@@ -443,12 +501,15 @@ Verify the pipeline is loaded:
 
 - Everything runs locally; no telemetry is sent anywhere by this toolkit
   itself (the Copilot CLI's own telemetry is a separate concern — see
-  GitHub's documentation).
+  GitHub's documentation). The only network request it makes is an
+  anonymous HTTPS GET of the public GitHub pricing page (at most once per
+  24h; disable with `COPILOT_TASK_REPORT_PRICING_FETCH=0`) — no usage,
+  task, or account data is sent.
 - Task IDs, tokens, and cost data are stored only in your own
   `~/.copilot/task-reports/` directory and your reports directory —
   nothing is transmitted or shared by these scripts.
-- The pricing table contains only public, independent list-price
-  approximations — no account, billing, or credential data.
+- The pricing cache contains only GitHub's public list prices — no
+  account, billing, or credential data.
 - See [`SECURITY.md`](SECURITY.md) for how to report a vulnerability.
 
 ## Uninstall / update
@@ -462,7 +523,7 @@ scripts/update.sh                        # git pull --ff-only, then re-run the i
 ```
 
 Uninstalling never touches usage reports, task/session ingest state,
-your pricing config, or Copilot session state — only the symlinks/copies
+your pricing configs/cache, or Copilot session state — only the symlinks/copies
 this toolkit created.
 
 ## Roadmap

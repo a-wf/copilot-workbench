@@ -24,8 +24,8 @@ flowchart TB
         EVENTS["~/.copilot/session-state/<id>/events.jsonl"]
         HELPER["bin/copilot-task-report.py\n(ingest + report renderer)"]
         STATE["~/.copilot/task-reports/\nsession-state.json, tasks/*.json"]
-        PRICING["~/.copilot/task-reports/\nmodel-pricing.json (user-editable)"]
-        REQPRICING["~/.copilot/task-reports/\nrequest-pricing.json (company policy, editable)"]
+        GHDOCS["docs.github.com\nModels and pricing for GitHub Copilot\n(official per-token rates)"]
+        PRICECACHE["~/.copilot/task-reports/\nofficial-pricing-cache.json (24h TTL)"]
         REPORTS["Task usage reports (Markdown)\ndefault: ~/Desktop/CopilotTaskReports\noverride: $COPILOT_TASK_REPORTS_DIR"]
     end
 
@@ -35,8 +35,8 @@ flowchart TB
     CS -->|"on exit: ingest --session-id --task KEY"| HELPER
     OTEL --> HELPER
     EVENTS --> HELPER
-    PRICING --> HELPER
-    REQPRICING --> HELPER
+    GHDOCS -->|"HTTPS GET, at most once per command when cache > 24h old (at most hourly while failing)"| HELPER
+    HELPER <-->|"validated snapshot (last valid kept on failure)"| PRICECACHE
     HELPER --> STATE
     HELPER --> REPORTS
 ```
@@ -97,8 +97,8 @@ aggregate as Markdown.
 |---|---|---|
 | OTEL span files (`~/.copilot/otel/copilot-otel-*.jsonl`) | Per-call model, token counts (prompt/completion/reasoning/cache-read), call duration, and (when present) the per-call reasoning-effort level | This is the **primary** source — the real conversation model calls. `events.jsonl`'s own model-call events only cover small internal utility calls, not the primary chat turns. |
 | `events.jsonl` (per session, under `~/.copilot/session-state/<id>/`) | Configured reasoning-effort timeline (`session.start`/`resume`/`model_change`), cumulative Copilot-internal usage checkpoints (`session.usage_checkpoint`), and subagent start/complete pairs | **Secondary** source, ingested independently of OTEL — a missing/late-arriving file on either side never blocks the other. |
-| `config/model-pricing.json` (installed to `~/.copilot/task-reports/model-pricing.json`, user-editable) | USD/1M-token rates per model, plus an alias map | Turns raw token counts into an approximate, independent USD estimate. Models with no pricing entry (after alias resolution) are reported as "no pricing data", never silently priced at $0. |
-| `config/request-pricing.json` (installed to `~/.copilot/task-reports/request-pricing.json` only if absent, editable) | Company-configured fixed USD per **model request**, keyed by model + reasoning-effort level (company-configured fixed rates; each model entry lists its own source), plus an alias map | Produces the separate "Company Fixed Per-Request Charge" section from the joint `by_model_effort` aggregation. Not official GitHub pricing, never a verified bill, never added to the token estimate. Missing config → *unavailable* (not $0); invalid config (non-numeric, boolean, negative, non-finite, wrong shape) → rejected whole with an explicit error. Unknown effort and unconfigured/`null` rates are unpriced and flagged (partial lower bound). "Requests" = OTEL usage-bearing model spans, incl. retried/failed calls that reported usage — not a guarantee every request was captured. |
+| Official GitHub pricing ([article body API](https://docs.github.com/api/article/body?pathname=/en/copilot/reference/copilot-billing/models-and-pricing), cached as `~/.copilot/task-reports/official-pricing-cache.json`) | Official USD per 1M tokens per model: input, cached input, cache write (rate / "Not applicable" / column absent), output, and Default vs Long-context tiers with their input-token threshold | Turns each call's tokens into an estimated USD cost at ingestion. Strictly parsed (any unsupported table schema, price cell, tier or threshold rejects the whole refresh); snapshot stores fetch time, source URL and content SHA-256 (no effective date is published). |
+| `config/model-pricing.json`, `config/request-pricing.json` (installed only if absent) | Legacy approximate per-token table and company fixed per-request policy | **Inactive** — no longer read by the default report. User copies are preserved untouched; the fixed-charge helpers remain in the code, dormant. |
 
 ### Ingest semantics (why it's safe to run repeatedly)
 
@@ -122,11 +122,58 @@ aggregate as Markdown.
   never calls that already happened before it.
 - **Joint model × effort aggregation** — alongside the separate `by_model`
   and `by_effort` tables, each task stores `by_model_effort`
-  (`{model: {effort_key: aggregate}}`) so per-(model, effort) fixed request
-  charges can be computed exactly. Task files persisted before this field
+  (`{model: {effort_key: aggregate}}`), originally for the (now dormant,
+  no longer rendered) per-(model, effort) fixed request charge; it is still
+  recorded so existing data stays consistent. Task files persisted before this field
   existed get it started empty (with a `by_model_effort_since` timestamp);
   their earlier requests are reported as explicitly *unattributed*, never
   backfilled by guessing a split from the two marginal tables.
+- **Official pricing refresh** — `ingest` and `report` call
+  `refresh_official_pricing_if_due()` once (memoized per process) *before*
+  taking the ingest lock, under its own `.official-pricing.lock`. It fetches
+  only if the cache is missing/invalid/older than 24h, with a 1 MB cap and
+  a 10s timeout per socket operation; the 20s total deadline is checked only
+  between body reads. These limits are best effort, not a hard deadline: the
+  socket timeout applies per operation (each receive), so a server streaming
+  headers or body slowly, slow DNS resolution, or a pricing-lock wait can
+  push an attempt past the nominal timeout, with no fixed upper bound. Only a
+  Python `ssl.SSLCertVerificationError` (raw or as `URLError.reason`) makes
+  the default fetcher retry once via the system `curl` (`-q` first so
+  `~/.curlrc` is ignored, `--fail`, `--proto =https`, no `-L`, verification
+  on, `--max-time 20`, `--max-filesize` plus a bounded chunked stdout read,
+  fixed argv without a shell, fixed URL only; HTTP 200 and the unchanged
+  effective URL are required via a `--write-out` trailer) and notes it on
+  stderr; all other errors take the normal failure path. Injectable
+  `PRICING_FETCHER`; `COPILOT_TASK_REPORT_PRICING_FETCH=0` disables the
+  network. A failure (network/`OSError`, protocol, parse or validation
+  error — handled by explicit exception types, not a blanket catch) writes
+  `official-pricing-refresh-state.json`, warns on stderr, keeps the last
+  valid cache, and suppresses retries for 1h, so a failing source is
+  retried at most hourly. A cached snapshot is used for pricing only while
+  it is at most 7 days past its fetch time (`fetched_epoch`/`fetched_at`:
+  download time, not a rate effective date); older (or future-dated) it is
+  kept for reference and new calls are recorded unpriced with a fixed
+  reason. Cache validation covers every field used later (ids, URLs, unit,
+  `snapshot_id` == `sha256:` + first 16 hex of `content_sha256`,
+  `fetched_at` consistent with `fetched_epoch`, string display names /
+  providers, `notes` as a list of strings, `lookup` equal to the one
+  derived from the models); an invalid cache is rejected whole and
+  re-fetched. A corrupted refresh-state file (bad UTF-8/JSON, non-numeric
+  or negative/non-finite epochs/counters) is reset with a warning and shown
+  in the report. Rendering, imports,
+  `ensure-marker` and `normalize-task-id` never fetch.
+- **Per-call official cost, recorded once** — `build_delta` prices each
+  OTEL call with the snapshot in effect for that command (tier from the
+  call's own input tokens; cache-read/cache-write as verified subsets of
+  input; reasoning inside output, priced once; every Gemini/Google-provider
+  call with reasoning tokens is conservatively unpriced because its output
+  may exclude reasoning) and `merge_delta_into_task`
+  adds the result to `task["official_cost"]`: per model, additive buckets
+  keyed by snapshot id (calls, USD and its input/cached/cache-write/output
+  components, tier counts) plus unpriced-call counts keyed by reason, and
+  each snapshot's metadata once. Refreshes never reprice recorded buckets.
+  Calls that predate `official_cost` on a task are rendered as *legacy*
+  (`call_count` minus recorded priced/unpriced calls) — never backfilled.
 - **Atomic, lock-protected writes** — the whole ingest cycle is wrapped in
   a best-effort cross-process file lock (`fcntl.flock`, falling back to
   unlocked operation if unavailable), and every file write goes through a
@@ -168,8 +215,19 @@ never touches these files — they live independently of session storage.
 `instructions/copilot-instructions.md` is the orchestrator: loaded
 automatically in every Copilot CLI session, it defines task tiers
 (trivial/small/standard/complex/high-risk) and a stage-selection matrix
-that picks which of the 7 roles run for a given task — every stage is
-optional, and skips are briefly disclosed to the user. There is no
+that picks which of the 7 roles run for a given task. Every stage is
+optional, and skips are briefly disclosed to the user. Before substantive
+work on standard/complex/high-risk tasks, or any broad discovery/design
+planning at any tier, the instructions require explicit approval of the
+proposed route: the stages and configured routing values, all skipped
+groups and reasons, and choices to approve delegation, choose main-session
+handling, or specify a custom route. Only minimal classification reads are
+allowed beforehand. Cancellation or decline stops work. Routing approval
+does not authorize implementation, plan-mode execution, tests, or commits;
+significant route changes require renewed approval. This is an
+orchestrator instruction, not deterministic CLI enforcement. Small/casual
+implementation retains its automatic coder route, and simple questions
+remain direct. There is no
 `fixer` role: `coder`/`senior-coder` apply their own targeted fixes,
 always at the same tier that did the original implementation, so a
 review or test failure never restarts work from scratch at a different

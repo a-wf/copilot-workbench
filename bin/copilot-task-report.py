@@ -84,32 +84,28 @@ for the user-facing summary):
   output/completion tokens, not an addition to them — the USD estimate uses
   output_tokens as-is (already inclusive of reasoning tokens) and never
   adds reasoning tokens a second time.
-- Cache tokens: `gen_ai.usage.cache_read.input_tokens` is a subset of
-  input_tokens billed (if the pricing table provides a
-  `cache_read_per_million` rate) at that cheaper rate; the remaining
-  "fresh" input tokens are billed at the normal input rate. If no
-  cache-read rate is configured for a model, cache-read tokens fall back to
-  the normal input rate (clearly noted, not silently ignored).
+- Cache tokens: `gen_ai.usage.cache_read.input_tokens` and
+  `gen_ai.usage.cache_write.input_tokens` are SUBSETS of input_tokens
+  (verified on real Copilot CLI spans; zero values are omitted by the CLI,
+  so an absent cache attribute means 0). Each subset is priced at its own
+  official rate and the remaining "fresh" input at the input rate.
 - Copilot-internal cost is reported as raw "nano AIU" (from
   session.usage_checkpoint's cumulative `totalNanoAiu`), explicitly labeled
   as NOT USD.
-- Estimated USD cost comes from a separate, user-maintainable pricing table
-  (model-pricing.json), including a documented `aliases` map (e.g. a
-  dated/variant model id -> a priced canonical model id, or explicitly to
-  `null` to mean "intentionally unpriced"). Any model still missing pricing
-  after alias resolution is reported as "no pricing data" rather than
-  silently priced at $0.
-- A SEPARATE company fixed per-request charge (request-pricing.json) is
-  computed from a joint model x effort-key aggregation (`by_model_effort`):
-  a company-configured USD amount per model request keyed by (model,
-  effort level), with the source of each rate listed per model in the
-  config — NOT official GitHub pricing, never a verified bill, and never
-  mixed into the token-based estimate. A missing/invalid config is
-  reported as unavailable (never $0); unknown effort, unconfigured or
-  null rates are excluded and flagged (partial lower bound); requests
-  recorded before joint tracking existed are reported as unattributed,
-  never backfilled. "Requests" means OTEL usage-bearing model spans,
-  including retried/failed calls that reported usage.
+- Estimated USD cost comes from GitHub's OFFICIAL per-token rates
+  (docs.github.com "Models and pricing for GitHub Copilot"), fetched
+  automatically, strictly validated, and cached for 24h under the support
+  directory (see the "Official GitHub Copilot per-token pricing" section
+  below). Each call is priced at ingestion (tier from that call's own input
+  tokens) and the result is recorded in the task JSON with the snapshot id
+  that priced it — never repriced later. Unknown models/tiers/usage shapes
+  are reported as unpriced (partial coverage), never $0; calls recorded
+  before this existed are "legacy" (token counts only, no backfill). The
+  old approximate model-pricing.json table is inactive (kept untouched).
+- The former company fixed per-request charge (request-pricing.json) is no
+  longer rendered in the default report. Its helpers and the joint
+  `by_model_effort` aggregation are kept (dormant/compatible) and the
+  config file is preserved.
 - Whole read-modify-write ingest cycles are wrapped in a cross-process file
   lock (best-effort via fcntl.flock) so concurrent copilot-s invocations
   never race on the same state/task files. To stay crash-safe, the
@@ -150,6 +146,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 
 try:
@@ -1582,6 +1579,17 @@ def process_otel_span(attrs, start_ts, end_ts, sess_state):
         "total_tokens": total_tokens,
         "duration_ms": duration_ms,
         "effort_key": effort_key,
+        # Which usage attributes were actually present on the span (vs.
+        # defaulted to 0 above). Per-call official pricing uses this so a
+        # MISSING input/output count is never silently priced as 0 tokens.
+        # Not aggregated (add_agg ignores it).
+        "usage_present": {
+            "input": "gen_ai.usage.input_tokens" in attrs,
+            "output": "gen_ai.usage.output_tokens" in attrs,
+            "reasoning": "gen_ai.usage.reasoning.output_tokens" in attrs,
+            "cache_read": "gen_ai.usage.cache_read.input_tokens" in attrs,
+            "cache_write": "gen_ai.usage.cache_write.input_tokens" in attrs,
+        },
     }
     return mc
 
@@ -1665,9 +1673,14 @@ def scan_otel_files(session_id, sess_state, install_epoch):
 # Delta building / merging into the per-task aggregate
 # --------------------------------------------------------------------------
 
-def build_delta(session_id, sess_state, events_path):
+def build_delta(session_id, sess_state, events_path, pricing_ctx=None):
+    """`pricing_ctx` is a load_official_pricing_context() result (the
+    official snapshot in effect for THIS command). If omitted, the cached
+    snapshot is loaded WITHOUT any network refresh."""
     marker = get_install_marker()
     install_epoch = marker["installed_epoch"]
+    if pricing_ctx is None:
+        pricing_ctx = load_official_pricing_context()
 
     delta = {
         "by_model": {},
@@ -1723,6 +1736,10 @@ def build_delta(session_id, sess_state, events_path):
     # 2) OTEL: primary token/model/time source — independently ingestible,
     #    gated to install_epoch regardless of events.jsonl's state.
     calls, min_ts, max_ts = scan_otel_files(session_id, sess_state, install_epoch)
+    # Per-call official cost estimate, computed NOW (at ingestion) with the
+    # snapshot in effect for this command and recorded additively — a later
+    # price refresh can never reprice these calls.
+    delta["official_cost"] = build_official_cost_delta(calls, pricing_ctx)
     for mc in calls:
         model = mc["model"]
         effort_key = mc["effort_key"]
@@ -1820,12 +1837,1373 @@ def merge_delta_into_task(task, delta, session_id, task_id):
 
     totals["nano_aiu"] += delta["nano_aiu_delta"]
     totals["premium_requests"] += delta["premium_requests_delta"]
+
+    # Official per-token cost estimates recorded at ingestion. A task file
+    # persisted before this existed gets the block started now; its earlier
+    # calls stay explicitly "legacy" (token counts kept, never repriced or
+    # backfilled). `.get` tolerates a delta from an older code path.
+    merge_official_cost_delta(task, delta.get("official_cost"))
     return task
 
 
 # --------------------------------------------------------------------------
-# Pricing
+# Official GitHub Copilot per-token pricing (automatic, cached snapshot)
 # --------------------------------------------------------------------------
+#
+# The estimated USD cost uses GitHub's OFFICIAL published per-token rates
+# ("Models and pricing for GitHub Copilot"), fetched automatically from the
+# docs article-body API, validated, and cached under SUPPORT_DIR for 24h.
+#
+# - Refresh happens at most once per `ingest`/`report` command (never on
+#   import, render, ensure-marker or normalize-task-id), only when the cache
+#   is missing/invalid/older than the TTL, under a dedicated file lock, with
+#   a bounded response size and best-effort time limits that are NOT a hard
+#   deadline: each blocking socket operation (connect, each receive) has a
+#   10s timeout and the 20s total deadline is only checked between body
+#   reads, so a server streaming headers or body slowly, slow DNS
+#   resolution (not covered by the socket timeout) or a wait for the
+#   pricing lock can make an attempt exceed the nominal timeout. After a failed
+#   attempt, further attempts are suppressed for
+#   OFFICIAL_PRICING_RETRY_BACKOFF_SECONDS (1h), so while the source keeps
+#   failing a refresh is retried at most hourly (not once per 24h) and every
+#   incremental ingest isn't slowed by a dead network.
+# - A failed fetch/parse NEVER replaces the last valid cache: it is kept and
+#   used (labeled stale in the report), and a warning goes to stderr — but
+#   only up to OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS (7 days) after it
+#   was FETCHED. A cached snapshot older than that (or dated in the future)
+#   is kept for reference only: calls ingested while it is the only snapshot
+#   are recorded as unpriced with the fixed reason UNPRICED_SNAPSHOT_TOO_OLD.
+#   `fetched_at` is when this tool downloaded the page, NOT a date from
+#   which GitHub's rates were effective (the page publishes none).
+# - A corrupted refresh-state file (invalid UTF-8/JSON, wrong types, negative
+#   or non-finite counters) is reset with a warning; it only holds retry
+#   metadata, so the last valid snapshot and recorded task costs are kept.
+# - The parser is strict: every pricing table must have a recognized
+#   schema, every row a valid $ amount for input/cached input/output, and
+#   tier thresholds must be "Not applicable" or a matching "≤ N K"/"> N K"
+#   Default/Long-context pair. Anything else rejects the WHOLE refresh (no
+#   partially parsed snapshot is ever cached). No rate is ever hardcoded or
+#   guessed; models absent from the official tables are unpriced.
+# - Costs are computed PER CALL at ingestion and recorded additively in the
+#   task JSON under the snapshot id that priced them, so a later refresh
+#   never reprices past estimates. Delayed ingestion uses the tariffs
+#   observed at ingestion time, which are not necessarily the rates in
+#   force when the call happened (labeled as such in the report).
+# - Usage semantics (verified against real Copilot CLI OTEL spans):
+#   `cache_read.input_tokens` and `cache_write.input_tokens` are SUBSETS of
+#   `input_tokens` (their sum never exceeded input across ~3,000 spans, for
+#   OpenAI, Anthropic, Google and Moonshot models alike); the CLI omits
+#   zero-valued cache attributes (it never emits 0), so an absent cache
+#   attribute means 0. Absent input/output counts are never treated as 0 —
+#   the call is unpriced. Reasoning tokens are a subset of output and are
+#   never priced a second time; a call whose reasoning count exceeds its
+#   output count (seen for some Gemini spans, where output may EXCLUDE
+#   reasoning) is unpriced rather than guessed. Because that exclusion
+#   cannot be detected when reasoning <= output, EVERY call to a Gemini /
+#   Google-provider model that reports reasoning_tokens > 0 is
+#   conservatively unpriced (UNPRICED_GEMINI_REASONING); its token counts
+#   are still recorded unchanged and nothing is estimated for it.
+
+OFFICIAL_PRICING_API_URL = (
+    "https://docs.github.com/api/article/body?pathname="
+    "/en/copilot/reference/copilot-billing/models-and-pricing"
+)
+OFFICIAL_PRICING_PUBLIC_URL = (
+    "https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing"
+)
+OFFICIAL_PRICING_ALLOWED_URL_PREFIX = "https://docs.github.com/"
+OFFICIAL_PRICING_CACHE_FILENAME = "official-pricing-cache.json"
+OFFICIAL_PRICING_STATE_FILENAME = "official-pricing-refresh-state.json"
+OFFICIAL_PRICING_LOCK_FILENAME = ".official-pricing.lock"
+OFFICIAL_PRICING_TTL_SECONDS = 24 * 3600
+# A cached snapshot fetched longer ago than this (by its `fetched_epoch`,
+# i.e. download time — not a rate effective date) is never used to price
+# newly ingested calls; it is kept on disk and shown for reference only.
+OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS = 7 * 24 * 3600
+OFFICIAL_PRICING_RETRY_BACKOFF_SECONDS = 3600
+OFFICIAL_PRICING_TIMEOUT_SECONDS = 10
+OFFICIAL_PRICING_TOTAL_DEADLINE_SECONDS = 20
+OFFICIAL_PRICING_MAX_BYTES = 1_000_000
+OFFICIAL_PRICING_SCHEMA_VERSION = 1
+OFFICIAL_PRICING_KIND = "github-copilot-official-model-pricing"
+# Set to "0"/"off"/"false"/"no" to disable all network fetching (the cached
+# snapshot, if any, is still used). Intended for offline use and hermetic
+# test fixtures.
+OFFICIAL_PRICING_FETCH_ENV = "COPILOT_TASK_REPORT_PRICING_FETCH"
+OFFICIAL_COST_SCHEMA_VERSION = 1
+# Injectable transport for tests/offline fixtures: a callable
+# (url, timeout_seconds, max_bytes) -> bytes. None = stdlib urllib fetch.
+PRICING_FETCHER = None
+
+# Per-process memo: cache path -> refresh result, so a command refreshes at
+# most once no matter how many times it asks.
+_OFFICIAL_REFRESH_RESULTS = {}
+
+TIER_DEFAULT = "default"
+TIER_LONG = "long_context"
+TIER_LABELS = {TIER_DEFAULT: "Default", TIER_LONG: "Long context"}
+
+CACHE_WRITE_RATE = "rate"
+CACHE_WRITE_NOT_APPLICABLE = "not_applicable"  # official "Not applicable": no separate cache-write cost
+CACHE_WRITE_NOT_LISTED = "not_listed"  # provider table has no cache-write column at all
+
+UNPRICED_NO_SNAPSHOT = "no valid official pricing snapshot was available at ingestion"
+# Fixed text (no ages/dates interpolated) so all such calls share ONE
+# recorded unpriced bucket per model.
+UNPRICED_SNAPSHOT_TOO_OLD = ("the only cached official pricing snapshot was fetched more than 7 days before "
+                             "ingestion (or is dated in the future); kept for reference only, not used for "
+                             "pricing (its fetch time is not a rate effective date)")
+UNPRICED_GEMINI_REASONING = ("Gemini/Google-provider call with reasoning tokens: reported output may exclude "
+                             "reasoning, so billable output is uncertain (conservatively unpriced; token "
+                             "counts kept)")
+UNPRICED_UNKNOWN_MODEL = "model not listed in the official GitHub pricing snapshot used at ingestion"
+UNPRICED_NO_INPUT = "input token count missing from telemetry (never assumed 0)"
+UNPRICED_NO_OUTPUT = "output token count missing from telemetry (never assumed 0)"
+UNPRICED_NEGATIVE = "negative token count in telemetry"
+UNPRICED_CACHE_EXCEEDS_INPUT = "cache-read + cache-write tokens exceed input tokens (unexpected usage shape)"
+UNPRICED_REASONING_EXCEEDS_OUTPUT = ("reasoning tokens exceed output tokens (output may exclude reasoning; "
+                                     "billable output unknown)")
+UNPRICED_TIER_AMBIGUOUS = ("input tokens fall between the tier threshold read as K=1,000 and K=1,024 "
+                           "(tier ambiguous)")
+UNPRICED_CACHE_WRITE_NOT_LISTED = ("cache-write tokens reported but the official table lists no cache-write "
+                                   "rate for this model")
+
+
+class OfficialPricingError(ValueError):
+    """Raised when the official pricing source or a cached snapshot is
+    missing, malformed, or uses an unsupported schema."""
+
+
+def official_pricing_cache_path():
+    return os.path.join(SUPPORT_DIR, OFFICIAL_PRICING_CACHE_FILENAME)
+
+
+def official_pricing_state_path():
+    return os.path.join(SUPPORT_DIR, OFFICIAL_PRICING_STATE_FILENAME)
+
+
+def official_pricing_fetch_enabled():
+    val = os.environ.get(OFFICIAL_PRICING_FETCH_ENV, "").strip().lower()
+    return val not in ("0", "off", "false", "no")
+
+
+def _iso_from_epoch(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@contextlib.contextmanager
+def official_pricing_lock():
+    """Dedicated cross-process lock for the cache refresh (kept separate from
+    the ingest lock so a slow network never holds up task-file writes)."""
+    os.makedirs(SUPPORT_DIR, exist_ok=True)
+    if fcntl is None:
+        yield
+        return
+    fd = os.open(os.path.join(SUPPORT_DIR, OFFICIAL_PRICING_LOCK_FILENAME), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
+def _default_pricing_fetch(url, timeout, max_bytes):
+    """Bounded stdlib HTTPS GET: per-socket-operation timeout, a total
+    deadline checked between reads (not a hard wall-clock limit; DNS
+    resolution is not covered by the socket timeout), size cap, and the
+    final URL must stay on docs.github.com over HTTPS. Transport/protocol
+    errors surface as OSError (incl. urllib.error.URLError, timeouts, TLS)
+    or OfficialPricingError (http.client protocol errors are wrapped).
+    A Python TLS certificate-verification failure (and only that) retries
+    once via the system curl with verification still ON — see
+    _curl_pricing_fetch; its failures surface as OfficialPricingError."""
+    import http.client  # lazy: never imported unless a refresh is due
+    import urllib.request
+
+    try:
+        return _default_pricing_fetch_inner(urllib.request, url, timeout, max_bytes)
+    except http.client.HTTPException as ex:
+        raise OfficialPricingError("HTTP protocol error: %s: %s" % (type(ex).__name__, ex))
+    except OSError as ex:
+        # ONLY a Python certificate-verification failure (typically a
+        # python.org build without its CA bundle installed) falls back to
+        # the system curl, which still verifies the certificate. Every other
+        # network/HTTP/timeout/parse error propagates unchanged.
+        if not _is_tls_cert_verification_error(ex):
+            raise
+        python_error = ("%s: %s" % (type(ex).__name__, ex))[:200]
+        body = _curl_pricing_fetch(url, timeout, max_bytes, python_error)
+        print("Note: Python could not verify the TLS certificate for docs.github.com (%s); fetched the "
+              "official pricing with the system curl instead (HTTPS only, certificate verification ON). "
+              "Repair Python's CA certificates to silence this note." % python_error, file=sys.stderr)
+        return body
+
+
+# System-curl fallback (used only after a Python TLS certificate-verification
+# failure; see _default_pricing_fetch). Fixed argv, never a shell.
+_CURL_STATUS_MARKER = "\n@@copilot-task-report-curl-status@@ "
+_CURL_CANDIDATE_PATHS = ("/usr/bin/curl",)
+
+
+def _is_tls_cert_verification_error(ex):
+    """True only for ssl.SSLCertVerificationError, raw or wrapped as the
+    `reason` of urllib.error.URLError (never for HTTPError or other errors)."""
+    try:
+        import ssl
+    except ImportError:
+        return False
+    cert_error = getattr(ssl, "SSLCertVerificationError", None)
+    if cert_error is None:
+        return False
+    if isinstance(ex, cert_error):
+        return True
+    import urllib.error
+    if isinstance(ex, urllib.error.HTTPError):
+        return False
+    return isinstance(ex, urllib.error.URLError) and isinstance(getattr(ex, "reason", None), cert_error)
+
+
+def _find_system_curl():
+    for path in _CURL_CANDIDATE_PATHS:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which("curl")
+
+
+def _curl_pricing_fetch(url, timeout, max_bytes, python_error):
+    """Bounded HTTPS GET of the FIXED official pricing URL via the system
+    curl, with certificate verification left ON (never -k/--insecure).
+    `-q` must stay first so no ~/.curlrc can inject options (e.g. -k). No
+    redirects are followed (no -L); only HTTP 200 from the same URL is
+    accepted. Output is read in chunks and capped at max_bytes; curl's
+    --max-time and a subprocess wait timeout bound the wall-clock time.
+    Raises OfficialPricingError (a ValueError) on any failure."""
+    import subprocess
+
+    if url != OFFICIAL_PRICING_API_URL:
+        raise OfficialPricingError("system curl fallback refused: only the fixed official pricing URL is allowed")
+    curl = _find_system_curl()
+    if not curl:
+        raise OfficialPricingError(
+            "Python could not verify the TLS certificate for docs.github.com (%s) and no system curl was "
+            "found for the verified fallback; repair Python's CA certificates (python.org builds on macOS: run "
+            "'Install Certificates.command'; otherwise point SSL_CERT_FILE at a valid CA bundle)" % python_error)
+    max_time = OFFICIAL_PRICING_TOTAL_DEADLINE_SECONDS
+    argv = [
+        curl, "-q",
+        "--fail", "--silent", "--show-error",
+        "--proto", "=https", "--proto-redir", "=https", "--tlsv1.2",
+        "--connect-timeout", str(int(timeout)),
+        "--max-time", str(int(max_time)),
+        "--max-filesize", str(int(max_bytes)),
+        "--header", "User-Agent: copilot-task-report (copilot-cli-toolkit official pricing refresh)",
+        "--header", "Accept: text/markdown, text/plain;q=0.9, */*;q=0.1",
+        "--write-out", _CURL_STATUS_MARKER + "%{http_code} %{url_effective}",
+        "--url", url,
+    ]
+    # Room for the status trailer (marker + 3-digit code + the fixed URL).
+    output_cap = max_bytes + len(_CURL_STATUS_MARKER) + len(url) + 16
+    chunks = []
+    size = 0
+    try:
+        with tempfile.TemporaryFile() as err_file:
+            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=err_file, shell=False, close_fds=True)
+            try:
+                while True:
+                    chunk = proc.stdout.read1(65536)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > output_cap:
+                        raise OfficialPricingError("system curl fallback: response too large (> %d bytes)"
+                                                   % max_bytes)
+                    chunks.append(chunk)
+                returncode = proc.wait(timeout=max_time + 5)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                proc.stdout.close()
+            err_file.seek(0)
+            err_text = err_file.read(2000).decode("utf-8", "replace").strip()
+    except subprocess.TimeoutExpired:
+        raise OfficialPricingError("system curl fallback exceeded %ds" % (max_time + 5))
+    except (OSError, subprocess.SubprocessError) as ex:
+        raise OfficialPricingError("system curl fallback could not run (%s: %s); Python TLS error was: %s"
+                                   % (type(ex).__name__, ex, python_error))
+    if returncode != 0:
+        raise OfficialPricingError("system curl fallback failed (exit %d: %s); Python TLS error was: %s"
+                                   % (returncode, err_text[:200] or "no message", python_error))
+    out = b"".join(chunks)
+    marker = _CURL_STATUS_MARKER.encode("ascii")
+    idx = out.rfind(marker)
+    if idx < 0:
+        raise OfficialPricingError("system curl fallback: missing HTTP status trailer")
+    body, trailer = out[:idx], out[idx + len(marker):].decode("ascii", "replace").strip()
+    status, _, final_url = trailer.partition(" ")
+    if status != "200":
+        raise OfficialPricingError("system curl fallback: unexpected HTTP status %s" % (status or "?"))
+    if final_url != url or not final_url.startswith(OFFICIAL_PRICING_ALLOWED_URL_PREFIX):
+        raise OfficialPricingError("system curl fallback: unexpected final URL")
+    if len(body) > max_bytes:
+        raise OfficialPricingError("system curl fallback: response too large (> %d bytes)" % max_bytes)
+    return body
+
+
+def _default_pricing_fetch_inner(urllib_request, url, timeout, max_bytes):
+    req = urllib_request.Request(url, headers={
+        "User-Agent": "copilot-task-report (copilot-cli-toolkit official pricing refresh)",
+        "Accept": "text/markdown, text/plain;q=0.9, */*;q=0.1",
+    })
+    deadline = time.monotonic() + OFFICIAL_PRICING_TOTAL_DEADLINE_SECONDS
+    with urllib_request.urlopen(req, timeout=timeout) as resp:
+        status = getattr(resp, "status", None) or resp.getcode()
+        if status != 200:
+            raise OfficialPricingError("unexpected HTTP status %s" % status)
+        final_url = resp.geturl() or url
+        if not final_url.startswith(OFFICIAL_PRICING_ALLOWED_URL_PREFIX):
+            raise OfficialPricingError("redirected away from %s" % OFFICIAL_PRICING_ALLOWED_URL_PREFIX)
+        clen = resp.headers.get("Content-Length")
+        if clen and clen.strip().isdigit() and int(clen) > max_bytes:
+            raise OfficialPricingError("response too large (%s bytes > %d)" % (clen.strip(), max_bytes))
+        chunks = []
+        size = 0
+        while True:
+            if time.monotonic() > deadline:
+                raise OfficialPricingError("download exceeded %ds total deadline" % OFFICIAL_PRICING_TOTAL_DEADLINE_SECONDS)
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                raise OfficialPricingError("response too large (> %d bytes)" % max_bytes)
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# ---- Parsing the official Markdown article body ----
+
+_PRICE_CELL_RE = re.compile(r"^\$(\d+(?:\.\d+)?)$")
+_THRESHOLD_CELL_RE = re.compile(r"^(≤|<=|>)\s*(\d+)\s*([Kk])$")
+_FOOTNOTE_REF_RE = re.compile(r"\[\^([A-Za-z0-9_-]+)\]")
+_FOOTNOTE_DEF_RE = re.compile(r"^\[\^([A-Za-z0-9_-]+)\]:\s*(\S.*)$")
+_TABLE_SEPARATOR_CELL_RE = re.compile(r"^:?-{3,}:?$")
+_MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9.\-]*[a-z0-9]$")
+_NOT_APPLICABLE = "not applicable"
+
+_OFFICIAL_COLUMNS = {
+    "model": "model",
+    "release status": None,
+    "category": None,
+    "tier": "tier",
+    "threshold (input tokens)": "threshold",
+    "input": "input",
+    "cached input": "cached_input",
+    "cache write": "cache_write",
+    "output": "output",
+}
+_REQUIRED_COLUMNS = ("model", "input", "cached_input", "output")
+
+
+def _split_table_row(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _clean_cell_text(text):
+    text = text.replace("\\", "")
+    text = re.sub(r"[*`]", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_official_model_name(display_name):
+    """Official display name -> model id (e.g. 'GPT-5.4 mini' -> 'gpt-5.4-mini',
+    'Claude Opus 4.8 (fast mode) (preview)' -> 'claude-opus-4.8-fast-mode-preview').
+    Purely mechanical (lowercase, spaces/parentheses -> '-'); never guesses."""
+    s = display_name.lower()
+    s = re.sub(r"[()]", " ", s)
+    s = re.sub(r"[\s_]+", "-", s.strip())
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    if not _MODEL_ID_RE.match(s):
+        raise OfficialPricingError("cannot derive a model id from official model name %r" % display_name)
+    return s
+
+
+def official_lookup_key(model_id):
+    """Loose key used ONLY to accept the dash-for-dot spelling of a version
+    number ('claude-opus-4-8' == 'claude-opus-4.8'). Validated per snapshot:
+    a key shared by two different official models is dropped (exact match
+    only for those)."""
+    return re.sub(r"(?<=\d)\.(?=\d)", "-", model_id.strip().lower())
+
+
+def _parse_price_cell(cell, where):
+    m = _PRICE_CELL_RE.match(cell)
+    if not m:
+        raise OfficialPricingError("%s: expected a $ amount, got %r" % (where, cell))
+    value = float(m.group(1))
+    if not math.isfinite(value) or value < 0:
+        raise OfficialPricingError("%s: invalid amount %r" % (where, cell))
+    return value
+
+
+def _parse_threshold_cell(cell, where):
+    if cell.lower() == _NOT_APPLICABLE:
+        return None
+    m = _THRESHOLD_CELL_RE.match(cell.replace("\u00a0", " "))
+    if not m:
+        raise OfficialPricingError("%s: unsupported tier threshold %r" % (where, cell))
+    comparator = "<=" if m.group(1) in ("≤", "<=") else ">"
+    k_value = int(m.group(2))
+    if k_value <= 0:
+        raise OfficialPricingError("%s: invalid tier threshold %r" % (where, cell))
+    return {"comparator": comparator, "k_value": k_value}
+
+
+def _parse_tier_cell(cell, where):
+    norm = cell.strip().lower()
+    if norm == "default":
+        return TIER_DEFAULT
+    if norm == "long context":
+        return TIER_LONG
+    raise OfficialPricingError("%s: unsupported tier %r" % (where, cell))
+
+
+def parse_official_pricing_markdown(text):
+    """Parse the official article body (Markdown) into
+    {'models': {id: entry}, 'lookup': {loose_key: id}, 'providers': [...]}.
+    Raises OfficialPricingError on ANY inconsistency — the caller must then
+    keep the previous cache rather than store a partial result."""
+    if not isinstance(text, str) or not text.strip():
+        raise OfficialPricingError("empty pricing document")
+    lines = text.splitlines()
+
+    footnotes = {}
+    for line in lines:
+        m = _FOOTNOTE_DEF_RE.match(line.strip())
+        if m:
+            if m.group(1) in footnotes:
+                raise OfficialPricingError("duplicate footnote definition [^%s]" % m.group(1))
+            footnotes[m.group(1)] = _clean_cell_text(m.group(2))
+
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "## pricing tables":
+            start = i + 1
+            break
+    if start is None:
+        raise OfficialPricingError("'## Pricing tables' section not found")
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].startswith("## "):
+            end = i
+            break
+    section = lines[start:end]
+
+    prose_before_tables = []
+    for line in section:
+        if line.lstrip().startswith("|") or line.startswith("### "):
+            break
+        prose_before_tables.append(line)
+    if "per 1 million tokens" not in " ".join(prose_before_tables).lower().replace("*", ""):
+        raise OfficialPricingError("pricing unit statement 'per 1 million tokens' not found")
+
+    models = {}
+    providers = []
+    provider = None
+    i = 0
+    n_tables = 0
+    while i < len(section):
+        line = section[i]
+        if line.startswith("### "):
+            provider = _clean_cell_text(line[4:])
+            if not provider:
+                raise OfficialPricingError("empty provider heading")
+            providers.append(provider)
+            i += 1
+            continue
+        if not line.lstrip().startswith("|"):
+            i += 1
+            continue
+        # A table: header, separator, rows (until the first non-'|' line).
+        if provider is None:
+            raise OfficialPricingError("pricing table found before any provider heading")
+        block = []
+        while i < len(section) and section[i].lstrip().startswith("|"):
+            block.append(section[i])
+            i += 1
+        n_tables += 1
+        where_t = "provider %r table" % provider
+        if len(block) < 2:
+            raise OfficialPricingError("%s: missing header/separator" % where_t)
+        header = [_clean_cell_text(c).lower() for c in _split_table_row(block[0])]
+        sep = _split_table_row(block[1])
+        if len(sep) != len(header) or not all(_TABLE_SEPARATOR_CELL_RE.match(c) for c in sep):
+            raise OfficialPricingError("%s: malformed header separator" % where_t)
+        col_index = {}
+        unknown_cols = []
+        for idx, name in enumerate(header):
+            if name in _OFFICIAL_COLUMNS:
+                key = _OFFICIAL_COLUMNS[name]
+                if key is None:
+                    continue
+                if key in col_index:
+                    raise OfficialPricingError("%s: duplicate column %r" % (where_t, name))
+                col_index[key] = idx
+            else:
+                unknown_cols.append(idx)
+        for req in _REQUIRED_COLUMNS:
+            if req not in col_index:
+                raise OfficialPricingError("%s: required column %r missing (header %r)" % (where_t, req, header))
+        if ("tier" in col_index) != ("threshold" in col_index):
+            raise OfficialPricingError("%s: 'Tier' and 'Threshold (input tokens)' must appear together" % where_t)
+
+        rows_by_model = {}
+        for raw_row in block[2:]:
+            cells = _split_table_row(raw_row)
+            if all(c == "" for c in cells):
+                continue  # visual spacer rows in the source
+            if len(cells) != len(header):
+                raise OfficialPricingError("%s: row has %d cells, header has %d: %r"
+                                           % (where_t, len(cells), len(header), raw_row.strip()))
+            raw_model = cells[col_index["model"]]
+            refs = _FOOTNOTE_REF_RE.findall(raw_model)
+            display = _clean_cell_text(_FOOTNOTE_REF_RE.sub("", raw_model))
+            if not display:
+                raise OfficialPricingError("%s: empty model name" % where_t)
+            model_id = normalize_official_model_name(display)
+            where = "%s, model %r" % (where_t, display)
+            for idx in unknown_cols:
+                if "$" in cells[idx]:
+                    raise OfficialPricingError("%s: unrecognized price column %r" % (where, header[idx]))
+            notes = []
+            for ref in refs:
+                if ref not in footnotes:
+                    raise OfficialPricingError("%s: footnote [^%s] has no definition" % (where, ref))
+                notes.append(footnotes[ref])
+            tier = _parse_tier_cell(cells[col_index["tier"]], where) if "tier" in col_index else TIER_DEFAULT
+            threshold = _parse_threshold_cell(cells[col_index["threshold"]], where) if "threshold" in col_index else None
+            rates = {
+                "input": _parse_price_cell(cells[col_index["input"]], where + " input"),
+                "cached_input": _parse_price_cell(cells[col_index["cached_input"]], where + " cached input"),
+                "output": _parse_price_cell(cells[col_index["output"]], where + " output"),
+            }
+            if "cache_write" in col_index:
+                cw_cell = cells[col_index["cache_write"]]
+                if cw_cell.lower() == _NOT_APPLICABLE:
+                    rates["cache_write"] = None
+                    rates["cache_write_status"] = CACHE_WRITE_NOT_APPLICABLE
+                else:
+                    rates["cache_write"] = _parse_price_cell(cw_cell, where + " cache write")
+                    rates["cache_write_status"] = CACHE_WRITE_RATE
+            else:
+                rates["cache_write"] = None
+                rates["cache_write_status"] = CACHE_WRITE_NOT_LISTED
+            rows = rows_by_model.setdefault(model_id, {"display_name": display, "rows": [], "notes": []})
+            if rows["display_name"] != display:
+                raise OfficialPricingError("%s: conflicting display names for id %r" % (where, model_id))
+            rows["rows"].append({"tier": tier, "threshold": threshold, "rates": rates})
+            for note in notes:
+                if note not in rows["notes"]:
+                    rows["notes"].append(note)
+
+        for model_id, info in rows_by_model.items():
+            where = "%s, model %r" % (where_t, info["display_name"])
+            if model_id in models:
+                raise OfficialPricingError("%s: model listed more than once across tables" % where)
+            tiers, threshold = _validate_official_tier_rows(info["rows"], where)
+            models[model_id] = {
+                "display_name": info["display_name"],
+                "provider": provider,
+                "notes": info["notes"],
+                "threshold": threshold,
+                "tiers": tiers,
+            }
+
+    if n_tables == 0:
+        raise OfficialPricingError("no pricing tables found")
+    if not models:
+        raise OfficialPricingError("no priced models found in the pricing tables")
+    return {"models": models, "lookup": build_official_lookup(models), "providers": providers}
+
+
+def _validate_official_tier_rows(rows, where):
+    """Accept exactly one Default row with no threshold, or exactly a Default
+    '≤ N K' row plus a Long-context '> N K' row with the same N."""
+    if len(rows) == 1:
+        row = rows[0]
+        if row["tier"] != TIER_DEFAULT or row["threshold"] is not None:
+            raise OfficialPricingError("%s: single-row model must be a Default tier with no threshold" % where)
+        return {TIER_DEFAULT: row["rates"]}, None
+    if len(rows) == 2:
+        by_tier = {r["tier"]: r for r in rows}
+        if set(by_tier) != {TIER_DEFAULT, TIER_LONG}:
+            raise OfficialPricingError("%s: two-row model must have exactly Default + Long context tiers" % where)
+        d_thr = by_tier[TIER_DEFAULT]["threshold"]
+        l_thr = by_tier[TIER_LONG]["threshold"]
+        if (d_thr is None or l_thr is None or d_thr["comparator"] != "<=" or l_thr["comparator"] != ">"
+                or d_thr["k_value"] != l_thr["k_value"]):
+            raise OfficialPricingError("%s: tier thresholds must be a matching '≤ N K' / '> N K' pair" % where)
+        k_value = d_thr["k_value"]
+        threshold = {
+            "label": "%dK" % k_value,
+            "tokens": k_value * 1000,
+            "ambiguous_upper_tokens": k_value * 1024,
+        }
+        return {TIER_DEFAULT: by_tier[TIER_DEFAULT]["rates"], TIER_LONG: by_tier[TIER_LONG]["rates"]}, threshold
+    raise OfficialPricingError("%s: unsupported number of tier rows (%d)" % (where, len(rows)))
+
+
+def build_official_lookup(models):
+    lookup = {}
+    collisions = set()
+    for model_id in models:
+        key = official_lookup_key(model_id)
+        if key in lookup and lookup[key] != model_id:
+            collisions.add(key)
+        lookup[key] = model_id
+    for key in collisions:
+        del lookup[key]
+    return lookup
+
+
+def build_official_snapshot(raw_bytes, fetched_epoch):
+    """Validated, cacheable snapshot from the raw article-body bytes."""
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as ex:
+        raise OfficialPricingError("response is not valid UTF-8: %s" % ex)
+    parsed = parse_official_pricing_markdown(text)
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    snapshot = {
+        "schema_version": OFFICIAL_PRICING_SCHEMA_VERSION,
+        "kind": OFFICIAL_PRICING_KIND,
+        "source_url": OFFICIAL_PRICING_API_URL,
+        "public_url": OFFICIAL_PRICING_PUBLIC_URL,
+        "fetched_at": _iso_from_epoch(fetched_epoch),
+        "fetched_epoch": float(fetched_epoch),
+        "content_sha256": digest,
+        "snapshot_id": "sha256:%s" % digest[:16],
+        "unit": OFFICIAL_PRICING_UNIT,
+        "providers": parsed["providers"],
+        "models": parsed["models"],
+        "lookup": parsed["lookup"],
+    }
+    return validate_official_snapshot(snapshot)
+
+
+def _check_rate(value, where, allow_none=False):
+    if value is None and allow_none:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise OfficialPricingError("%s: invalid rate %r" % (where, value))
+
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+OFFICIAL_PRICING_UNIT = "USD per 1M tokens"
+
+
+def _check_str_list(value, where):
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise OfficialPricingError("%s must be a list of non-empty strings" % where)
+
+
+def validate_official_snapshot(snap):
+    """Validate a snapshot (freshly built or read back from the cache file).
+    Checks every field later used for pricing, provenance and rendering, so
+    a hand-edited/corrupted cache is rejected as a whole (and re-fetched)
+    instead of raising mid-ingest."""
+    if not isinstance(snap, dict):
+        raise OfficialPricingError("snapshot must be an object")
+    if snap.get("schema_version") != OFFICIAL_PRICING_SCHEMA_VERSION or snap.get("kind") != OFFICIAL_PRICING_KIND:
+        raise OfficialPricingError("unsupported snapshot schema")
+    for key in ("source_url", "public_url", "fetched_at", "content_sha256", "snapshot_id"):
+        if not isinstance(snap.get(key), str) or not snap[key]:
+            raise OfficialPricingError("snapshot field %r missing" % key)
+    for key in ("source_url", "public_url"):
+        if not snap[key].startswith(OFFICIAL_PRICING_ALLOWED_URL_PREFIX):
+            raise OfficialPricingError("snapshot field %r is not a %s URL" % (key, OFFICIAL_PRICING_ALLOWED_URL_PREFIX))
+    if snap.get("unit") != OFFICIAL_PRICING_UNIT:
+        raise OfficialPricingError("snapshot unit must be %r" % OFFICIAL_PRICING_UNIT)
+    digest = snap["content_sha256"]
+    if not _SHA256_HEX_RE.match(digest):
+        raise OfficialPricingError("snapshot field 'content_sha256' is not a sha256 hex digest")
+    if snap["snapshot_id"] != "sha256:%s" % digest[:16]:
+        raise OfficialPricingError("snapshot_id does not match content_sha256")
+    epoch = snap.get("fetched_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+        raise OfficialPricingError("snapshot field 'fetched_epoch' invalid")
+    try:
+        expected_at = _iso_from_epoch(epoch) if math.isfinite(epoch) and epoch >= 0 else None
+    except (OverflowError, ValueError, OSError):
+        expected_at = None
+    if expected_at is None or snap["fetched_at"] != expected_at:
+        raise OfficialPricingError("snapshot field 'fetched_epoch' invalid or inconsistent with 'fetched_at'")
+    _check_str_list(snap.get("providers"), "snapshot field 'providers'")
+    models = snap.get("models")
+    if not isinstance(models, dict) or not models:
+        raise OfficialPricingError("snapshot has no models")
+    for model_id, entry in models.items():
+        if not isinstance(model_id, str) or not _MODEL_ID_RE.match(model_id):
+            raise OfficialPricingError("snapshot model id %r invalid" % (model_id,))
+        where = "snapshot model %r" % model_id
+        if not isinstance(entry, dict) or not isinstance(entry.get("tiers"), dict):
+            raise OfficialPricingError("%s: malformed entry" % where)
+        for key in ("display_name", "provider"):
+            if not isinstance(entry.get(key), str) or not entry[key]:
+                raise OfficialPricingError("%s: %r must be a non-empty string" % (where, key))
+        notes = entry.get("notes")
+        if notes is None:
+            notes = []
+        if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
+            raise OfficialPricingError("%s: 'notes' must be a list of strings" % where)
+        tiers = entry["tiers"]
+        threshold = entry.get("threshold")
+        if threshold is None:
+            if set(tiers) != {TIER_DEFAULT}:
+                raise OfficialPricingError("%s: tiers inconsistent with missing threshold" % where)
+        else:
+            if set(tiers) != {TIER_DEFAULT, TIER_LONG} or not isinstance(threshold, dict):
+                raise OfficialPricingError("%s: tiers inconsistent with threshold" % where)
+            for key in ("tokens", "ambiguous_upper_tokens"):
+                v = threshold.get(key)
+                if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+                    raise OfficialPricingError("%s: invalid threshold %r" % (where, key))
+            if threshold["ambiguous_upper_tokens"] < threshold["tokens"]:
+                raise OfficialPricingError("%s: invalid threshold band" % where)
+        for tier, rates in tiers.items():
+            tw = "%s tier %s" % (where, tier)
+            if not isinstance(rates, dict):
+                raise OfficialPricingError("%s: malformed rates" % tw)
+            for key in ("input", "cached_input", "output"):
+                _check_rate(rates.get(key), "%s %s" % (tw, key))
+            status = rates.get("cache_write_status")
+            if status == CACHE_WRITE_RATE:
+                _check_rate(rates.get("cache_write"), "%s cache_write" % tw)
+            elif status in (CACHE_WRITE_NOT_APPLICABLE, CACHE_WRITE_NOT_LISTED):
+                if rates.get("cache_write") is not None:
+                    raise OfficialPricingError("%s: cache_write must be null when %s" % (tw, status))
+            else:
+                raise OfficialPricingError("%s: invalid cache_write_status %r" % (tw, status))
+    lookup = snap.get("lookup")
+    if (not isinstance(lookup, dict)
+            or not all(isinstance(k, str) and isinstance(v, str) for k, v in lookup.items())
+            or lookup != build_official_lookup(models)):
+        raise OfficialPricingError("snapshot lookup table invalid or inconsistent with its models")
+    return snap
+
+
+def read_official_snapshot_cache():
+    """Returns (snapshot_or_None, error_or_None). Never raises for a
+    missing/unreadable/corrupted cache: an invalid cache is rejected as a
+    whole (and a refresh will re-fetch it)."""
+    path = official_pricing_cache_path()
+    if not os.path.exists(path):
+        return None, None
+    try:
+        with open(path, "rb") as f:
+            raw = json.loads(f.read().decode("utf-8"), parse_constant=_reject_json_constant)
+        return validate_official_snapshot(raw), None
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, OverflowError,
+            RecursionError) as ex:
+        # ValueError covers OfficialPricingError/RequestPricingError too.
+        return None, "cached official pricing snapshot %s is invalid: %s" % (path, ex)
+
+
+_REFRESH_STATE_EPOCH_KEYS = ("last_attempt_epoch", "last_failure_epoch", "last_success_epoch")
+_REFRESH_STATE_TEXT_KEYS = ("last_attempt_at", "last_failure_at", "last_success_at", "last_error")
+
+
+def validate_official_refresh_state(state):
+    """Validate the refresh-state metadata. Epochs must be absent/null or
+    finite, nonnegative, non-bool numbers; timestamps/last_error absent/null
+    or strings; consecutive_failures absent/null or a nonnegative int.
+    Unknown keys are left as-is (never read). Raises OfficialPricingError."""
+    if not isinstance(state, dict):
+        raise OfficialPricingError("refresh state must be a JSON object")
+    for key in _REFRESH_STATE_EPOCH_KEYS:
+        v = state.get(key)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise OfficialPricingError("%r must be a number, got %r" % (key, v))
+        try:
+            ok = math.isfinite(v) and v >= 0
+        except OverflowError:
+            ok = False
+        if not ok:
+            raise OfficialPricingError("%r must be finite and nonnegative, got %r" % (key, v))
+    for key in _REFRESH_STATE_TEXT_KEYS:
+        v = state.get(key)
+        if v is not None and not isinstance(v, str):
+            raise OfficialPricingError("%r must be a string, got %r" % (key, v))
+    v = state.get("consecutive_failures")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
+        raise OfficialPricingError("'consecutive_failures' must be a nonnegative integer, got %r" % (v,))
+    return state
+
+
+def read_official_refresh_state():
+    """Returns (state_dict, error_or_None). A missing file is an empty state;
+    an unreadable/corrupted one yields an EMPTY state plus an error message
+    (it holds only retry metadata: resetting it never touches the cached
+    snapshot or any recorded task cost). Never raises."""
+    path = official_pricing_state_path()
+    if not os.path.exists(path):
+        return {}, None
+    try:
+        with open(path, "rb") as f:
+            raw = json.loads(f.read().decode("utf-8"), parse_constant=_reject_json_constant)
+        return validate_official_refresh_state(raw), None
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, OverflowError,
+            RecursionError) as ex:
+        return {}, ("official pricing refresh state %s is invalid (%s); its retry metadata is ignored and "
+                    "reset (cached snapshot and recorded task costs are unaffected)" % (path, ex))
+
+
+def refresh_official_pricing_if_due(now=None):
+    """Refresh the cached official snapshot if it is missing/invalid/older
+    than the TTL. At most ONE attempt per cache path per process (memoized),
+    and none at all within the retry backoff after a failed attempt. Never
+    raises; failures keep the previous valid cache and warn on stderr.
+    Returns a small result dict (for status display/tests)."""
+    path = official_pricing_cache_path()
+    if path in _OFFICIAL_REFRESH_RESULTS:
+        return _OFFICIAL_REFRESH_RESULTS[path]
+    result = _refresh_official_pricing(time.time() if now is None else now)
+    _OFFICIAL_REFRESH_RESULTS[path] = result
+    return result
+
+
+def official_snapshot_age_status(age_seconds):
+    """Classify a cached snapshot by its age since it was FETCHED:
+    'fresh' (< TTL), 'stale' (TTL .. OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS;
+    still used for pricing, labeled stale) or 'expired' (older than that, or
+    dated in the future: kept for reference only, never used for pricing)."""
+    if age_seconds < 0 or age_seconds > OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS:
+        return "expired"
+    if age_seconds < OFFICIAL_PRICING_TTL_SECONDS:
+        return "fresh"
+    return "stale"
+
+
+def _reset_invalid_refresh_state(state_error):
+    """Warn about a corrupted refresh-state file and overwrite it with an
+    empty state (retry metadata only; the cache and task costs are kept)."""
+    print("Warning: %s." % state_error, file=sys.stderr)
+    try:
+        atomic_write(official_pricing_state_path(), json.dumps({}, indent=2))
+    except OSError as ex:
+        print("Warning: could not reset the official pricing refresh state (%s); continuing with empty "
+              "retry metadata." % ex, file=sys.stderr)
+
+
+def _refresh_official_pricing(now):
+    if not official_pricing_fetch_enabled():
+        return {"attempted": False, "status": "disabled"}
+    try:
+        with official_pricing_lock():
+            state, state_error = read_official_refresh_state()
+            if state_error:
+                _reset_invalid_refresh_state(state_error)
+            snapshot, cache_error = read_official_snapshot_cache()
+            if snapshot is not None:
+                age = now - snapshot["fetched_epoch"]
+                if 0 <= age < OFFICIAL_PRICING_TTL_SECONDS:
+                    return {"attempted": False, "status": "fresh"}
+            # Validated above: epochs are None or finite nonnegative numbers.
+            last_fail = state.get("last_failure_epoch")
+            last_ok = state.get("last_success_epoch") or 0
+            if (last_fail is not None and last_fail > last_ok
+                    and 0 <= now - last_fail < OFFICIAL_PRICING_RETRY_BACKOFF_SECONDS):
+                return {"attempted": False, "status": "suppressed"}
+
+            state["last_attempt_epoch"] = now
+            state["last_attempt_at"] = _iso_from_epoch(now)
+            fetcher = PRICING_FETCHER or _default_pricing_fetch
+            try:
+                raw = fetcher(OFFICIAL_PRICING_API_URL, OFFICIAL_PRICING_TIMEOUT_SECONDS, OFFICIAL_PRICING_MAX_BYTES)
+                if not isinstance(raw, (bytes, bytearray)):
+                    raise OfficialPricingError("fetcher returned %s, expected bytes" % type(raw).__name__)
+                if len(raw) > OFFICIAL_PRICING_MAX_BYTES:
+                    raise OfficialPricingError("response too large (> %d bytes)" % OFFICIAL_PRICING_MAX_BYTES)
+                new_snapshot = build_official_snapshot(bytes(raw), now)
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, OverflowError) as ex:
+                # Network (OSError incl. URLError/timeouts/TLS), protocol and
+                # parse/validation failures (OfficialPricingError is a
+                # ValueError) never break ingest: keep the last valid cache.
+                message = ("%s: %s" % (type(ex).__name__, ex))[:300]
+                state["last_failure_epoch"] = now
+                state["last_failure_at"] = _iso_from_epoch(now)
+                state["last_error"] = message
+                state["consecutive_failures"] = (state.get("consecutive_failures") or 0) + 1
+                atomic_write(official_pricing_state_path(), json.dumps(state, indent=2))
+                if snapshot is not None:
+                    if official_snapshot_age_status(now - snapshot["fetched_epoch"]) == "expired":
+                        kept = ("keeping the last valid snapshot fetched %s for reference only: it is older than "
+                                "%d days (or dated in the future), so new calls will be recorded as unpriced"
+                                % (snapshot["fetched_at"], OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS // 86400))
+                    else:
+                        kept = ("keeping the last valid snapshot fetched %s (now stale; used for pricing only "
+                                "until it is %d days old)"
+                                % (snapshot["fetched_at"], OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS // 86400))
+                elif cache_error:
+                    kept = "the existing cache is also invalid (%s); new calls will be recorded as unpriced" % cache_error
+                else:
+                    kept = "no cached snapshot exists; new calls will be recorded as unpriced (not $0)"
+                print("Warning: official GitHub Copilot pricing refresh failed (%s); %s. Retries are suppressed "
+                      "for %d min after a failure (retried at most hourly while failing)."
+                      % (message, kept, OFFICIAL_PRICING_RETRY_BACKOFF_SECONDS // 60),
+                      file=sys.stderr)
+                return {"attempted": True, "status": "failed", "error": message}
+
+            atomic_write(official_pricing_cache_path(), json.dumps(new_snapshot, indent=2, sort_keys=True))
+            state["last_success_epoch"] = now
+            state["last_success_at"] = _iso_from_epoch(now)
+            state["last_error"] = None
+            state["consecutive_failures"] = 0
+            atomic_write(official_pricing_state_path(), json.dumps(state, indent=2))
+            return {"attempted": True, "status": "refreshed", "snapshot_id": new_snapshot["snapshot_id"]}
+    except OSError as ex:
+        print("Warning: could not refresh official GitHub Copilot pricing cache (%s); using the existing "
+              "cache if any." % ex, file=sys.stderr)
+        return {"attempted": False, "status": "error", "error": str(ex)}
+
+
+def load_official_pricing_context(now=None):
+    """Cache-only (never touches the network, never raises for corrupted
+    cache/state files). Returns
+    {'status': 'fresh'|'stale'|'expired'|'unavailable', 'snapshot',
+     'age_seconds', 'cache_error', 'state_error', 'last_error',
+     'last_failure_at', 'fetch_enabled', 'path'}.
+    An 'expired' snapshot is still returned (for display/reference) but is
+    never used to price calls — see official_pricing_snapshot_for_ingest."""
+    now = time.time() if now is None else now
+    snapshot, cache_error = read_official_snapshot_cache()
+    state, state_error = read_official_refresh_state()
+    ctx = {
+        "snapshot": snapshot,
+        "cache_error": cache_error,
+        "state_error": state_error,
+        "last_error": state.get("last_error"),
+        "last_failure_at": state.get("last_failure_at"),
+        "fetch_enabled": official_pricing_fetch_enabled(),
+        "path": official_pricing_cache_path(),
+        "age_seconds": None,
+    }
+    if snapshot is None:
+        ctx["status"] = "unavailable"
+    else:
+        age = now - snapshot["fetched_epoch"]
+        ctx["age_seconds"] = age
+        ctx["status"] = official_snapshot_age_status(age)
+    return ctx
+
+
+def official_pricing_snapshot_for_ingest(pricing_ctx):
+    """(snapshot_or_None, unpriced_reason) to price calls ingested with this
+    context. A snapshot whose context status is 'expired' (or whose recorded
+    age exceeds the maximum pricing age / is negative) is NOT used: calls
+    are recorded as unpriced with UNPRICED_SNAPSHOT_TOO_OLD."""
+    ctx = pricing_ctx or {}
+    snapshot = ctx.get("snapshot")
+    if snapshot is None:
+        return None, UNPRICED_NO_SNAPSHOT
+    age = ctx.get("age_seconds")
+    if ctx.get("status") == "expired" or (
+            isinstance(age, (int, float)) and not isinstance(age, bool)
+            and official_snapshot_age_status(age) == "expired"):
+        return None, UNPRICED_SNAPSHOT_TOO_OLD
+    return snapshot, None
+
+
+def resolve_official_model(model, snapshot):
+    """OTEL model id -> official model id, or None. Exact (case-insensitive)
+    match first, then the validated dash-for-dot lookup. No other aliasing:
+    anything else (e.g. 'auto', unlisted or renamed models) is unpriced."""
+    if not snapshot or not isinstance(model, str):
+        return None
+    m = model.strip().lower()
+    if m in snapshot["models"]:
+        return m
+    return snapshot.get("lookup", {}).get(official_lookup_key(m))
+
+
+def is_gemini_official_model(model_id, entry):
+    """True for an official Gemini model or any model in the Google provider
+    table (conservative: Gemini telemetry may report output EXCLUDING
+    reasoning tokens)."""
+    provider = entry.get("provider") if isinstance(entry, dict) else None
+    provider = provider.strip().lower() if isinstance(provider, str) else ""
+    return model_id.startswith("gemini") or "google" in provider or "gemini" in provider
+
+
+def price_call_official(mc, snapshot, no_snapshot_reason=UNPRICED_NO_SNAPSHOT):
+    """Price ONE model call. Returns (result_dict, None) or (None, reason).
+    Tier is chosen from THIS call's input tokens (never a task aggregate).
+    `no_snapshot_reason` is the recorded reason when `snapshot` is None
+    (e.g. UNPRICED_SNAPSHOT_TOO_OLD when the only cache is too old)."""
+    if snapshot is None:
+        return None, no_snapshot_reason
+    model_id = resolve_official_model(mc.get("model"), snapshot)
+    if model_id is None:
+        return None, UNPRICED_UNKNOWN_MODEL
+    present = mc.get("usage_present") or {}
+    if not present.get("input", True):
+        return None, UNPRICED_NO_INPUT
+    if not present.get("output", True):
+        return None, UNPRICED_NO_OUTPUT
+    inp = int(mc.get("prompt_tokens") or 0)
+    out = int(mc.get("completion_tokens") or 0)
+    reasoning = int(mc.get("reasoning_tokens") or 0)
+    cache_read = int(mc.get("cache_read_tokens") or 0)
+    cache_write = int(mc.get("cache_write_tokens") or 0)
+    if min(inp, out, reasoning, cache_read, cache_write) < 0:
+        return None, UNPRICED_NEGATIVE
+    if cache_read + cache_write > inp:
+        return None, UNPRICED_CACHE_EXCEEDS_INPUT
+
+    entry = snapshot["models"][model_id]
+    if reasoning > 0 and is_gemini_official_model(model_id, entry):
+        # Undetectable when reasoning <= output, so never priced (no guess).
+        return None, UNPRICED_GEMINI_REASONING
+    if reasoning > out:
+        return None, UNPRICED_REASONING_EXCEEDS_OUTPUT
+
+    threshold = entry.get("threshold")
+    if threshold is None:
+        tier = TIER_DEFAULT
+    elif inp <= threshold["tokens"]:
+        tier = TIER_DEFAULT
+    elif inp <= threshold["ambiguous_upper_tokens"]:
+        return None, UNPRICED_TIER_AMBIGUOUS
+    else:
+        tier = TIER_LONG
+    rates = entry["tiers"][tier]
+
+    status = rates["cache_write_status"]
+    if status == CACHE_WRITE_RATE:
+        cache_write_rate = rates["cache_write"]
+    elif status == CACHE_WRITE_NOT_APPLICABLE:
+        # Official "Not applicable": no separate cache-write cost — those
+        # tokens are still ordinary input tokens, billed at the input rate.
+        cache_write_rate = rates["input"]
+    elif cache_write > 0:
+        return None, UNPRICED_CACHE_WRITE_NOT_LISTED
+    else:
+        cache_write_rate = 0.0
+
+    fresh_input = inp - cache_read - cache_write
+    components = {
+        "input_usd": fresh_input * rates["input"] / 1_000_000.0,
+        "cached_input_usd": cache_read * rates["cached_input"] / 1_000_000.0,
+        "cache_write_usd": cache_write * cache_write_rate / 1_000_000.0,
+        # Reasoning tokens are a subset of output: priced once, here.
+        "output_usd": out * rates["output"] / 1_000_000.0,
+    }
+    return {"model_id": model_id, "tier": tier, "usd": sum(components.values()), "components": components}, None
+
+
+def _blank_official_bucket():
+    return {"calls": 0, "usd": 0.0, "input_usd": 0.0, "cached_input_usd": 0.0, "cache_write_usd": 0.0,
+            "output_usd": 0.0, "official_model": None, "tiers": {}}
+
+
+def build_official_cost_delta(calls, pricing_ctx):
+    """Additive per-call official cost buckets for one ingest batch."""
+    snapshot, no_snapshot_reason = official_pricing_snapshot_for_ingest(pricing_ctx)
+    out = {"snapshot": None, "by_model": {}}
+    used_ids = set()
+    for mc in calls:
+        model = mc["model"]
+        rec = out["by_model"].setdefault(model, {"priced": {}, "unpriced": {}})
+        result, reason = price_call_official(mc, snapshot, no_snapshot_reason or UNPRICED_NO_SNAPSHOT)
+        if result is None:
+            u = rec["unpriced"].setdefault(reason, {"calls": 0, "total_tokens": 0})
+            u["calls"] += 1
+            u["total_tokens"] += int(mc.get("total_tokens") or 0)
+            continue
+        bucket = rec["priced"].setdefault(snapshot["snapshot_id"], _blank_official_bucket())
+        bucket["calls"] += 1
+        bucket["usd"] += result["usd"]
+        for key, value in result["components"].items():
+            bucket[key] += value
+        bucket["official_model"] = result["model_id"]
+        bucket["tiers"][result["tier"]] = bucket["tiers"].get(result["tier"], 0) + 1
+        used_ids.add(result["model_id"])
+    if snapshot is not None and used_ids:
+        age = (pricing_ctx or {}).get("age_seconds")
+        out["snapshot"] = {
+            "snapshot_id": snapshot["snapshot_id"],
+            "fetched_at": snapshot["fetched_at"],
+            "content_sha256": snapshot["content_sha256"],
+            "source_url": snapshot["source_url"],
+            "public_url": snapshot["public_url"],
+            "stale_at_ingest": (pricing_ctx or {}).get("status") == "stale",
+            "age_hours_at_ingest": round(age / 3600.0, 2) if isinstance(age, (int, float)) else None,
+            "notes": {mid: list(snapshot["models"][mid].get("notes") or []) for mid in sorted(used_ids)
+                      if snapshot["models"][mid].get("notes")},
+        }
+    return out
+
+
+def merge_official_cost_delta(task, oc_delta):
+    if not oc_delta or not oc_delta.get("by_model"):
+        return
+    oc = task.get("official_cost")
+    if not isinstance(oc, dict):
+        oc = task["official_cost"] = {
+            "schema_version": OFFICIAL_COST_SCHEMA_VERSION,
+            "since": now_iso(),
+            "snapshots": {},
+            "by_model": {},
+        }
+    snaps = oc.setdefault("snapshots", {})
+    meta = oc_delta.get("snapshot")
+    if meta:
+        sid = meta["snapshot_id"]
+        dst = snaps.setdefault(sid, {
+            "content_sha256": meta["content_sha256"],
+            "source_url": meta["source_url"],
+            "public_url": meta["public_url"],
+            "first_fetched_at": meta["fetched_at"],
+            "first_used_at": now_iso(),
+            "used_while_stale": False,
+            "max_age_hours_at_ingest": None,
+            "notes": {},
+        })
+        dst["last_fetched_at"] = meta["fetched_at"]
+        dst["last_used_at"] = now_iso()
+        dst["used_while_stale"] = bool(dst.get("used_while_stale")) or bool(meta.get("stale_at_ingest"))
+        age = meta.get("age_hours_at_ingest")
+        if age is not None and (dst.get("max_age_hours_at_ingest") is None or age > dst["max_age_hours_at_ingest"]):
+            dst["max_age_hours_at_ingest"] = age
+        notes = dst.setdefault("notes", {})
+        for mid, texts in (meta.get("notes") or {}).items():
+            existing = notes.setdefault(mid, [])
+            for t in texts:
+                if t not in existing:
+                    existing.append(t)
+    by_model = oc.setdefault("by_model", {})
+    for model, rec in oc_delta["by_model"].items():
+        dst_rec = by_model.setdefault(model, {"priced": {}, "unpriced": {}})
+        for sid, bucket in rec.get("priced", {}).items():
+            b = dst_rec.setdefault("priced", {}).setdefault(sid, _blank_official_bucket())
+            for key in ("calls", "usd", "input_usd", "cached_input_usd", "cache_write_usd", "output_usd"):
+                b[key] = b.get(key, 0) + bucket[key]
+            b["official_model"] = bucket.get("official_model") or b.get("official_model")
+            tiers = b.setdefault("tiers", {})
+            for tier, n in bucket.get("tiers", {}).items():
+                tiers[tier] = tiers.get(tier, 0) + n
+        for reason, u in rec.get("unpriced", {}).items():
+            d = dst_rec.setdefault("unpriced", {}).setdefault(reason, {"calls": 0, "total_tokens": 0})
+            d["calls"] += u["calls"]
+            d["total_tokens"] += u["total_tokens"]
+
+
+def summarize_official_cost(task):
+    """Coverage summary from RECORDED estimates (never recomputed)."""
+    oc = task.get("official_cost") if isinstance(task.get("official_cost"), dict) else {}
+    recorded = oc.get("by_model") or {}
+    token_models = task.get("by_model") or {}
+    per_model = {}
+    totals = {"calls": 0, "priced_calls": 0, "usd": 0.0, "unpriced_calls": 0, "legacy_calls": 0}
+    reasons = {}
+    warnings = []
+    for model in sorted(set(token_models) | set(recorded)):
+        rec = recorded.get(model) or {}
+        priced_calls = sum(int(b.get("calls", 0) or 0) for b in (rec.get("priced") or {}).values())
+        usd = sum(float(b.get("usd", 0) or 0) for b in (rec.get("priced") or {}).values())
+        official_models = sorted({b.get("official_model") for b in (rec.get("priced") or {}).values()
+                                  if b.get("official_model")})
+        tiers = {}
+        for b in (rec.get("priced") or {}).values():
+            for tier, n in (b.get("tiers") or {}).items():
+                tiers[tier] = tiers.get(tier, 0) + n
+        unpriced = {r: int(u.get("calls", 0) or 0) for r, u in (rec.get("unpriced") or {}).items()}
+        unpriced_calls = sum(unpriced.values())
+        calls = int((token_models.get(model) or {}).get("call_count", 0) or 0)
+        legacy = calls - priced_calls - unpriced_calls
+        if legacy < 0:
+            warnings.append("model '%s': recorded cost buckets (%d calls) exceed the token totals (%d calls)"
+                            % (model, priced_calls + unpriced_calls, calls))
+            legacy = 0
+        per_model[model] = {
+            "calls": calls, "priced_calls": priced_calls, "usd": usd, "unpriced": unpriced,
+            "unpriced_calls": unpriced_calls, "legacy_calls": legacy,
+            "official_models": official_models, "tiers": tiers,
+        }
+        totals["calls"] += calls
+        totals["priced_calls"] += priced_calls
+        totals["usd"] += usd
+        totals["unpriced_calls"] += unpriced_calls
+        totals["legacy_calls"] += legacy
+        for r, n in unpriced.items():
+            reasons[r] = reasons.get(r, 0) + n
+    return {"per_model": per_model, "totals": totals, "reasons": reasons, "warnings": warnings,
+            "snapshots": oc.get("snapshots") or {}, "since": oc.get("since")}
+
+
+def format_official_cost_total(summary):
+    t = summary["totals"]
+    if t["calls"] == 0 and t["priced_calls"] == 0:
+        return "$0.0000 (no model calls recorded)"
+    if t["priced_calls"] == 0:
+        return ("N/A — none of the %d recorded calls could be priced (see Estimated Cost Coverage); "
+                "this is *not* $0" % t["calls"])
+    if t["unpriced_calls"] == 0 and t["legacy_calls"] == 0:
+        return "$%.4f — all %d recorded calls priced" % (t["usd"], t["priced_calls"])
+    parts = []
+    if t["unpriced_calls"]:
+        parts.append("%d unpriced" % t["unpriced_calls"])
+    if t["legacy_calls"]:
+        parts.append("%d legacy (recorded before official per-token pricing, never repriced)" % t["legacy_calls"])
+    return "$%.4f — **PARTIAL (lower bound)**: %d of %d calls priced; excludes %s" % (
+        t["usd"], t["priced_calls"], t["calls"], ", ".join(parts))
+
+
+def format_official_model_cost(row):
+    if row["priced_calls"] == 0:
+        if row["calls"] == 0 and not row["unpriced_calls"]:
+            return "—"
+        return "not priced"
+    s = "$%.4f" % row["usd"]
+    missing = row["unpriced_calls"] + row["legacy_calls"]
+    if missing:
+        s += " (partial: %d of %d calls)" % (row["priced_calls"], row["calls"])
+    return s
+
+
+def _fmt_age(seconds):
+    if seconds is None:
+        return "unknown age"
+    if seconds < 0:
+        return "fetched in the future (clock skew)"
+    hours = seconds / 3600.0
+    if hours < 48:
+        return "%.1fh old" % hours
+    return "%.1f days old" % (hours / 24.0)
+
+
+def render_official_cost_section(task, summary, ctx):
+    lines = []
+    lines.append("## Estimated Cost Coverage (official GitHub Copilot per-token rates)")
+    lines.append("")
+    lines.append("_Each model call is priced individually **at ingestion** with GitHub's official published "
+                 "per-token rates ([Models and pricing for GitHub Copilot](%s)), fetched automatically and "
+                 "cached for 24h, and the result is recorded with the snapshot that priced it — a later rate "
+                 "change never reprices past calls. If ingestion was delayed, the rates are those published "
+                 "at ingestion time, not necessarily the rates in force when the call happened. The tier "
+                 "(Default / Long context) is chosen from each call's own input tokens. Cached-input and "
+                 "cache-write tokens are subsets of input tokens (priced at their own rates; a cache write "
+                 "listed as \"Not applicable\" is billed as ordinary input); reasoning tokens are part of "
+                 "output and priced once. This is an **estimate of list-price usage, not a bill**: it does "
+                 "not deduct plan-included GitHub AI Credits allowances, and calls that cannot be priced "
+                 "exactly are excluded and listed below (never counted as $0)._" % OFFICIAL_PRICING_PUBLIC_URL)
+    lines.append("")
+
+    # Current cache status (affects FUTURE ingests only; recorded costs are fixed).
+    if ctx["status"] == "fresh":
+        status = "fresh — snapshot `%s` fetched %s (%s; refreshed automatically every 24h)" % (
+            ctx["snapshot"]["snapshot_id"], ctx["snapshot"]["fetched_at"], _fmt_age(ctx["age_seconds"]))
+    elif ctx["status"] == "stale":
+        status = ("**STALE** — last valid snapshot `%s` fetched %s (%s, older than 24h; still used for pricing "
+                  "until it is %d days old)" % (
+                      ctx["snapshot"]["snapshot_id"], ctx["snapshot"]["fetched_at"], _fmt_age(ctx["age_seconds"]),
+                      OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS // 86400))
+    elif ctx["status"] == "expired":
+        status = ("**TOO OLD TO PRICE** — last valid snapshot `%s` fetched %s (%s; more than %d days old or "
+                  "dated in the future) is kept for reference only; calls ingested now are recorded as unpriced "
+                  "(not $0). Its fetch time is when this tool downloaded the page, not a rate effective date" % (
+                      ctx["snapshot"]["snapshot_id"], ctx["snapshot"]["fetched_at"], _fmt_age(ctx["age_seconds"]),
+                      OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS // 86400))
+    else:
+        status = ("**UNAVAILABLE** — no valid official pricing snapshot is cached; calls ingested now are "
+                  "recorded as unpriced (not $0)")
+    extras = []
+    if ctx.get("cache_error"):
+        extras.append(ctx["cache_error"])
+    if ctx.get("state_error"):
+        extras.append(ctx["state_error"])
+    if ctx["status"] != "fresh" and ctx.get("last_error"):
+        extras.append("last refresh error at %s: %s" % (ctx.get("last_failure_at") or "unknown time", ctx["last_error"]))
+    if not ctx.get("fetch_enabled"):
+        extras.append("automatic fetching is disabled via %s" % OFFICIAL_PRICING_FETCH_ENV)
+    lines.append("- Official rate cache now: %s%s" % (status, (" — " + "; ".join(extras)) if extras else ""))
+    lines.append("  _(cache status only affects calls ingested from now on; the estimates below are as recorded.)_")
+    if summary.get("since"):
+        lines.append("- Official per-token estimates recorded for this task since: %s" % summary["since"])
+    lines.append("")
+
+    t = summary["totals"]
+    lines.append("| Model | Calls | Priced calls | Est. USD (official rates) | Unpriced calls | Legacy calls | Official model / tiers used |")
+    lines.append("|---|---|---|---|---|---|---|")
+    for model, row in sorted(summary["per_model"].items(), key=lambda kv: (-kv[1]["usd"], kv[0])):
+        tiers = ", ".join("%s×%d" % (TIER_LABELS.get(k, k), n) for k, n in sorted(row["tiers"].items()))
+        official = ", ".join(row["official_models"]) or "—"
+        lines.append("| %s | %d | %d | %s | %d | %d | %s%s |" % (
+            model, row["calls"], row["priced_calls"],
+            ("$%.4f" % row["usd"]) if row["priced_calls"] else "not priced",
+            row["unpriced_calls"], row["legacy_calls"], official, (" (%s)" % tiers) if tiers else ""))
+    lines.append("| **Total** | %d | %d | %s | %d | %d | |" % (
+        t["calls"], t["priced_calls"], ("$%.4f" % t["usd"]) if t["priced_calls"] else "N/A",
+        t["unpriced_calls"], t["legacy_calls"]))
+    lines.append("")
+
+    warnings = []
+    for reason, n in sorted(summary["reasons"].items()):
+        warnings.append("%d call(s) not priced: %s" % (n, reason))
+    if t["legacy_calls"]:
+        warnings.append("%d call(s) are legacy: recorded before official per-token pricing existed for this "
+                        "task (token counts kept; no price provenance, so never backfilled or repriced)"
+                        % t["legacy_calls"])
+    warnings.extend(summary["warnings"])
+    if warnings:
+        lines.append("### Unpriced / partial-coverage warnings")
+        lines.append("")
+        for w in warnings:
+            lines.append("- %s" % w)
+        lines.append("")
+
+    if summary["snapshots"]:
+        lines.append("### Official rate snapshots used by this task")
+        lines.append("")
+        for sid, meta in sorted(summary["snapshots"].items(), key=lambda kv: kv[1].get("first_used_at") or ""):
+            stale = " — **used while stale** (max age at ingestion %.1fh)" % meta["max_age_hours_at_ingest"] \
+                if meta.get("used_while_stale") and meta.get("max_age_hours_at_ingest") is not None else ""
+            fetched = meta.get("first_fetched_at") or "unknown"
+            if meta.get("last_fetched_at") and meta.get("last_fetched_at") != fetched:
+                fetched = "%s … %s" % (fetched, meta["last_fetched_at"])
+            lines.append("- `%s` (sha256 %s…) fetched %s from %s; used %s → %s%s" % (
+                sid, (meta.get("content_sha256") or "")[:12], fetched, meta.get("public_url") or meta.get("source_url"),
+                meta.get("first_used_at") or "?", meta.get("last_used_at") or "?", stale))
+            for mid, texts in sorted((meta.get("notes") or {}).items()):
+                for text in texts:
+                    lines.append("  - Official note for %s: %s" % (mid, text))
+        lines.append("")
+    return lines
+
+
+# --------------------------------------------------------------------------
+# Legacy independent pricing table (model-pricing.json) — INACTIVE
+# --------------------------------------------------------------------------
+#
+# Kept only for backward compatibility of callers/tests. The default report
+# no longer uses these approximate, non-official rates; the estimated USD
+# cost comes from the official GitHub snapshot above. An existing
+# ~/.copilot/task-reports/model-pricing.json is left untouched.
 
 def load_pricing():
     pricing = load_json(PRICING_FILE, None)
@@ -1897,8 +3275,13 @@ def estimate_usd(by_model):
 
 
 # --------------------------------------------------------------------------
-# Company fixed per-request charge policy
+# Company fixed per-request charge policy — DORMANT (not in default report)
 # --------------------------------------------------------------------------
+#
+# No longer rendered by render_markdown(): the fixed per-request figures
+# were benchmark-derived and misleading next to official per-token rates.
+# Kept for compatibility (and so the preserved request-pricing.json and the
+# recorded by_model_effort data remain usable if explicitly called).
 #
 # A SEPARATE billing view from the token-based USD estimate above. The
 # company charges a fixed USD amount per MODEL REQUEST, keyed by
@@ -2353,7 +3736,7 @@ def render_markdown(task):
     lines.append("| Model calls (from OTEL chat spans; includes failed calls that reported usage) | %d |" % totals.get("call_count", 0))
     lines.append("| Prompt (input) tokens | %d |" % totals.get("prompt_tokens", 0))
     lines.append("| ...of which cache-read tokens | %d |" % totals.get("cache_read_tokens", 0))
-    lines.append("| Cache-write tokens (informational) | %d |" % totals.get("cache_write_tokens", 0))
+    lines.append("| ...of which cache-write tokens | %d |" % totals.get("cache_write_tokens", 0))
     lines.append("| Completion (output) tokens | %d |" % totals.get("completion_tokens", 0))
     lines.append("| ...of which reasoning tokens (measured; already included in completion tokens above, not added separately) | %d |" % totals.get("reasoning_tokens", 0))
     lines.append("| Total tokens | %d |" % totals.get("total_tokens", 0))
@@ -2367,30 +3750,40 @@ def render_markdown(task):
     lines.append("| Copilot-internal usage (raw, **not USD**; from session.usage_checkpoint cumulative deltas) | %d nano-AIU (%.6f AIU) |" % (nano_aiu, nano_aiu / 1e9))
     lines.append("| Copilot premium requests consumed (from session.usage_checkpoint cumulative deltas) | %d |" % totals.get("premium_requests", 0))
 
-    total_usd, priced, unpriced = estimate_usd(task.get("by_model", {}))
-    if total_usd is not None:
-        usd_str = "$%.4f" % total_usd
-        if unpriced:
-            usd_str += " (partial — no pricing data for: %s)" % ", ".join(sorted(set(unpriced)))
-        lines.append("| Estimated USD cost (independent pricing table, approximate — NOT an official Copilot bill) | %s |" % usd_str)
+    official_summary = summarize_official_cost(task)
+    pricing_ctx = load_official_pricing_context()
+    lines.append("| Estimated USD cost (official GitHub per-token rates recorded at ingestion — estimate, NOT a bill) | %s |"
+                 % format_official_cost_total(official_summary))
+    if pricing_ctx["status"] == "fresh":
+        rate_status = "fresh (%s, snapshot `%s` fetched %s)" % (
+            _fmt_age(pricing_ctx["age_seconds"]), pricing_ctx["snapshot"]["snapshot_id"],
+            pricing_ctx["snapshot"]["fetched_at"])
+    elif pricing_ctx["status"] == "stale":
+        rate_status = "**STALE** (%s, fetched %s) — see Estimated Cost Coverage" % (
+            _fmt_age(pricing_ctx["age_seconds"]), pricing_ctx["snapshot"]["fetched_at"])
+    elif pricing_ctx["status"] == "expired":
+        rate_status = ("**TOO OLD TO PRICE** (%s, fetched %s; kept for reference only, new calls are unpriced) "
+                       "— see Estimated Cost Coverage" % (
+                           _fmt_age(pricing_ctx["age_seconds"]), pricing_ctx["snapshot"]["fetched_at"]))
     else:
-        lines.append("| Estimated USD cost (independent pricing table, approximate) | N/A — no pricing data for any model used (%s) |" % ", ".join(sorted(set(unpriced))))
+        rate_status = "**UNAVAILABLE** — no valid official snapshot cached; see Estimated Cost Coverage"
+    lines.append("| Official rate source | [GitHub Copilot models and pricing](%s) — cache %s |"
+                 % (OFFICIAL_PRICING_PUBLIC_URL, rate_status))
     lines.append("")
 
-    lines.extend(render_fixed_charge_section(task))
+    lines.extend(render_official_cost_section(task, official_summary, pricing_ctx))
 
     lines.append("## By Model")
     lines.append("")
-    lines.append("| Model | Calls | Prompt | Cache-read | Completion | Reasoning | Total Tokens | Model-call Time | Est. USD |")
-    lines.append("|---|---|---|---|---|---|---|---|---|")
-    models, aliases, _ = load_pricing()
+    lines.append("| Model | Calls | Prompt | Cache-read | Cache-write | Completion | Reasoning | Total Tokens | Model-call Time | Est. USD (official) |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|")
     for model, agg in sorted(task.get("by_model", {}).items(), key=lambda kv: -kv[1]["total_tokens"]):
-        price = resolve_model_price(model, models, aliases)
-        cost_str = "$%.4f" % call_cost(agg, price) if price else "no pricing data"
-        lines.append("| %s | %d | %d | %d | %d | %d | %d | %s | %s |" % (
+        row = official_summary["per_model"].get(model)
+        cost_str = format_official_model_cost(row) if row else "not priced"
+        lines.append("| %s | %d | %d | %d | %d | %d | %d | %d | %s | %s |" % (
             model, agg["call_count"], agg["prompt_tokens"], agg["cache_read_tokens"],
-            agg["completion_tokens"], agg["reasoning_tokens"], agg["total_tokens"],
-            fmt_duration_ms(agg["duration_ms"]), cost_str))
+            agg.get("cache_write_tokens", 0), agg["completion_tokens"], agg["reasoning_tokens"],
+            agg["total_tokens"], fmt_duration_ms(agg["duration_ms"]), cost_str))
     lines.append("")
 
     lines.append("## By Reasoning-Effort Intent")
@@ -2450,22 +3843,26 @@ def render_markdown(task):
                   "of guessed, to avoid misattribution from stale/open state.")
     lines.append("- Copilot-internal AIU/premium-request counts are raw usage accounting "
                   "units, not a currency amount.")
-    lines.append("- The estimated USD cost uses an independently maintained pricing table "
-                  "(model-pricing.json) with public list-price approximations (including "
-                  "alias resolution for renamed/dated model ids); it is not an official "
-                  "Copilot invoice and may drift from actual billing. Cache-read tokens are "
-                  "priced at a model's `cache_read_per_million` rate when configured, "
-                  "otherwise at the normal input rate.")
-    lines.append("- The company fixed per-request charge is a company-configured policy "
-                  "(request-pricing.json; fixed USD per model request by model + effort level, "
-                  "company-configured fixed rates with per-model sources) — not official "
-                  "GitHub pricing and never a verified bill. It counts only OTEL usage-bearing "
-                  "model spans (including retried/failed calls that reported usage), so it cannot "
-                  "claim every request was captured. Requests with unknown effort, no configured "
-                  "rate, or an explicitly unpriced rate are excluded (the total is then a labeled "
-                  "partial lower bound), and requests recorded before joint model+effort tracking "
-                  "are reported as unattributed rather than guessed. It is independent of, and not "
-                  "additive with, the token-based USD estimate.")
+    lines.append("- The estimated USD cost uses GitHub's official published per-token rates "
+                  "(fetched automatically from docs.github.com and cached for 24h), applied "
+                  "per call at ingestion and recorded with the snapshot used. It is a list-price "
+                  "estimate, not an invoice: plan-included AI Credits allowances are not deducted, "
+                  "and models/usage shapes that cannot be priced exactly are excluded and listed "
+                  "(partial lower bound), never counted as $0. Calls recorded before this pricing "
+                  "existed for a task are reported as legacy (token counts only, never repriced). "
+                  "If the source is unreachable the last valid snapshot is used and labeled stale, "
+                  "but only until it is 7 days past its fetch time (the time this tool downloaded the "
+                  "page, not a rate effective date); after that, or with no snapshot at all, new calls "
+                  "are recorded as unpriced.")
+    lines.append("- Some providers' telemetry may report output tokens EXCLUDING reasoning tokens "
+                  "(observed for some Gemini calls, where reasoning > output). Because this cannot be "
+                  "detected when reasoning <= output, every Gemini/Google-provider call that reports "
+                  "reasoning tokens is conservatively left unpriced (token counts kept). For other "
+                  "providers, a call with reasoning > output is unpriced; otherwise reasoning is "
+                  "assumed to be included in the reported output.")
+    lines.append("- Earlier versions of this report also showed a company fixed per-request charge "
+                  "(request-pricing.json). That section is no longer part of the default report; the "
+                  "config file and recorded model+effort data are preserved but unused.")
     lines.append("- If an OTEL file is truncated/rewound (rare), the gap is skipped with a "
                   "warning rather than being silently lost forever or risking a double count.")
     lines.append("")
@@ -2499,6 +3896,13 @@ def cmd_ingest(args):
     session_dir = args.session_dir or os.path.join(SESSION_STATE_DIR, session_id)
     events_path = os.path.join(session_dir, "events.jsonl")
 
+    # Refresh the official pricing cache (at most once per command, only if
+    # due, bounded) BEFORE taking the ingest lock, so a slow network never
+    # holds up other copilot-s ingests. The snapshot read right after is the
+    # one that prices this command's calls.
+    refresh_official_pricing_if_due()
+    pricing_ctx = load_official_pricing_context()
+
     with ingest_lock():
         state = load_json(STATE_FILE, {})
         sess_state = state.setdefault(session_id, {})
@@ -2516,7 +3920,7 @@ def cmd_ingest(args):
         # independent lifecycles: build_delta seeds/reads each of them on
         # its own, so a not-yet-existing events.jsonl never suppresses OTEL
         # ingestion (and vice versa) — see build_delta's docstring/comments.
-        delta = build_delta(session_id, sess_state, events_path)
+        delta = build_delta(session_id, sess_state, events_path, pricing_ctx=pricing_ctx)
 
         if (
             delta["model_calls"] == 0
@@ -2571,6 +3975,9 @@ def cmd_report(args):
     if task is None:
         print("No recorded usage for task '%s' yet." % task_id, file=sys.stderr)
         return 1
+    # Keeps the cache status shown in the report current. Recorded cost
+    # estimates are never recomputed from the refreshed rates.
+    refresh_official_pricing_if_due()
     md = render_markdown(task)
     with ingest_lock():
         atomic_write(report_path(task_id), md)

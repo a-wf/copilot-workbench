@@ -53,6 +53,10 @@ class BaseHomeTestCase(unittest.TestCase):
     def env(self, extra=None):
         e = dict(os.environ)
         e["HOME"] = self.home
+        # Any real task-report helper reached by a shell subprocess must
+        # remain network-free, even if the ambient environment enables
+        # automatic official-price refreshes.
+        e["COPILOT_TASK_REPORT_PRICING_FETCH"] = "0"
         # Never let a real Copilot CLI be found/launched from these tests.
         e["PATH"] = "/usr/bin:/bin"
         if extra:

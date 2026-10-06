@@ -145,6 +145,22 @@ EXPECTED_ROUTING = {
             "context_tier": "default",
         },
     },
+    "routing_approval": {
+        "required_tiers": ["standard", "complex", "high-risk"],
+        "required_for_broad_discovery_or_design_planning": True,
+        "allowed_preapproval_work": "minimal_reads_for_classification",
+        "prompt_choices": [
+            "approve_recommended_delegation",
+            "main_session_alternative",
+            "custom_routing",
+        ],
+        "approval_authorizes": "routing_only",
+        "require_renewed_approval_for_significant_route_changes": True,
+        "cancellation_or_decline": "stop_without_substantive_work",
+        "if_ask_user_unavailable": (
+            "pause_and_request_plain_text_approval_if_runtime_supports"
+        ),
+    },
 }
 
 
@@ -183,12 +199,17 @@ def parse_agent_routing(path):
     The project avoids a PyYAML dependency for tests. This parser is
     deliberately limited to the exact repository-owned format:
     root section -> route name -> scalar fields + optional one-line
-    copilot map.
+    copilot map, plus typed scalar/list fields in `routing_approval`.
     """
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
 
-    result = {"agents": {}, "built_in_tools": {}, "task_routing": {}}
+    result = {
+        "agents": {},
+        "built_in_tools": {},
+        "task_routing": {},
+        "routing_approval": {},
+    }
     current_section = None
     current_route = None
     for raw_line in content.splitlines():
@@ -196,8 +217,35 @@ def parse_agent_routing(path):
         section_match = re.match(r"^([a-z_]+):$", line)
         if section_match:
             section = section_match.group(1)
-            current_section = section if section in result else None
+            if section not in result:
+                raise AssertionError(f"unexpected routing section: {section}")
+            current_section = section
             current_route = None
+            continue
+        if (
+            line
+            and not line.startswith((" ", "#"))
+            and ":" in line
+        ):
+            raise AssertionError(f"unexpected top-level routing entry: {line}")
+        if current_section == "routing_approval":
+            approval_match = re.match(r"^  ([a-z_]+): (.+)$", line)
+            if approval_match:
+                key, value = approval_match.groups()
+                if value == "true":
+                    parsed_value = True
+                elif value == "false":
+                    parsed_value = False
+                elif value.startswith("[") and value.endswith("]"):
+                    items = value[1:-1].strip()
+                    parsed_value = (
+                        [item.strip() for item in items.split(",")]
+                        if items
+                        else []
+                    )
+                else:
+                    parsed_value = value
+                result[current_section][key] = parsed_value
             continue
         route_match = re.match(r"^  ([a-z][a-z_-]*):$", line)
         if route_match:
@@ -259,7 +307,8 @@ class TestAgentInventory(unittest.TestCase):
         routing = parse_agent_routing(ROUTING_CONFIG)
 
         self.assertEqual(
-            set(routing), {"agents", "built_in_tools", "task_routing"}
+            set(routing),
+            {"agents", "built_in_tools", "task_routing", "routing_approval"},
         )
         self.assertEqual(set(routing["agents"]), set(EXPECTED_AGENTS))
         self.assertEqual(len(EXPECTED_AGENTS), 7)
@@ -381,6 +430,126 @@ class TestAgentInventory(unittest.TestCase):
                     expected["reasoningEffort"],
                 )
 
+    def test_routing_approval_config_has_typed_values(self):
+        approval = parse_agent_routing(ROUTING_CONFIG)["routing_approval"]
+
+        for key in (
+            "required_for_broad_discovery_or_design_planning",
+            "require_renewed_approval_for_significant_route_changes",
+        ):
+            with self.subTest(boolean=key):
+                self.assertIs(type(approval[key]), bool)
+
+        for key in (
+            "allowed_preapproval_work",
+            "approval_authorizes",
+            "cancellation_or_decline",
+            "if_ask_user_unavailable",
+        ):
+            with self.subTest(scalar=key):
+                self.assertIs(type(approval[key]), str)
+
+        for key in ("required_tiers", "prompt_choices"):
+            with self.subTest(list=key):
+                self.assertIs(type(approval[key]), list)
+                self.assertTrue(all(type(item) is str for item in approval[key]))
+
+    def test_routing_approval_instructions_match_config_scope_and_exceptions(self):
+        with open(ORCHESTRATOR_INSTRUCTIONS, "r", encoding="utf-8") as f:
+            instructions = " ".join(f.read().split()).lower().replace("*", "")
+
+        required_phrases = (
+            "for standard, complex, and high-risk tasks",
+            "broad discovery or design planning regardless of tier",
+            "preliminary minimal reads needed to classify the request are allowed",
+            "before substantive work",
+            "do not use this gate for simple questions or routine small/casual implementation work",
+            "keeps its automatic `coder` route",
+            "ask_user",
+            "approve recommended delegation",
+            "main-session alternative",
+            "custom routing",
+            "wait for explicit approval before continuing",
+            "cancellation means no work",
+            "a decline is not consent",
+            "routing approval authorizes only the approved stages, ownership, and model route",
+            "distinct from plan-mode approval",
+            "does not authorize code edits, tests, commits, pushes",
+            "do not start implementation until any required plan approval is also given",
+            "obtain renewed routing approval",
+            "routine file reads and bounded fixes/retests performed by already-approved roles do not require repeated approval",
+            "honor a user's explicit authorization of the exact route without asking redundantly",
+            "auto dynamically selected; underlying model not identified",
+            "if `ask_user` is unavailable, pause and request plain-text approval",
+        )
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(
+                    phrase,
+                    instructions,
+                    f"missing routing approval instruction: {phrase}",
+                )
+
+        approval = EXPECTED_ROUTING["routing_approval"]
+        self.assertEqual(
+            approval["required_tiers"], ["standard", "complex", "high-risk"]
+        )
+        self.assertTrue(
+            approval["required_for_broad_discovery_or_design_planning"]
+        )
+        self.assertEqual(
+            approval["allowed_preapproval_work"],
+            "minimal_reads_for_classification",
+        )
+        self.assertEqual(
+            approval["prompt_choices"],
+            [
+                "approve_recommended_delegation",
+                "main_session_alternative",
+                "custom_routing",
+            ],
+        )
+        self.assertEqual(approval["approval_authorizes"], "routing_only")
+        self.assertTrue(
+            approval["require_renewed_approval_for_significant_route_changes"]
+        )
+        self.assertEqual(
+            approval["cancellation_or_decline"],
+            "stop_without_substantive_work",
+        )
+
+    def test_readme_and_architecture_document_approval_defaults(self):
+        for relative_path in ("README.md", os.path.join("docs", "architecture.md")):
+            with self.subTest(document=relative_path):
+                with open(
+                    os.path.join(REPO_ROOT, relative_path),
+                    "r",
+                    encoding="utf-8",
+                ) as f:
+                    documentation = " ".join(f.read().split()).lower()
+
+                self.assertTrue(
+                    "standard, complex, and high-risk" in documentation
+                    or "standard/complex/high-risk" in documentation
+                )
+                self.assertTrue(
+                    "broad discovery or design planning" in documentation
+                    or "broad discovery/design planning" in documentation
+                )
+                self.assertIn(
+                    "before substantive work",
+                    documentation,
+                    "approval gate must precede substantive work",
+                )
+                self.assertTrue(
+                    "minimal classification reads" in documentation
+                    or "only minimal classification reads" in documentation
+                )
+                self.assertTrue(
+                    "renewed approval" in documentation
+                    or "route changes need renewed approval" in documentation
+                )
+
     def test_discovery_description_is_read_only_and_bounded(self):
         fm = parse_frontmatter(os.path.join(AGENTS_DIR, "discovery.agent.md"))
         description = fm.get("description", "").lower()
@@ -477,6 +646,7 @@ class BaseHomeTestCase(unittest.TestCase):
         "COPILOT_OTEL_FILE_EXPORTER_PATH",
         "COPILOT_OTEL_RUN_TS",
         "COPILOT_S_VERSION",
+        "COPILOT_TASK_REPORT_PRICING_FETCH",
     )
 
     def setUp(self):
@@ -488,6 +658,7 @@ class BaseHomeTestCase(unittest.TestCase):
         for var in self.TOOLKIT_ENV_VARS:
             e.pop(var, None)
         e["HOME"] = self.home
+        e["COPILOT_TASK_REPORT_PRICING_FETCH"] = "0"
         return e
 
     def run_install(self):

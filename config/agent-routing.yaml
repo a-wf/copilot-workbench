@@ -50,3 +50,15 @@ task_routing:
     model: gpt-6-luna
     reasoning_effort: low
     context_tier: default
+
+# User approval is required before substantive work on these routes.
+# This is an orchestrator convention, not a Copilot CLI enforcement feature.
+routing_approval:
+  required_tiers: [standard, complex, high-risk]
+  required_for_broad_discovery_or_design_planning: true
+  allowed_preapproval_work: minimal_reads_for_classification
+  prompt_choices: [approve_recommended_delegation, main_session_alternative, custom_routing]
+  approval_authorizes: routing_only
+  require_renewed_approval_for_significant_route_changes: true
+  cancellation_or_decline: stop_without_substantive_work
+  if_ask_user_unavailable: pause_and_request_plain_text_approval_if_runtime_supports
