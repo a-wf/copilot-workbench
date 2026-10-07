@@ -68,7 +68,7 @@ EXPECTED_AGENTS = {
         "tools": ["*"],
     },
     "reviewer": {
-        "model": "claude-opus-5.5",
+        "model": "claude-sonnet-5.5",
         "reasoningEffort": "high",
         "tools": ["read", "search", "execute"],
     },
@@ -112,7 +112,7 @@ EXPECTED_ROUTING = {
         },
         "reviewer": {
             "role": "Code Review Specialist",
-            "model": "claude-opus-5.5",
+            "model": "claude-sonnet-5.5",
             "reasoning_effort": "high",
             "context_tier": "long_context",
         },
@@ -143,6 +143,30 @@ EXPECTED_ROUTING = {
             "model": "gpt-6-luna",
             "reasoning_effort": "low",
             "context_tier": "default",
+        },
+        "code_review": {
+            "required_after_every_code_change": True,
+            "exempt_change_types": ["pure_prose_docs", "mechanical_git_only"],
+            "default": {
+                "agent": "reviewer",
+                "model": "claude-sonnet-5.5",
+                "reasoning_effort": "high",
+                "context_tier": "long_context",
+            },
+            "stronger_override": {
+                "when": [
+                    "senior_coder_authored",
+                    "complex_or_high_risk",
+                    "implementation_model_unknown",
+                ],
+                "agent": "reviewer",
+                "model": "claude-opus-5.5",
+                "reasoning_effort": "high",
+                "context_tier": "long_context",
+            },
+            "review_budget": (
+                "one_comprehensive_pass_plus_up_to_3_focused_verification_rounds"
+            ),
         },
     },
     "routing_approval": {
@@ -199,7 +223,8 @@ def parse_agent_routing(path):
     The project avoids a PyYAML dependency for tests. This parser is
     deliberately limited to the exact repository-owned format:
     root section -> route name -> scalar fields + optional one-line
-    copilot map, plus typed scalar/list fields in `routing_approval`.
+    copilot map, plus typed scalar/list fields in `routing_approval` and
+    the nested `task_routing.code_review` mapping.
     """
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
@@ -212,6 +237,7 @@ def parse_agent_routing(path):
     }
     current_section = None
     current_route = None
+    current_nested_route = None
     for raw_line in content.splitlines():
         line = raw_line.rstrip()
         section_match = re.match(r"^([a-z_]+):$", line)
@@ -221,6 +247,7 @@ def parse_agent_routing(path):
                 raise AssertionError(f"unexpected routing section: {section}")
             current_section = section
             current_route = None
+            current_nested_route = None
             continue
         if (
             line
@@ -250,8 +277,41 @@ def parse_agent_routing(path):
         route_match = re.match(r"^  ([a-z][a-z_-]*):$", line)
         if route_match:
             current_route = route_match.group(1)
+            current_nested_route = None
             if current_section is not None:
                 result[current_section][current_route] = {}
+            continue
+        if current_section == "task_routing" and current_route is not None:
+            nested_route_match = re.match(r"^    ([a-z][a-z_-]*):$", line)
+            if nested_route_match:
+                current_nested_route = nested_route_match.group(1)
+                result[current_section][current_route][current_nested_route] = {}
+                continue
+
+            direct_field_match = re.match(r"^    ([a-z_]+): (.+)$", line)
+            nested_field_match = re.match(r"^      ([a-z_]+): (.+)$", line)
+            field_match = nested_field_match or direct_field_match
+            if field_match:
+                key, value = field_match.groups()
+                if value == "true":
+                    parsed_value = True
+                elif value == "false":
+                    parsed_value = False
+                elif value.startswith("[") and value.endswith("]"):
+                    items = value[1:-1].strip()
+                    parsed_value = (
+                        [item.strip() for item in items.split(",")]
+                        if items
+                        else []
+                    )
+                else:
+                    parsed_value = value
+                destination = result[current_section][current_route]
+                if nested_field_match and current_nested_route:
+                    destination = destination[current_nested_route]
+                elif direct_field_match:
+                    current_nested_route = None
+                destination[key] = parsed_value
             continue
         if current_section is None or current_route is None:
             continue
@@ -429,6 +489,80 @@ class TestAgentInventory(unittest.TestCase):
                     routing["agents"][name]["reasoning_effort"],
                     expected["reasoningEffort"],
                 )
+
+    def test_code_review_routing_is_mandatory_with_conditional_model_override(self):
+        policy = parse_agent_routing(ROUTING_CONFIG)["task_routing"]["code_review"]
+
+        self.assertIs(type(policy["required_after_every_code_change"]), bool)
+        self.assertTrue(policy["required_after_every_code_change"])
+        self.assertEqual(
+            policy["exempt_change_types"],
+            ["pure_prose_docs", "mechanical_git_only"],
+        )
+        self.assertEqual(
+            policy["default"],
+            {
+                "agent": "reviewer",
+                "model": "claude-sonnet-5.5",
+                "reasoning_effort": "high",
+                "context_tier": "long_context",
+            },
+        )
+        self.assertEqual(
+            policy["stronger_override"],
+            {
+                "when": [
+                    "senior_coder_authored",
+                    "complex_or_high_risk",
+                    "implementation_model_unknown",
+                ],
+                "agent": "reviewer",
+                "model": "claude-opus-5.5",
+                "reasoning_effort": "high",
+                "context_tier": "long_context",
+            },
+        )
+        self.assertEqual(
+            policy["review_budget"],
+            "one_comprehensive_pass_plus_up_to_3_focused_verification_rounds",
+        )
+
+    def test_review_instructions_cover_small_and_main_authored_code_batches(self):
+        with open(ORCHESTRATOR_INSTRUCTIONS, "r", encoding="utf-8") as f:
+            instructions = f.read()
+
+        reviewer_section = instructions.split("### 4. `reviewer`", 1)[1].split(
+            "### 5. `tester`", 1
+        )[0]
+        reviewer_section = " ".join(reviewer_section.split()).casefold()
+        required_phrases = (
+            "after every coherent source/code modification batch",
+            "regardless of tier or whether the main session or an agent authored it",
+            "tests (including tester-authored tests)",
+            "executable or behavior-affecting configuration",
+            "no-executable-behavior is not an exemption for tests or configuration",
+            "review each coherent batch, not each individual edit",
+            "pure prose/docs and mechanical git-only operations are normally exempt",
+            "default to `claude-sonnet-5.5` at high effort and long context",
+            "`claude-opus-5.5` high/long-context route for senior-coder-authored, complex/high-risk, or unknown implementation-model work",
+            "one comprehensive review",
+            "up to 3 focused verification rounds",
+            "not a reset of the four-call budget",
+            "if `tester` adds or edits tests after that review",
+            "bounded focused verification cycle",
+            "if that budget is exhausted while newly authored code remains unchecked, stop and escalate; do not approve it",
+        )
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, reviewer_section)
+
+        task_matrix = instructions.split("## Task tiers and stage-selection matrix", 1)[
+            1
+        ].split("## Stage-by-stage rules", 1)[0]
+        small_tier = next(
+            line for line in task_matrix.splitlines() if line.startswith("| **Small**")
+        )
+        self.assertIn("✅ for every code change", small_tier)
 
     def test_routing_approval_config_has_typed_values(self):
         approval = parse_agent_routing(ROUTING_CONFIG)["routing_approval"]

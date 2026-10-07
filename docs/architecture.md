@@ -215,8 +215,13 @@ never touches these files — they live independently of session storage.
 `instructions/copilot-instructions.md` is the orchestrator: loaded
 automatically in every Copilot CLI session, it defines task tiers
 (trivial/small/standard/complex/high-risk) and a stage-selection matrix
-that picks which of the 7 roles run for a given task. Every stage is
-optional, and skips are briefly disclosed to the user. Before substantive
+that picks which of the 7 roles run for a given task. Code review is
+mandatory for every source/code modification batch: production source,
+tests (including tester-authored tests), scripts, Storybook stories, and
+executable or behavior-affecting configuration, even when no executable
+behavior is added. Pure prose/docs and mechanical git-only operations
+are normally exempt. Other stages remain
+conditional, and skips are briefly disclosed to the user. Before substantive
 work on standard/complex/high-risk tasks, or any broad discovery/design
 planning at any tier, the instructions require explicit approval of the
 proposed route: the stages and configured routing values, all skipped
@@ -226,12 +231,22 @@ allowed beforehand. Cancellation or decline stops work. Routing approval
 does not authorize implementation, plan-mode execution, tests, or commits;
 significant route changes require renewed approval. This is an
 orchestrator instruction, not deterministic CLI enforcement. Small/casual
-implementation retains its automatic coder route, and simple questions
-remain direct. There is no
+implementation retains its automatic coder route, followed by review for
+code changes; simple questions remain direct. There is no
 `fixer` role: `coder`/`senior-coder` apply their own targeted fixes,
 always at the same tier that did the original implementation, so a
 review or test failure never restarts work from scratch at a different
-tier.
+tier. Findings return to the original implementer (`coder`,
+`senior-coder`, or the main session when it authored the change), while
+the main session must not review its own changes. Tester-authored test
+defects return to `tester`; production-code defects return to the
+original production-code author. A tester adding/editing tests after the
+broad review triggers bounded focused verification of those newly changed
+tests alongside prior findings and regressions, within the same four-call
+total — not a redundant broad review or budget reset. If the budget is
+exhausted with code unchecked, work stops for escalation. The
+`test-reviewer` remains a test-coverage/quality gate and does not replace
+correctness review of tester-authored code.
 
 The bounded flow is: `discovery` (read-only, broad/unfamiliar context
 only) and `planner` (ambiguity/design only, consumes discovery's output
@@ -239,9 +254,13 @@ instead of re-exploring) feed `coder` (routine CRUD/UI/standard logic;
 writes and fixes production code only) or `senior-coder` (multi-file
 architecture, async state, schema/data-model changes, deep structural
 bugs, new services; writes and fixes production code only). `reviewer`
-does one comprehensive pass, then at most 3 focused verification rounds
-checking only prior findings and regressions — never a second broad
-review — before escalating to the user. `tester` only runs when behavior
+uses Sonnet 5.5 high/long-context by default for routine code changes and
+Opus 5.5 high/long-context for senior-coder-authored, complex/high-risk,
+or unknown-implementation-model changes. It does one comprehensive pass,
+then at most 3 focused verification rounds checking prior findings,
+regressions, and any newly changed tester-authored code, all within the
+same four-invocation total — never a second broad review or budget reset —
+before escalating to the user. `tester` only runs when behavior
 merits testing, in a test/fix loop capped at 3 rounds before escalating;
 it writes and runs tests only and never fixes production code itself.
 `test-reviewer` only engages for complex/high-risk tasks, with the same

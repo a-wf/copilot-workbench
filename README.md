@@ -4,8 +4,10 @@ Personal-workflow tooling for the [GitHub Copilot CLI](https://github.com/github
 a session manager with automatic per-task usage/cost reporting, and a
 7-role multi-agent implementation pipeline (discovery/planner → coder/
 senior-coder → reviewer → tester → test-reviewer) with cost-aware, bounded
-routing — every stage is optional, and each is scoped to avoid duplicated
-work.
+routing — all source/code changes (production source, tests including
+tester-authored tests, scripts, Storybook stories, and executable or
+behavior-affecting configuration) receive independent review;
+discovery, planning, and testing remain conditional.
 
 Both pieces are independent — use the session manager without the agent
 pipeline, or vice versa.
@@ -24,7 +26,10 @@ Copilot's `/model auto` setting and this toolkit solve different problems.
 Auto mode lets Copilot dynamically choose a model for the current work.
 This toolkit adds workflow policy *around* Copilot: session management,
 task-level reporting, custom roles, explicit model defaults, bounded loops,
-and rules for skipping unnecessary stages.
+and conditional stage routing with mandatory independent review for
+source/code changes, including tests and behavior-affecting configuration
+even when they add no executable behavior. Pure prose/documentation and
+mechanical git-only operations are normally exempt.
 
 The toolkit is **not automatically better, smarter, or more reliable than
 Auto mode**. Auto is maintained by GitHub and can adapt as models and routing
@@ -34,8 +39,8 @@ and accept the maintenance and orchestration overhead that comes with it.
 | Area | Copilot Auto mode | This toolkit |
 |---|---|---|
 | Model selection | Copilot chooses dynamically based on the current request | Each custom role has a visible default model, with personal overrides available through `/subagents` |
-| Workflow | Flexible; Copilot decides whether and how to delegate | A documented task-tier policy decides which roles should run or be skipped |
-| Cost control | Relies mainly on Copilot's automatic routing and account limits | Uses cheaper routine roles, expensive models only at selected gates, stage skipping, and bounded review/test loops |
+| Workflow | Flexible; Copilot decides whether and how to delegate | A documented task-tier policy decides which roles run; all source/code changes, including tests and behavior-affecting configuration, receive independent review |
+| Cost control | Relies mainly on Copilot's automatic routing and account limits | Uses cheaper routine roles, tiered reviewer routing, conditional stages, and bounded review/test loops |
 | Role separation | May handle planning, implementation, review, and testing in one session | Separates discovery, planning, production coding, review, and testing into narrowly-scoped roles |
 | Repeatability | Routing may change as Auto evolves or as prompts differ | Agent files and instructions are inspectable, version-controlled defaults |
 | Session management | Uses Copilot CLI's native session commands | Adds a global cross-directory session list, bulk deletion, naming, and exit-time keep/rename/delete prompts |
@@ -82,10 +87,10 @@ direct.
   your current git branch (or a free-form task name/ID you provide).
 - **7-role agent pipeline** — `discovery`, `planner`, `coder`,
   `senior-coder`, `reviewer`, `tester`, `test-reviewer`, wired together by
-  an orchestrator with explicit task tiers so trivial/small tasks skip
-  straight to the right implementer while complex/high-risk work gets
-  discovery, planning, review, and testing — with every stage optional and
-  bounded to avoid duplicated, token-burning work.
+  an orchestrator with explicit task tiers; all source/code changes,
+  including tests, scripts, stories, and behavior-affecting configuration,
+  get independent bounded review while discovery, planning, and testing
+  remain conditional to avoid duplicated, token-burning work.
 - **Official GitHub per-token pricing, refreshed automatically** — the
   estimated USD cost uses GitHub's published
   [Copilot models and pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
@@ -378,7 +383,7 @@ documented tradeoffs.
 | `planner` | Turns an ambiguous/design-heavy task into an ordered implementation plan, consuming discovery's output instead of re-exploring | `gpt-6.1-sol` (effort: `medium`) |
 | `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `gpt-6-luna` (effort: `xhigh`) |
 | `senior-coder` | Complex implementation and targeted fixes: multi-file architecture, async state, schema/data-model changes, deep structural bugs, new services | `claude-opus-5.5` (effort: `high`) |
-| `reviewer` | One comprehensive review, then up to 3 bounded focused-verification rounds on prior findings/regressions only; never rewrites | `claude-opus-5.5` (effort: `high`) |
+| `reviewer` | One comprehensive review, then up to 3 bounded focused-verification rounds on prior findings/regressions only; never rewrites | `claude-sonnet-5.5` (effort: `high`; Opus for stronger override) |
 | `tester` | Writes and runs tests, only when behavior merits it; bounded test/fix loop (max 3 rounds) | `gpt-6-luna` (effort: `xhigh`) |
 | `test-reviewer` | Complex/high-risk-only quality gate on test coverage/trust, same bounded verification discipline as `reviewer` | `claude-opus-5.5` (effort: `high`) |
 
@@ -409,16 +414,25 @@ route: use the `task` tool to invoke the named custom agent `coder` (not
 the built-in `task` shell executor), with `gpt-6-luna`, low reasoning
 effort, and default context. The main session scopes and coordinates the
 work and retains oversight. `coder` implements only and does not test or
-review its own changes; invoke `reviewer` and/or `tester` only when risk
-or behavior warrants it. Answer simple informational questions directly.
+review its own changes; every code batch receives an independent reviewer
+pass, while tester remains conditional on behavior. Pure prose/docs and
+mechanical git-only changes are exempt. Answer simple informational
+questions directly.
 Routine shell/mechanical work remains routed to the built-in `task`.
 
-Model choices follow a cost/capability tiering (start cheap for routine
-work, step up for design/routing, reserve the top tier for hard problems):
+Model choices follow a provisional cost/capability tiering (start cheap for routine
+work, step up for design/routing and higher-scrutiny review):
 `gpt-6-luna` is the cheapest/fastest tier for well-scoped implementation,
 test-writing, and bounded mechanical task execution; `gpt-6.1-sol` is a
-mid tier for planning/routing decisions, and `claude-opus-5.5` is the top
-tier reserved for complex implementation and high-scrutiny review.
+mid tier for planning/routing decisions, and `claude-opus-5.5` is reserved
+for complex implementation and the stronger reviewer override. Routine
+coder/GPT-6 Luna code changes use `claude-sonnet-5.5` at high effort and
+long context for review; senior-coder-authored, complex/high-risk, or
+unknown-implementation-model changes use Opus at high/long-context.
+This recommendation is not a code-review benchmark or evidence of
+superior defect detection. The reviewer role links to the dated Artificial
+Analysis model pages and GitHub's official per-token pricing; actual cost
+varies with tokens, cache use, and verbosity.
 `discovery` keeps
 `gemini-3.8-flash` regardless of this tiering, since its value is a large
 context window for mapping broad codebases, not raw task-solving
@@ -450,10 +464,15 @@ models are assigned either way.
 
 The orchestrator (`instructions/copilot-instructions.md`, auto-loaded every
 session) selects stages by task tier (trivial/small/standard/complex/
-high-risk) and enforces bounded review/fix and test/fix loops. Every stage
-is optional — trivial one-line changes can skip straight to `coder` with no
-discovery, planning, review, or tests, while only complex/high-risk work
-pulls in discovery, `senior-coder`, and `test-reviewer`. There is no
+high-risk) and enforces bounded review/fix and test/fix loops. Discovery,
+planning, and testing are conditional, but every source/code change batch
+gets independent review: production source, tests (including
+tester-authored tests), scripts, Storybook stories, and executable or
+behavior-affecting configuration. This requirement applies even if a
+test or configuration change adds no executable behavior. Pure
+prose/docs and mechanical git-only operations are normally exempt. Small code changes therefore include a reviewer
+stage. Only complex/high-risk work typically pulls in discovery,
+`senior-coder`, and `test-reviewer`. There is no
 `fixer` agent: `coder`/`senior-coder` handle their own targeted fixes at
 whichever tier originally implemented the code, so there's no hand-off
 duplication.

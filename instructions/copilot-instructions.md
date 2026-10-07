@@ -1,12 +1,17 @@
 # Multi-agent implementation pipeline
 
 This toolkit ships 7 custom agents: `planner`, `discovery`, `coder`,
-`senior-coder`, `reviewer`, `tester`, `test-reviewer`. Every stage is
-**optional** — the goal is to spend the fewest tokens/dollars that still
-get the task done correctly, not to run every stage on every task. Use the
-task tiers and routing rules below to decide what to invoke, invoke only
-those agents, and briefly tell the user which stages you skipped and why
-so it's never silent.
+`senior-coder`, `reviewer`, `tester`, `test-reviewer`. Most stages are
+conditional, but every source/code modification batch requires an
+independent `reviewer` pass, including production source, tests (including
+tester-authored tests), scripts, Storybook stories, and executable or
+behavior-affecting configuration changes. This applies even when a change
+does not add executable behavior, such as a test or configuration change.
+Pure prose/documentation changes (including agent instructions) and
+mechanical git-only operations are normally exempt unless the user
+explicitly asks for a review.
+Use the task tiers and routing rules below and briefly tell the user which
+optional stages were skipped.
 
 ## Mandatory stage communication
 
@@ -26,10 +31,11 @@ Before starting substantive work, send one concise routing update that:
 Example of the initial routing update, followed by a separate approval
 request when the gate above applies:
 
-> Small instruction-only change. Recommended route: coder
+> Small pure-prose instruction change. Recommended route: coder
 > (`gpt-6-luna`, low, default). Skipping discovery/planner because the
 > target and approach are explicit; skipping reviewer/tester/test-reviewer
-> because there is no executable behavior.
+> because this is a pure-prose change (not code, tests, scripts, stories,
+> or behavior-affecting configuration).
 
 If a skip decision is made later rather than during initial routing
 (for example, tests become unnecessary after inspection), communicate it
@@ -110,7 +116,8 @@ for this task, follow the user's override and mention the deviation.
 | `planner` | `gpt-6.1-sol` | `medium` | `long_context` |
 | `coder` | `gpt-6-luna` | `xhigh` | `default` |
 | `senior-coder` | `claude-opus-5.5` | `high` | `long_context` |
-| `reviewer` | `claude-opus-5.5` | `high` | `long_context` |
+| `reviewer` default | `claude-sonnet-5.5` | `high` | `long_context` |
+| `reviewer` stronger override | `claude-opus-5.5` | `high` | `long_context` |
 | `tester` | `gpt-6-luna` | `xhigh` | `default` |
 | `test-reviewer` | `claude-opus-5.5` | `high` | `long_context` |
 
@@ -138,9 +145,9 @@ using the `task` tool to invoke the named custom agent `coder`, passing
 not a route to the built-in `task` shell executor. The main session defines
 the scope, coordinates the work, and retains oversight of the result.
 `coder` implements only; it does not test or review its own changes.
-Depending on risk and behavior, the main session may additionally invoke
-`reviewer` and/or `tester` when warranted, but neither is required for
-every small implementation.
+Every code batch then receives independent review; only pure prose/docs
+and mechanical git-only changes are exempt. Invoke `tester` only when
+behavior warrants testing.
 
 Simple informational questions should be answered directly in the main
 session. Routine shell/git and other mechanical command execution remains
@@ -184,8 +191,13 @@ stage already did:
   the built-in `task` subagent using the route above. The main session
   initiates that delegation and retains oversight; `task` executes only
   the assigned operation and does not delegate further.
-- `reviewer` does one broad review, then only narrow, bounded
-  verification of what came back — never a second broad pass.
+- `reviewer` reviews the complete coherent source/code batch, including
+  tests added or edited by `tester`. Prefer a comprehensive review after
+  the code and test batch is available. If tester-authored code arrives
+  after the broad review, inspect those new changes in a bounded focused
+  verification cycle; do not restart a broad review or reset the 4-call
+  budget. If the budget is exhausted with new code unchecked, stop and
+  escalate rather than approving it.
 - `tester` tests; it never fixes implementation bugs itself.
 - `test-reviewer` checks test quality only, on complex/high-risk tasks
   only; it never writes/runs tests or implements.
@@ -202,9 +214,9 @@ when the specifics warrant it, but state the deviation to the user.
 
 | Tier | Examples | discovery | planner | coder | senior-coder | reviewer | tester | test-reviewer |
 |---|---|---|---|---|---|---|---|---|
-| **Trivial** | typo/docs/comment fix, one-line config/copy change, formatting-only diff | skip | skip | ✅ | escalation only | skip | skip | skip |
-| **Small** | small well-scoped change in familiar code, obvious approach, no meaningful behavior to test | skip | skip | ✅ | escalation only | skip (implementer may note its own confidence/limitations, but does not review/approve) | skip unless behavior changed | skip |
-| **Standard** | routine feature/bug fix, familiar codebase area, CRUD/UI/standard logic, clear approach | skip unless area is unfamiliar | skip if approach is obvious, else ✅ | ✅ | escalation only | ✅ (one pass) if risk/behavior warrants it or it isn't directly verifiable by inspection; otherwise skip | ✅ if behavior changed | skip |
+| **Trivial** | typo/docs/comment fix, non-behavior-affecting config/copy change, formatting-only diff | skip | skip | ✅ | escalation only | ✅ for all source/code changes (including tests and configuration); exempt pure prose/docs and mechanical git-only | skip | skip |
+| **Small** | small well-scoped change in familiar code, obvious approach, no meaningful behavior to test | skip | skip | ✅ | escalation only | ✅ for every code change | skip unless behavior changed | skip |
+| **Standard** | routine feature/bug fix, familiar codebase area, CRUD/UI/standard logic, clear approach | skip unless area is unfamiliar | skip if approach is obvious, else ✅ | ✅ | escalation only | ✅ (one pass) for every code change | ✅ if behavior changed | skip |
 | **Complex** | multi-file architecture, async/state management, schema/data-model changes, deep structural bug, new service | ✅ if area is broad/unfamiliar | ✅ | — | ✅ | ✅ (one pass + up to 3 verification rounds) | ✅ | recommended |
 | **High-risk** | security-sensitive, shared/critical logic, hard-to-verify correctness by inspection alone | ✅ if area is broad/unfamiliar | ✅ | — | ✅ | ✅ (one pass + up to 3 verification rounds) | ✅ | ✅ |
 
@@ -247,7 +259,8 @@ routing hint when one exists:
   production code only — standard CRUD operations, UI changes,
   straightforward business logic, well-scoped bug fixes in a single area,
   and targeted fixes for `reviewer`/`tester` findings on coder-authored
-  work. It does not write or run tests.
+  work, and production-code findings on tester-authored work (back to the
+  original production-code author). It does not write or run tests.
 - **Route to `senior-coder`** (complex, higher-cost model): writes and
   fixes production code only — multi-file architectural changes,
   async/state-machine work, schema or data-model changes, deep structural
@@ -255,6 +268,14 @@ routing hint when one exists:
   senior-coder-authored work (or fixes that themselves need this scope,
   even if the original implementation was `coder`'s). It does not write
   or run tests.
+
+Review findings return to the original implementer (`coder`,
+`senior-coder`, or the main session when it authored the change); the main
+session must not review its own changes. Defects in tester-authored tests
+go back to `tester`, while production-code defects identified during
+testing go back to the original production-code author. `test-reviewer`
+remains a coverage/quality gate only and does not replace the mandatory
+correctness review of tester-authored code.
 
 An implementer that discovers mid-task its work actually needs the other
 tier's scope should stop and escalate with the current diff/context
@@ -266,30 +287,47 @@ obvious limitations alongside the diff for the next stage to weigh.
 
 ### 4. `reviewer` — one broad pass + up to 3 focused verification rounds (max 4 invocations)
 
-Invoke `reviewer` for standard tier and above once the implementer is
-done. For small/trivial tiers there is no reviewer stage at all — the
-implementer may note its own confidence/limitations, but that is not a
-review or approval, and `reviewer` is simply skipped, not replaced.
+Invoke `reviewer` after every coherent source/code modification batch,
+regardless of tier or whether the main session or an agent authored it.
+This includes production source, tests (including tester-authored tests),
+scripts, Storybook stories, and executable or behavior-affecting
+configuration; no-executable-behavior is not an exemption for tests or
+configuration. Review each coherent batch, not each individual edit.
+Pure prose/docs and mechanical git-only operations are normally exempt.
+Default to
+`claude-sonnet-5.5` at high effort and long context for routine coder/GPT-6
+Luna work and other known routine implementations. Use the stronger
+`claude-opus-5.5` high/long-context route for senior-coder-authored,
+complex/high-risk, or unknown implementation-model work. Apply this
+convention to the reviewer task call; it is not native CLI config.
 
-`reviewer` uses `claude-opus-5` by explicit user selection: it's the most
-expensive model in the pipeline, so it's deliberately gated rather than
-run out of habit. It is skipped entirely for trivial/small tiers, and for
-standard-tier work it only runs when risk or behavior genuinely warrants
-it — skip it for standard-tier changes that are directly verifiable by
-inspection. Complex and high-risk tiers always get a review pass; that
-cost is justified there.
+Reviewer scope explicitly includes defensive correctness edge cases
+(including whitespace-only accessibility labels, input validation,
+TypeScript narrowing/build mismatches, and Storybook control-to-prop
+boundaries), not only business logic, architecture, or Figma alignment.
+This is high-confidence review, not a guarantee of catching all bugs.
+The model choice is a provisional cost/capability recommendation, not
+benchmark evidence or a claim of superior defect detection. See the
+reviewer role for dated model/pricing references.
 
-When it does run, `reviewer` performs exactly one comprehensive review
+Per task, reviewer performs exactly one comprehensive review
 (invocation 1 of up to 4), then:
 
 - If it finds issues, send them to the same tier that implemented the
-  change (`coder` or `senior-coder`), then return to `reviewer` for
-  **focused verification** — checking only whether those specific
-  findings were resolved and whether the fix introduced a regression in
-  the same area. This is not a new broad review and must not surface new,
-  unrelated findings.
+  change (`coder`, `senior-coder`, or the main session when it authored
+  the change; the main session must not review its own changes), then return to `reviewer` for
+  **focused verification** — checking whether those specific findings
+  were resolved, whether the fix introduced a regression in the same
+  area, and any bounded tester-authored code added since the broad review.
+  This is not a new broad review and must not surface unrelated findings.
 - Repeat focused verification for up to 3 more rounds (invocations 2–4
   total, i.e. 1 broad review + up to 3 verification rounds).
+- Prefer having the complete code-and-test batch available for the broad
+  review. If `tester` adds or edits tests after that review, inspect those
+  new test changes before completion using a bounded focused verification
+  cycle, not a redundant broad review and not a reset of the four-call
+  budget. If that budget is exhausted while newly authored code remains
+  unchecked, stop and escalate; do not approve it.
 - If issues remain unresolved after the 3rd verification round, stop
   looping and escalate to the user with a clear summary instead of
   continuing indefinitely.
@@ -322,16 +360,18 @@ verification rounds on whatever gaps/fixes came back (never a fresh broad
 review), then escalate to the user if unresolved after round 3.
 
 - Missing coverage goes back to `tester`.
-- An actual implementation bug goes back to whichever tier implemented the
-  change.
+- A defect in a tester-authored test goes back to `tester`; a production
+  code defect goes back to the original production-code author. The main
+  session must not review its own changes.
 
 Only after `test-reviewer` approves (or, for tasks that skip it, after
 `tester`/`reviewer` approve) is the task considered complete.
 
 ## Rules
 
-- Every stage is optional — skip freely when the tier/matrix above says
-  to, but follow the mandatory stage-communication contract above: report
+- Conditional stages may be skipped when the tier/matrix above says to,
+  but code review is mandatory for each source/code batch; follow the mandatory
+  stage-communication contract above: report
   skips before work starts, report later skip decisions at the transition,
   and include the compact final `Stages:` record.
 - Apply the mandatory pre-work routing-approval gate above to standard,

@@ -29,7 +29,7 @@ agents:
     copilot: { model: claude-opus-5.5, reasoning_effort: high, context_tier: long_context }
   reviewer:
     role: Code Review Specialist
-    copilot: { model: claude-opus-5.5, reasoning_effort: high, context_tier: long_context }
+    copilot: { model: claude-sonnet-5.5, reasoning_effort: high, context_tier: long_context }
   tester:
     role: Test Engineer
     copilot: { model: gpt-6-luna, reasoning_effort: xhigh, context_tier: default }
@@ -50,6 +50,22 @@ task_routing:
     model: gpt-6-luna
     reasoning_effort: low
     context_tier: default
+  code_review:
+    # Toolkit orchestration convention; not native Copilot CLI routing config.
+    required_after_every_code_change: true
+    exempt_change_types: [pure_prose_docs, mechanical_git_only]
+    default:
+      agent: reviewer
+      model: claude-sonnet-5.5
+      reasoning_effort: high
+      context_tier: long_context
+    stronger_override:
+      when: [senior_coder_authored, complex_or_high_risk, implementation_model_unknown]
+      agent: reviewer
+      model: claude-opus-5.5
+      reasoning_effort: high
+      context_tier: long_context
+    review_budget: one_comprehensive_pass_plus_up_to_3_focused_verification_rounds
 
 # User approval is required before substantive work on these routes.
 # This is an orchestrator convention, not a Copilot CLI enforcement feature.

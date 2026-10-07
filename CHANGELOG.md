@@ -6,6 +6,38 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — independent review for every code change
+
+- Require one independent reviewer pass for every coherent source/code
+  modification batch, including production source, tests (including
+  tester-authored tests), scripts, Storybook stories, and executable or
+  behavior-affecting configuration, even when no executable behavior is
+  added. Pure prose/documentation and mechanical git-only operations are
+  normally exempt. Prefer review after the full code-and-test batch is
+  available; later tester-authored code requires bounded focused
+  verification, not a redundant broad review or budget reset. If the
+  four-call budget is exhausted with new code unchecked, stop and
+  escalate. Route findings to the original implementer; tester-authored
+  test defects return to tester, while production-code defects return to
+  the original production author. Keep the review budget at one
+  comprehensive pass plus at most three focused verification rounds;
+  preserve existing routing approval requirements.
+- Default routine coder/GPT-6 Luna changes to Claude Sonnet 5.5 at high
+  effort/long context; use Opus 5.5 high/long-context for senior-coder
+  authorship, complex/high-risk work, or unknown implementation model.
+  This is a toolkit task-routing convention, not native Copilot CLI
+  configuration. The model recommendation is provisional, not based on
+  code-review benchmark evidence. See the reviewer profile for dated
+  Artificial Analysis Intelligence Index values (general-intelligence
+  scores, not high-effort measurements or code-review benchmarks) and official GitHub token
+  pricing references; actual cost varies with tokens, caching, and output
+  verbosity.
+- Expanded reviewer scope to call out defensive correctness edge cases,
+  including whitespace-only accessibility labels, input validation,
+  TypeScript narrowing/build mismatches, and Storybook control-to-prop
+  boundaries. Review remains high-confidence, not a guarantee of catching
+  all bugs.
+
 ### Changed — approval before substantive routed work
 
 - The orchestrator now requires explicit routing approval before substantive
