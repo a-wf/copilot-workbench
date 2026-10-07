@@ -95,3 +95,11 @@ Output format:
 
 Hand off findings to whichever implementer tier made the change; hand off
 approval to `tester` (if testing is warranted) or mark the task complete.
+
+Work from the orchestrator's compact handoff manifest (task/cycle/batch,
+changed files with authors, test results, unresolved findings). In focused
+rounds, check only the listed files and finding numbers. Do not narrate a
+per-file walkthrough. Stay read-only: never run
+`copilot-task-report.py record-review` or any other write command yourself
+— the main session records your verdict and round from your response, so
+state them exactly as in the output format above.

@@ -367,6 +367,129 @@ review), then escalate to the user if unresolved after round 3.
 Only after `test-reviewer` approves (or, for tasks that skip it, after
 `tester`/`reviewer` approve) is the task considered complete.
 
+## Batched handoff and review records
+
+### Default handoff order
+
+For a code change, the default order is: implement → run the relevant
+tests → **one** comprehensive `reviewer` pass over the entire batch
+(production code, tests, scripts, and behavior-affecting configuration
+together) → `test-reviewer` coverage review when the task is complex or
+high-risk.
+
+- If new or changed tests are needed, `tester` writes and runs them before
+  the broad review. If existing tests already cover the change, skip
+  `tester` and have the built-in `task` route run the chosen existing test
+  command; report the skip at that transition.
+- The independent correctness review by `reviewer` is mandatory for every
+  code batch, whoever authored it. Start the broad review only once the
+  test batch is ready; do not run it in parallel with, or before, the
+  tests it should cover.
+- `test-reviewer` is a coverage/quality gate only; it never substitutes for
+  `reviewer`'s correctness review. If it causes new or edited tests after
+  the broad review, those tests must be re-run (a `tester` fix/retest round)
+  and receive a focused `reviewer` correctness check, both inside the same
+  work-item budgets below — even when `reviewer` had already approved, the
+  check is the next focused round of that cycle, never a new broad review.
+  If either budget is exhausted, stop and escalate; never approve unchecked
+  code.
+- Budgets per work-item cycle: in budget wording throughout these
+  instructions and the agent roles, "per task" means per requested work
+  item — one `cycle_id` — not the whole, possibly multi-week task report.
+  `reviewer` and `test-reviewer` each get 1 broad pass +
+  up to 3 focused rounds (max 4); `tester` gets 1 initial run + up to 3
+  fix/retest rounds (max 4). Fixes, retests and follow-up sessions for the
+  same work item stay in the same cycle. A new session never resets these
+  budgets. Only a later, separately requested work item gets a new cycle,
+  and only when the user confirms it is new; the report tool cannot enforce
+  that distinction.
+
+### Compact handoff manifest
+
+Hand each review/test stage a compact manifest instead of narration or a
+per-file walkthrough:
+
+```text
+Task: ABC-123 | Cycle: abc-123-c1 | Batch: 1 | Requested: reviewer broad (round 0)
+Changed files: bin/tool.py (senior-coder); tests/test_tool.py (tester); config/x.yaml (senior-coder)
+Tests: python3 -m unittest tests.test_tool -> 42 passed
+Unresolved findings: none
+```
+
+Later fix handoffs list only the files changed since the previous round and
+the numbered findings being addressed; they never request a repeat broad
+review.
+
+### Recording review outcomes
+
+`cycle_id` names one requested work item. Use the same cycle id for every
+review round of that work item, even across sessions; a task report may
+contain many cycles. Never start a new cycle id to get a fresh review
+budget. If it is unclear whether work is a new item or a continuation, ask
+the user instead of choosing silently.
+
+After each `reviewer` or `test-reviewer` response, the main session (never
+the reviewer itself — reviewers stay read-only) records the outcome with the
+installed helper (default install prefix shown; adjust for `--prefix`):
+
+```sh
+python3 "$HOME/.local/bin/copilot-task-report.py" record-review --input /tmp/review-abc-123-c1-reviewer-r0.json
+```
+
+where the input file contains exactly:
+
+```json
+{
+  "schema": "copilot-task-report.review-record",
+  "schema_version": 1,
+  "record_id": "abc-123-c1-reviewer-r0",
+  "task_id": "ABC-123",
+  "session_id": "unknown",
+  "cycle_id": "abc-123-c1",
+  "stage": "reviewer",
+  "round": 0,
+  "verdict": "needs-fixes",
+  "invocation_id": "unknown",
+  "invocation_unknown_reason": "task tool result did not expose an agent id",
+  "provenance": {
+    "source": "orchestrator-supplied",
+    "basis": "agent-response",
+    "reference": "reviewer broad review: Verdict Needs fixes, findings #1-#2"
+  }
+}
+```
+
+- `round` is `0` for the broad review and `1`–`3` for focused rounds
+  (the reviewer's "verification round N" is `round` N);
+  `verdict` is `approved`, `needs-fixes`, `escalated`, or `unknown`
+  (reviewer "Approve"/test-reviewer "Ready to ship" → `approved`; "Needs
+  fixes"/"Needs more tests or fixes" → `needs-fixes`; "Escalate to user" →
+  `escalated`; anything unclear → `unknown`).
+  `unknown` never implies success.
+- `task_id` is the task the work belongs to (for example the branch's
+  `ABC-123` key or the task name the user gave); use the literal
+  `UNASSIGNED` when none is known. Records are not moved if the session is
+  later ingested under a different task.
+- Use a real session id or agent invocation id only when you actually have
+  it; otherwise write the literal `"unknown"` (with
+  `invocation_unknown_reason` for the invocation). Never invent or guess an
+  id or an agent linkage.
+- `basis` is `agent-response` when taken from the reviewer's own response,
+  or `user-supplied` when the user gives or approves the outcome manually.
+  Do not auto-extract outcomes from prose you have not read.
+- The command rejects malformed input, unknown fields or versions,
+  conflicting duplicates, a second broad review in the same cycle, rounds
+  out of order or beyond 3, and rounds after `escalated`. `approved` does
+  not close the stage: record a focused check of tests or fixes changed
+  after an approval as the next round of the same cycle (still at most
+  round 3); the latest recorded round is the stage outcome, so a later
+  non-approved round means the work is not complete. Treat
+  a rejection as a signal to fix the record or escalate, never to work
+  around the budget. An identical replay is a harmless no-op.
+- Recording does not regenerate the Markdown report; it appears on the next
+  `report`/ingest. Missing records for historical work are not a compliance
+  failure.
+
 ## Rules
 
 - Conditional stages may be skipped when the tier/matrix above says to,
@@ -387,6 +510,8 @@ Only after `test-reviewer` approves (or, for tasks that skip it, after
   in that case say so explicitly when escalating.
 - Review/fix and test/fix loops are bounded to 3 focused rounds each; stop
   and escalate to the user rather than looping indefinitely.
+- Use the compact handoff manifest for stage handoffs and keep narration
+  short; do not narrate or request per-file reviews.
 - Keep the user informed at each stage transition with a short status
   update (e.g., "Routine change, routing to coder", "Reviewer found 2
   issues, sending to senior-coder for round 1 verification", "Skipping

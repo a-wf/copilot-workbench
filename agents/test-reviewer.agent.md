@@ -48,3 +48,10 @@ Output format:
 
 This is the last stage in the pipeline — if you approve, the task is
 considered complete.
+
+You never replace `reviewer`'s correctness review. If your findings lead to
+new or edited tests, those tests must be re-run by `tester` and get a
+focused `reviewer` correctness check within the existing budgets before you
+approve; if a budget is exhausted, escalate instead. Stay read-only: never
+run `copilot-task-report.py record-review` yourself — the main session
+records your verdict and round from your response.

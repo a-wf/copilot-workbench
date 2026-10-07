@@ -6,6 +6,47 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Added — batched review handoff, attribution coverage, review records
+
+- Default handoff order is now implement → relevant tests → one
+  comprehensive reviewer pass over the whole code-and-test batch →
+  test-reviewer for complex/high-risk work. `tester` is skipped when
+  existing tests suffice (the built-in `task` route runs them). Stages use
+  a compact handoff manifest; later fix rounds carry only the changed
+  subset and finding numbers. Tests added after a coverage review need a
+  retest and a focused correctness check inside the same budgets, else
+  escalate. Budgets and reviewer models (Sonnet 5.5 default, Opus 5.5 for
+  senior-coder/complex/high-risk/unknown) are unchanged.
+  `config/agent-routing.yaml` gains `broad_review_timing` and
+  `review_record_command` under `task_routing.code_review`.
+- Task reports gain an *Attribution Coverage* section backed by a new
+  versioned `attribution` block: usage already on a task becomes frozen
+  `legacy`, new calls are `unknown` with an explicit reason (no supported
+  telemetry link from model calls to agent invocations; nothing is
+  inferred from timestamps or models), and buckets reconcile with the
+  totals. No per-agent cost is measured; official cost estimates are
+  unchanged and nothing is repriced or backfilled. An informational
+  registry records invocations observed in `events.jsonl` (session id +
+  `agentId`), merged idempotently, including registry-only ingests.
+- New `copilot-task-report.py record-review --input <JSON-file>` command
+  stores validated, orchestrator-supplied reviewer/test-reviewer round
+  records (`copilot-task-report.review-record` v1) and enforces the bounded
+  per-cycle review policy (no second broad review, ordered rounds ≤ 3, no
+  rounds after escalation, no reset by changing session). Approval is not
+  terminal: a later in-order focused round of the same cycle can check
+  tests/fixes changed after it, and the report's stage outcome is the
+  latest round. Budgets are per requested work item (`cycle_id`), not per
+  task-report lifetime.
+  Rejections exit non-zero with a stderr message; identical replays are
+  no-ops. It never ingests, fetches pricing, or regenerates reports.
+  Reports show recorded reviews and their exact-id registry check. Missing
+  historical records are not a compliance failure.
+- `ingest` now reads an existing task file strictly (as `record-review`
+  does): an unreadable/non-object file or one naming another task is refused
+  with a non-zero exit before any offsets or task data are written, instead
+  of being silently replaced by an empty task. Markdown table cells escape
+  backslashes before pipes.
+
 ### Changed — independent review for every code change
 
 - Require one independent reviewer pass for every coherent source/code

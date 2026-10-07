@@ -66,6 +66,8 @@ task_routing:
       reasoning_effort: high
       context_tier: long_context
     review_budget: one_comprehensive_pass_plus_up_to_3_focused_verification_rounds
+    broad_review_timing: after_complete_code_and_test_batch
+    review_record_command: copilot-task-report.py record-review
 
 # User approval is required before substantive work on these routes.
 # This is an orchestrator convention, not a Copilot CLI enforcement feature.

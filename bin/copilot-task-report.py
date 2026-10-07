@@ -132,6 +132,20 @@ for the user-facing summary):
 - Failed model calls ARE accounted for when their OTEL span exposes usage
   attributes (some providers report partial usage even on an error/timeout)
   — we do not filter spans by status code, only by presence of usage data.
+- Attribution (task["attribution"], versioned): model calls are NOT linked
+  to agent invocations, because no supported identifier joins an OTEL chat
+  span to a subagent invocation. Every new call is booked as "unknown" with
+  an explicit reason; usage aggregated before the block existed on a task is
+  frozen as "legacy". Calls are never attributed from timestamps, models or
+  agent time windows, and no per-agent cost is computed (the official cost
+  estimate is unchanged). The block also keeps an informational registry of
+  invocations observed in events.jsonl (session id + agentId); registry
+  presence is not ownership. The "By Custom Agent" self-report table is
+  unchanged and separate.
+- `record-review --input <file>` stores explicit, orchestrator-supplied
+  reviewer/test-reviewer round records (task["reviews"]) after strict
+  validation against the bounded review policy. They are not telemetry,
+  and recording never ingests, fetches pricing or regenerates reports.
 """
 
 import argparse
@@ -208,6 +222,38 @@ MAX_AGENT_INTERVALS = 2000
 # session (session.start/resume/model_change history), same rationale as
 # MAX_AGENT_INTERVALS above.
 MAX_EFFORT_TIMELINE = 2000
+
+# --------------------------------------------------------------------------
+# Model-call -> agent-invocation attribution (additive, versioned)
+# --------------------------------------------------------------------------
+#
+# task["attribution"] (schema ATTRIBUTION_SCHEMA_VERSION) records, for every
+# model call ingested after the block was started on a task, WHY it is or is
+# not linked to an agent invocation. Today no supported link exists: the
+# OTEL chat spans this tool reads carry the session's conversation id but no
+# observed agent/invocation identifier, and calls are deliberately NEVER
+# attributed from timestamps, models or "the only open interval" guesses.
+# Every new call is therefore recorded as unknown with an explicit reason.
+#
+# Calls already aggregated on a task when the block is started are frozen as
+# "legacy" (a snapshot of the task totals at that moment) — never re-derived,
+# repriced or backfilled. The attribution buckets are exclusive and must
+# reconcile with task["totals"]: legacy + unknown (+ attributed, currently
+# always 0) == totals.
+#
+# The same block also holds an informational registry of agent invocations
+# OBSERVED in events.jsonl (`subagent.started`/`subagent.completed`, keyed by
+# session id + the event's own `agentId`). Registry presence is not ownership
+# of any model call or cost.
+ATTRIBUTION_SCHEMA_VERSION = 1
+ATTRIBUTION_REASON_NO_SUPPORTED_LINK = (
+    "no supported link: OTEL chat spans carry no observed agent/invocation identifier "
+    "(timestamps, models and agent intervals are never used to attribute calls)"
+)
+ATTRIBUTION_PROVENANCE = {
+    "model_calls": "OTEL 'chat *' spans matched by gen_ai.conversation.id == session id",
+    "observed_invocations": "events.jsonl subagent.started / subagent.completed events keyed by session id + agentId",
+}
 
 
 # --------------------------------------------------------------------------
@@ -1426,7 +1472,10 @@ def process_events_jsonl(raw_lines, sess_state):
         used directly to attribute a call)
     Returns a dict with: nano_aiu_delta, premium_requests_delta,
     agent_summaries (list from subagent.completed, self-reported, for the
-    "By Custom Agent" coverage table), repositories (set).
+    "By Custom Agent" coverage table), repositories (set), and
+    invocation_events (observed subagent.started/completed events that carry
+    their own `agentId`, for the informational invocation registry; events
+    without an agentId are not registered — no identifier is invented).
     """
     checkpoint_cursor = sess_state.setdefault("checkpoint_cursor", {"nano_aiu": 0, "premium_requests": 0})
     effort_timeline = sess_state.setdefault("effort_timeline", [])
@@ -1438,6 +1487,7 @@ def process_events_jsonl(raw_lines, sess_state):
         "premium_requests_delta": 0,
         "agent_summaries": [],
         "repositories": set(),
+        "invocation_events": [],
     }
 
     for raw in raw_lines:
@@ -1469,9 +1519,25 @@ def process_events_jsonl(raw_lines, sess_state):
                     "name": data.get("agentName") or data.get("agentType") or "unknown-agent",
                     "start": ts,
                 }
+            if isinstance(agent_id, str) and agent_id:
+                result["invocation_events"].append({
+                    "agent_id": agent_id,
+                    "event": "started",
+                    "ts": ts,
+                    "agent_name": data.get("agentName") or data.get("agentType") or "unknown-agent",
+                    "model": None,
+                })
 
         elif etype == "subagent.completed":
             agent_id = e.get("agentId")
+            if isinstance(agent_id, str) and agent_id:
+                result["invocation_events"].append({
+                    "agent_id": agent_id,
+                    "event": "completed",
+                    "ts": ts,
+                    "agent_name": data.get("agentName") or data.get("agentType") or "unknown-agent",
+                    "model": data.get("model") if isinstance(data.get("model"), str) else None,
+                })
             opened = open_agents.pop(agent_id, None) if agent_id else None
             if opened and ts is not None:
                 closed_intervals.append({"name": opened["name"], "start": opened["start"], "end": ts})
@@ -1669,6 +1735,18 @@ def scan_otel_files(session_id, sess_state, install_epoch):
     return calls, min_ts, max_ts
 
 
+def attribution_reason_for_call(mc):
+    """Why model call `mc` is (not) linked to an agent invocation.
+
+    The only acceptable future link is an explicit invocation identifier
+    actually present on the call's own telemetry record; none is observed on
+    the OTEL chat spans read today, so every call returns the fixed
+    "no supported link" reason. Timestamps, models and agent intervals are
+    deliberately NOT used. Supporting an evidenced join later must add a
+    separate attributed bucket under a new ATTRIBUTION_SCHEMA_VERSION."""
+    return ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+
+
 # --------------------------------------------------------------------------
 # Delta building / merging into the per-task aggregate
 # --------------------------------------------------------------------------
@@ -1696,6 +1774,10 @@ def build_delta(session_id, sess_state, events_path, pricing_ctx=None):
         "model_calls": 0,
         "nano_aiu_delta": 0,
         "premium_requests_delta": 0,
+        # Attribution delta: per-reason aggregates for calls that could not
+        # be linked to an invocation (exclusive; every call lands in exactly
+        # one reason) and observed invocation-registry events.
+        "attribution": {"unknown": {}, "invocation_events": []},
     }
 
     # 1) events.jsonl: configured-effort timeline, checkpoint deltas, agent
@@ -1732,6 +1814,7 @@ def build_delta(session_id, sess_state, events_path, pricing_ctx=None):
         delta["premium_requests_delta"] += ev_result["premium_requests_delta"]
         delta["agent_summaries"].extend(ev_result["agent_summaries"])
         delta["repositories"] |= ev_result["repositories"]
+        delta["attribution"]["invocation_events"].extend(ev_result["invocation_events"])
 
     # 2) OTEL: primary token/model/time source — independently ingestible,
     #    gated to install_epoch regardless of events.jsonl's state.
@@ -1750,6 +1833,9 @@ def build_delta(session_id, sess_state, events_path, pricing_ctx=None):
         joint = delta["by_model_effort"].setdefault(model, {})
         joint.setdefault(effort_key, blank_agg())
         add_agg(joint[effort_key], mc)
+        reason = attribution_reason_for_call(mc)
+        delta["attribution"]["unknown"].setdefault(reason, blank_agg())
+        add_agg(delta["attribution"]["unknown"][reason], mc)
         delta["model_calls"] += 1
 
     delta["min_ts"] = min_ts
@@ -1777,6 +1863,11 @@ def merge_delta_into_task(task, delta, session_id, task_id):
     repos = set(task.get("repositories", []))
     repos.update(delta["repositories"])
     task["repositories"] = sorted(repos)
+
+    # Must run BEFORE this delta touches task["totals"]: when the block is
+    # started on an existing task, its "legacy" snapshot is exactly the usage
+    # aggregated before attribution tracking existed for that task.
+    attribution = prepare_attribution_block(task)
 
     totals = task.setdefault("totals", blank_agg())
     totals.setdefault("first_call_ts", None)
@@ -1843,7 +1934,213 @@ def merge_delta_into_task(task, delta, session_id, task_id):
     # calls stay explicitly "legacy" (token counts kept, never repriced or
     # backfilled). `.get` tolerates a delta from an older code path.
     merge_official_cost_delta(task, delta.get("official_cost"))
+    att_delta = delta.get("attribution")
+    if att_delta is None:
+        # Delta from an older code path without attribution data: no call
+        # can have a supported link, so book its calls under the same fixed
+        # reason (keeps the buckets reconciled with the totals above).
+        fallback = blank_agg()
+        for agg in delta["by_model"].values():
+            for k in blank_agg():
+                fallback[k] += agg.get(k, 0)
+        att_delta = {"unknown": {ATTRIBUTION_REASON_NO_SUPPORTED_LINK: fallback} if fallback["call_count"] else {},
+                     "invocation_events": []}
+    merge_attribution_delta(attribution, att_delta, session_id)
     return task
+
+
+def prepare_attribution_block(task):
+    """Return the task's v1 attribution block, starting it if absent.
+
+    A newly started block freezes the task's CURRENT totals as "legacy" (all
+    zero for a task with no recorded usage yet). An existing block of an
+    unsupported shape/version is left untouched (never rewritten or
+    "upgraded" by guessing) and None is returned, with a warning; the report
+    then shows attribution as unreadable instead of a fabricated split."""
+    att = task.get("attribution")
+    if att is None:
+        prior = task.get("totals") if isinstance(task.get("totals"), dict) else {}
+        legacy = {}
+        for k in blank_agg():
+            value = prior.get(k, 0)
+            legacy[k] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+        att = task["attribution"] = {
+            "schema_version": ATTRIBUTION_SCHEMA_VERSION,
+            "since": now_iso(),
+            "legacy": legacy,
+            "unknown": {},
+            "observed_invocations": {},
+            "provenance": dict(ATTRIBUTION_PROVENANCE),
+        }
+        return att
+    if (
+        isinstance(att, dict)
+        and att.get("schema_version") == ATTRIBUTION_SCHEMA_VERSION
+        and isinstance(att.get("legacy"), dict)
+        and isinstance(att.get("unknown"), dict)
+        and isinstance(att.get("observed_invocations"), dict)
+    ):
+        return att
+    print("Warning: task '%s' has an unsupported/malformed attribution block; leaving it unchanged "
+          "(new calls are still counted in the task totals)." % task.get("task_id", "?"), file=sys.stderr)
+    return None
+
+
+def merge_attribution_delta(att, att_delta, session_id):
+    """Merge one ingest's attribution delta into a v1 block (or do nothing if
+    `att` is None — see prepare_attribution_block).
+
+    Unknown-reason aggregates are additive. Registry merging is idempotent
+    per (session id, agentId, event kind): replaying an identical observation
+    is a no-op; a different timestamp/model for an already-recorded event
+    keeps the first value and increments `conflicting_observations` instead
+    of silently overwriting it."""
+    if att is None or not att_delta:
+        return
+    unknown = att["unknown"]
+    for reason, agg in (att_delta.get("unknown") or {}).items():
+        dst = unknown.setdefault(reason, blank_agg())
+        for k in blank_agg():
+            dst[k] = dst.get(k, 0) + agg.get(k, 0)
+
+    events = att_delta.get("invocation_events") or []
+    if not events:
+        return
+    registry = att["observed_invocations"].setdefault(session_id, {})
+    for ev in events:
+        agent_id = ev.get("agent_id")
+        if not isinstance(agent_id, str) or not agent_id:
+            continue
+        name = ev.get("agent_name") if isinstance(ev.get("agent_name"), str) else "unknown-agent"
+        entry = registry.get(agent_id)
+        if not isinstance(entry, dict):
+            entry = registry[agent_id] = {
+                "agent_name": name,
+                "started": False,
+                "started_ts": None,
+                "completed": False,
+                "completed_ts": None,
+                "model": None,
+                "conflicting_observations": 0,
+            }
+        if entry.get("agent_name") in (None, "unknown-agent") and name != "unknown-agent":
+            entry["agent_name"] = name
+        elif name not in ("unknown-agent", entry.get("agent_name")):
+            entry["conflicting_observations"] = entry.get("conflicting_observations", 0) + 1
+        kind = "completed" if ev.get("event") == "completed" else "started"
+        ts_key = "%s_ts" % kind
+        if not entry.get(kind):
+            entry[kind] = True
+            entry[ts_key] = ev.get("ts")
+        elif entry.get(ts_key) != ev.get("ts"):
+            entry["conflicting_observations"] = entry.get("conflicting_observations", 0) + 1
+        model = ev.get("model")
+        if model:
+            if entry.get("model") is None:
+                entry["model"] = model
+            elif entry["model"] != model:
+                entry["conflicting_observations"] = entry.get("conflicting_observations", 0) + 1
+
+
+def _int_or_zero(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def summarize_attribution(task):
+    """Read-only summary of the attribution block for rendering.
+
+    status: "active" (v1 block), "not_started" (task predates attribution
+    tracking and has not been re-ingested: everything is shown as legacy),
+    or "unreadable" (unsupported/malformed block; nothing is inferred)."""
+    totals = task.get("totals") if isinstance(task.get("totals"), dict) else {}
+    total_calls = _int_or_zero(totals.get("call_count"))
+    total_tokens = _int_or_zero(totals.get("total_tokens"))
+    att = task.get("attribution")
+    out = {
+        "status": "active",
+        "since": None,
+        "total_calls": total_calls,
+        "total_tokens": total_tokens,
+        "legacy_calls": 0,
+        "legacy_tokens": 0,
+        "unknown": {},
+        "unknown_calls": 0,
+        "unknown_tokens": 0,
+        "attributed_calls": 0,
+        "attributed_tokens": 0,
+        "reconciled": True,
+        "registry": {},
+        "registry_sessions": 0,
+        "registry_invocations": 0,
+        "registry_conflicts": 0,
+    }
+    if att is None:
+        out["status"] = "not_started"
+        out["legacy_calls"] = total_calls
+        out["legacy_tokens"] = total_tokens
+        return out
+    if not (isinstance(att, dict) and att.get("schema_version") == ATTRIBUTION_SCHEMA_VERSION
+            and isinstance(att.get("legacy"), dict) and isinstance(att.get("unknown"), dict)
+            and isinstance(att.get("observed_invocations"), dict)):
+        out["status"] = "unreadable"
+        out["reconciled"] = False
+        return out
+    out["since"] = att.get("since")
+    out["legacy_calls"] = _int_or_zero(att["legacy"].get("call_count"))
+    out["legacy_tokens"] = _int_or_zero(att["legacy"].get("total_tokens"))
+    for reason, agg in att["unknown"].items():
+        if not isinstance(agg, dict):
+            continue
+        calls = _int_or_zero(agg.get("call_count"))
+        tokens = _int_or_zero(agg.get("total_tokens"))
+        out["unknown"][reason] = {"calls": calls, "total_tokens": tokens}
+        out["unknown_calls"] += calls
+        out["unknown_tokens"] += tokens
+    out["reconciled"] = (
+        out["legacy_calls"] + out["unknown_calls"] + out["attributed_calls"] == total_calls
+        and out["legacy_tokens"] + out["unknown_tokens"] + out["attributed_tokens"] == total_tokens
+    )
+    for sid, per_session in att["observed_invocations"].items():
+        if not isinstance(per_session, dict):
+            continue
+        counted = False
+        for entry in per_session.values():
+            if not isinstance(entry, dict):
+                continue
+            counted = True
+            name = entry.get("agent_name") if isinstance(entry.get("agent_name"), str) else "unknown-agent"
+            row = out["registry"].setdefault(name, {"invocations": 0, "completed": 0, "started_only": 0,
+                                                    "completed_only": 0, "conflicts": 0})
+            row["invocations"] += 1
+            started, completed = bool(entry.get("started")), bool(entry.get("completed"))
+            if completed:
+                row["completed"] += 1
+            if started and not completed:
+                row["started_only"] += 1
+            if completed and not started:
+                row["completed_only"] += 1
+            conflicts = _int_or_zero(entry.get("conflicting_observations"))
+            row["conflicts"] += conflicts
+            out["registry_conflicts"] += conflicts
+            out["registry_invocations"] += 1
+        if counted:
+            out["registry_sessions"] += 1
+    return out
+
+
+def observed_invocation_status(task, session_id, invocation_id):
+    """Exact-identifier lookup of a recorded review's invocation in the
+    task's observed registry. Never infers a session or a link."""
+    if invocation_id == REVIEW_UNKNOWN:
+        return "explicitly unknown"
+    if session_id == REVIEW_UNKNOWN:
+        return "not verifiable (session unknown)"
+    att = task.get("attribution")
+    registry = att.get("observed_invocations") if isinstance(att, dict) else None
+    per_session = registry.get(session_id) if isinstance(registry, dict) else None
+    if isinstance(per_session, dict) and isinstance(per_session.get(invocation_id), dict):
+        return "observed in events.jsonl registry"
+    return "not observed in this task's registry (not ingested yet, or recorded under another task)"
 
 
 # --------------------------------------------------------------------------
@@ -3823,6 +4120,9 @@ def render_markdown(task):
             lines.append("| %s | %d | %d | %s |" % (name, agg["completions"], agg["total_tokens"], fmt_duration_ms(agg["duration_ms"])))
         lines.append("")
 
+    lines.extend(render_attribution_section(task))
+    lines.extend(render_review_section(task))
+
     lines.append("## Limitations")
     lines.append("")
     lines.append("- Usage is only tracked from the moment this feature was installed; older "
@@ -3865,8 +4165,154 @@ def render_markdown(task):
                   "config file and recorded model+effort data are preserved but unused.")
     lines.append("- If an OTEL file is truncated/rewound (rare), the gap is skipped with a "
                   "warning rather than being silently lost forever or risking a double count.")
+    lines.append("- Model calls are not attributed to agents: no supported telemetry link exists, so "
+                  "calls are shown as unknown (or legacy) in Attribution Coverage — unknown does not "
+                  "mean the main session made them. No per-agent cost is measured.")
+    lines.append("- Recorded reviews are orchestrator-supplied records added with `record-review`, "
+                  "not native telemetry, and recording them does not regenerate this report. A task "
+                  "with no recorded reviews (including any work done before recording existed) is not "
+                  "evidence of a skipped or failed review.")
     lines.append("")
     return "\n".join(lines)
+
+
+def _md_cell(value):
+    """Make a free-text value safe inside a Markdown table cell. Backslashes
+    are escaped before pipes so an input like `a\\|b` cannot turn its own
+    backslash into an escape that leaves a raw, cell-splitting pipe."""
+    text = "" if value is None else str(value)
+    return " ".join(text.split()).replace("\\", "\\\\").replace("|", "\\|")
+
+
+def render_attribution_section(task):
+    s = summarize_attribution(task)
+    lines = ["## Attribution Coverage (model calls → agent invocations)", ""]
+    if s["status"] == "unreadable":
+        lines.append("_This task's attribution block has an unsupported or malformed schema; it is left "
+                     "unchanged and not interpreted. Totals above are unaffected._")
+        lines.append("")
+        return lines
+    lines.append("_Exclusive buckets that must add up to the Summary totals. **Unknown is not the "
+                 "main session**: it means no supported link to an agent invocation exists. Calls are "
+                 "never attributed from timestamps, models or agent time windows. No per-agent cost is "
+                 "measured; the estimated USD cost above is unchanged and is not split by agent._")
+    lines.append("")
+    lines.append("| Bucket | Calls | Total Tokens |")
+    lines.append("|---|---|---|")
+    if s["status"] == "not_started":
+        legacy_label = "Legacy — recorded before attribution tracking (starts at the next ingest)"
+    else:
+        legacy_label = "Legacy — recorded before attribution tracking started (%s)" % (s["since"] or "unknown")
+    lines.append("| %s | %d | %d |" % (legacy_label, s["legacy_calls"], s["legacy_tokens"]))
+    for reason, row in sorted(s["unknown"].items()):
+        lines.append("| Unknown — %s | %d | %d |" % (_md_cell(reason), row["calls"], row["total_tokens"]))
+    lines.append("| Attributed to an observed agent invocation | %d | %d |"
+                 % (s["attributed_calls"], s["attributed_tokens"]))
+    lines.append("| **Total (Summary)** | %d | %d |" % (s["total_calls"], s["total_tokens"]))
+    lines.append("")
+    if not s["reconciled"]:
+        lines.append("> ⚠️ Attribution buckets do not reconcile with the Summary totals (legacy + unknown "
+                     "+ attributed ≠ totals); treat this section as incomplete for this task.")
+        lines.append("")
+
+    if s["registry_invocations"]:
+        lines.append("### Observed Agent Invocations (events.jsonl registry — informational, not ownership)")
+        lines.append("")
+        lines.append("_Invocations seen as `subagent.started`/`subagent.completed` events, keyed by session "
+                     "id + the event's own `agentId` (%d invocation(s) across %d session(s)). Being in this "
+                     "registry does not attribute any model call or cost to that agent; the self-reported "
+                     "By Custom Agent table above is separate and unchanged._"
+                     % (s["registry_invocations"], s["registry_sessions"]))
+        lines.append("")
+        lines.append("| Agent | Invocations | Completed | Started only (no completion observed) | "
+                     "Completed only (no start observed) | Conflicting observations |")
+        lines.append("|---|---|---|---|---|---|")
+        for name, row in sorted(s["registry"].items()):
+            lines.append("| %s | %d | %d | %d | %d | %d |" % (
+                _md_cell(name), row["invocations"], row["completed"], row["started_only"],
+                row["completed_only"], row["conflicts"]))
+        lines.append("")
+    return lines
+
+
+def _review_round_label(round_no):
+    if isinstance(round_no, bool) or not isinstance(round_no, int):
+        return "round %s" % _md_cell(round_no)
+    if round_no == 0:
+        return "broad (invocation 1 of max 4)"
+    return "focused %d of 3 (invocation %d of max 4)" % (round_no, round_no + 1)
+
+
+def render_review_section(task):
+    reviews = task.get("reviews")
+    if not isinstance(reviews, dict) or not isinstance(reviews.get("records"), dict) or not reviews["records"]:
+        return []
+    lines = ["## Recorded Reviews (orchestrator-supplied records — not native telemetry)", ""]
+    if reviews.get("schema_version") != REVIEWS_SCHEMA_VERSION:
+        lines.append("_This task's review records use an unsupported schema version; they are not "
+                     "interpreted._")
+        lines.append("")
+        return lines
+    lines.append("_Added explicitly with `copilot-task-report.py record-review`, based on the reviewer "
+                 "response or a user-supplied outcome. They are not extracted from telemetry and do not "
+                 "prove that the review happened. Invocation checks are exact-id lookups in the observed "
+                 "registry above; nothing is inferred. A verdict of `unknown` never implies success._")
+    lines.append("")
+    records = [r for r in reviews["records"].values() if isinstance(r, dict)]
+
+    def sort_key(r):
+        rnd = r.get("round")
+        return (str(r.get("cycle_id")), str(r.get("stage")), rnd if isinstance(rnd, int) else 99)
+
+    records.sort(key=sort_key)
+    lines.append("| Cycle | Stage | Round | Verdict | Session | Invocation | Invocation check | Provenance | Recorded |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    groups = {}
+    for r in records:
+        rnd = r.get("round")
+        round_label = _review_round_label(rnd)
+        inv = r.get("invocation_id")
+        inv_cell = _md_cell(inv)
+        if inv == REVIEW_UNKNOWN:
+            inv_cell = "unknown (%s)" % _md_cell(r.get("invocation_unknown_reason"))
+        prov = r.get("provenance") if isinstance(r.get("provenance"), dict) else {}
+        prov_cell = "%s / %s: %s" % (_md_cell(prov.get("source")), _md_cell(prov.get("basis")),
+                                     _md_cell(prov.get("reference")))
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            _md_cell(r.get("cycle_id")), _md_cell(r.get("stage")), round_label, _md_cell(r.get("verdict")),
+            _md_cell(r.get("session_id")), inv_cell,
+            observed_invocation_status(task, r.get("session_id"), inv), prov_cell, _md_cell(r.get("recorded_at"))))
+        groups.setdefault((str(r.get("cycle_id")), str(r.get("stage"))), []).append(r)
+    lines.append("")
+    lines.append("Outcome per work cycle and stage (latest recorded round):")
+    lines.append("")
+    for (cycle, stage), rows in sorted(groups.items()):
+        latest = rows[-1]
+        verdict = latest.get("verdict")
+        rnd = latest.get("round")
+        used = (rnd + 1) if isinstance(rnd, int) else "?"
+        if verdict == "approved":
+            outcome = "approved at %s" % _review_round_label(rnd)
+        elif verdict == "escalated":
+            outcome = "escalated to the user at %s" % _review_round_label(rnd)
+        elif verdict == "needs-fixes":
+            outcome = ("open — latest verdict needs-fixes at %s; not complete" % _review_round_label(rnd)
+                       if isinstance(rnd, int) and rnd < REVIEW_MAX_ROUND
+                       else "needs-fixes after the last allowed round; must be escalated, not complete")
+        else:
+            outcome = "unknown outcome at latest recorded round (insufficient to imply success)"
+        if verdict != "approved":
+            earlier = [r for r in rows[:-1] if r.get("verdict") == "approved"]
+            if earlier:
+                # Approval is not terminal: a later round in the same cycle
+                # (e.g. checking tests added after a coverage review) is the
+                # current outcome, and the earlier approval no longer holds.
+                outcome += "; supersedes the earlier approval at %s" % _review_round_label(
+                    earlier[-1].get("round"))
+        lines.append("- `%s` / %s: %s — %s of max 4 invocations recorded" % (
+            _md_cell(cycle), _md_cell(stage), outcome, used))
+    lines.append("")
+    return lines
 
 
 def task_path(task_id):
@@ -3877,6 +4323,283 @@ def task_path(task_id):
 def report_path(task_id):
     safe = task_id.replace("/", "_")
     return os.path.join(REPORTS_DIR, "%s.md" % safe)
+
+
+# --------------------------------------------------------------------------
+# Review lifecycle records (`record-review`)
+# --------------------------------------------------------------------------
+#
+# Explicit, orchestrator-supplied records of reviewer / test-reviewer rounds,
+# stored under task["reviews"]. They are NOT native telemetry and are never
+# parsed out of agent prose: the caller states each field. Validation is
+# strict (no defaults for missing fields, unknown keys rejected) and the
+# bounded review policy is checked against the task's existing records:
+#
+# - Budget scope is (task, cycle_id, stage). A cycle_id names ONE requested
+#   work item; a task report may contain many cycles. Changing session id
+#   never resets a cycle's budget. The tool cannot verify that a new cycle_id
+#   really is a new work item — reusing one cycle per work item is the
+#   orchestrator's documented obligation.
+# - round 0 is the single broad review; rounds 1..3 are focused rounds. Each
+#   (cycle, stage, round) slot holds exactly one record (so no second broad
+#   review), round N requires round N-1, and nothing may follow an
+#   "escalated" round. "approved" is NOT terminal: a later focused round
+#   (still N-1 ordered and <= 3) may check tests/fixes newly changed in the
+#   same cycle after an approval (e.g. tests added after a coverage review).
+#   The latest recorded round is the stage's current outcome; an earlier
+#   approval followed by a later non-approved round is superseded.
+# - record_id is unique per task: an identical replay is a no-op, a different
+#   payload under the same id is a conflict.
+#
+# Recording never ingests telemetry, fetches pricing, regenerates the
+# Markdown report, or touches usage/legacy/attribution data.
+
+REVIEW_RECORD_SCHEMA = "copilot-task-report.review-record"
+REVIEW_RECORD_SCHEMA_VERSION = 1
+REVIEWS_SCHEMA_VERSION = 1
+REVIEW_UNKNOWN = "unknown"
+REVIEW_STAGES = ("reviewer", "test-reviewer")
+REVIEW_VERDICTS = ("approved", "needs-fixes", "escalated", "unknown")
+# Only escalation ends a stage's budget early; see the policy notes above.
+REVIEW_TERMINAL_VERDICTS = ("escalated",)
+REVIEW_MAX_ROUND = 3
+REVIEW_PROVENANCE_SOURCES = ("orchestrator-supplied",)
+REVIEW_PROVENANCE_BASES = ("agent-response", "user-supplied")
+REVIEW_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+REVIEW_TEXT_MAX_LEN = 500
+REVIEW_INPUT_MAX_BYTES = 64 * 1024
+REVIEW_INPUT_KEYS = frozenset((
+    "schema", "schema_version", "record_id", "task_id", "session_id", "cycle_id", "stage", "round",
+    "verdict", "invocation_id", "invocation_unknown_reason", "provenance",
+))
+REVIEW_PROVENANCE_KEYS = frozenset(("source", "basis", "reference"))
+
+
+class ReviewRecordError(ValueError):
+    """Invalid review-record input or a record that conflicts with policy/state."""
+
+
+def _review_reject_constant(name):
+    raise ReviewRecordError("non-finite number %r is not allowed" % name)
+
+
+def _review_no_duplicate_keys(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ReviewRecordError("duplicate JSON key %r" % key)
+        obj[key] = value
+    return obj
+
+
+def _review_identifier(value, field, allow_unknown):
+    if not isinstance(value, str):
+        raise ReviewRecordError("%s must be a string (got %s)" % (field, type(value).__name__))
+    if value.lower() == REVIEW_UNKNOWN:
+        if allow_unknown and value == REVIEW_UNKNOWN:
+            return value
+        if allow_unknown:
+            raise ReviewRecordError("%s: use the exact lowercase literal %r for an unknown value"
+                                    % (field, REVIEW_UNKNOWN))
+        raise ReviewRecordError("%s may not be the reserved value %r" % (field, REVIEW_UNKNOWN))
+    if not REVIEW_ID_RE.match(value):
+        raise ReviewRecordError(
+            "%s %r is not a safe identifier (1-200 chars: letters, digits, '.', '_', ':', '-', "
+            "starting with a letter or digit)%s"
+            % (field, value, " or the literal 'unknown'" if allow_unknown else ""))
+    return value
+
+
+def _review_text(value, field):
+    if not isinstance(value, str):
+        raise ReviewRecordError("%s must be a string (got %s)" % (field, type(value).__name__))
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise ReviewRecordError("%s must be a single line without control characters" % field)
+    text = value.strip()
+    if not text:
+        raise ReviewRecordError("%s must not be empty" % field)
+    if len(text) > REVIEW_TEXT_MAX_LEN:
+        raise ReviewRecordError("%s must be at most %d characters" % (field, REVIEW_TEXT_MAX_LEN))
+    return text
+
+
+def _review_choice(value, field, choices):
+    if not isinstance(value, str) or value not in choices:
+        raise ReviewRecordError("%s must be one of %s (got %r)" % (field, ", ".join(choices), value))
+    return value
+
+
+def validate_review_record(raw):
+    """Validate one parsed review-record document and return its normalized
+    form. Every field is required (invocation_unknown_reason exactly when
+    invocation_id is 'unknown'); nothing is defaulted."""
+    if not isinstance(raw, dict):
+        raise ReviewRecordError("the review record must be a JSON object")
+    unknown_keys = sorted(set(raw) - REVIEW_INPUT_KEYS)
+    if unknown_keys:
+        raise ReviewRecordError("unknown field(s): %s" % ", ".join(unknown_keys))
+    required = sorted(REVIEW_INPUT_KEYS - {"invocation_unknown_reason"} - set(raw))
+    if required:
+        raise ReviewRecordError("missing required field(s): %s" % ", ".join(required))
+    if raw["schema"] != REVIEW_RECORD_SCHEMA:
+        raise ReviewRecordError("schema must be %r (got %r)" % (REVIEW_RECORD_SCHEMA, raw["schema"]))
+    version = raw["schema_version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != REVIEW_RECORD_SCHEMA_VERSION:
+        raise ReviewRecordError("unsupported schema_version %r (this tool supports %d)"
+                                % (version, REVIEW_RECORD_SCHEMA_VERSION))
+    task_raw = raw["task_id"]
+    if not isinstance(task_raw, str):
+        raise ReviewRecordError("task_id must be a string")
+    task_id = normalize_task_id(task_raw)
+    if task_id is None:
+        raise ReviewRecordError(
+            "task_id %r is not a valid task ID/name (expected e.g. ABC-123, a free-form name using "
+            "letters/digits/./_/- up to %d characters, or the literal '%s')" % (task_raw, MAX_TASK_ID_LEN, UNASSIGNED))
+    rnd = raw["round"]
+    if isinstance(rnd, bool) or not isinstance(rnd, int) or not 0 <= rnd <= REVIEW_MAX_ROUND:
+        raise ReviewRecordError("round must be an integer 0 (broad review) to %d (focused round) (got %r)"
+                                % (REVIEW_MAX_ROUND, rnd))
+    invocation_id = _review_identifier(raw["invocation_id"], "invocation_id", allow_unknown=True)
+    if invocation_id == REVIEW_UNKNOWN:
+        if "invocation_unknown_reason" not in raw:
+            raise ReviewRecordError("invocation_unknown_reason is required when invocation_id is 'unknown'")
+        unknown_reason = _review_text(raw["invocation_unknown_reason"], "invocation_unknown_reason")
+    else:
+        if "invocation_unknown_reason" in raw:
+            raise ReviewRecordError("invocation_unknown_reason is only allowed when invocation_id is 'unknown'")
+        unknown_reason = None
+    prov = raw["provenance"]
+    if not isinstance(prov, dict):
+        raise ReviewRecordError("provenance must be an object with source, basis and reference")
+    prov_unknown = sorted(set(prov) - REVIEW_PROVENANCE_KEYS)
+    if prov_unknown:
+        raise ReviewRecordError("unknown provenance field(s): %s" % ", ".join(prov_unknown))
+    prov_missing = sorted(REVIEW_PROVENANCE_KEYS - set(prov))
+    if prov_missing:
+        raise ReviewRecordError("missing provenance field(s): %s" % ", ".join(prov_missing))
+    return {
+        "record_id": _review_identifier(raw["record_id"], "record_id", allow_unknown=False),
+        "task_id": task_id,
+        "session_id": _review_identifier(raw["session_id"], "session_id", allow_unknown=True),
+        "cycle_id": _review_identifier(raw["cycle_id"], "cycle_id", allow_unknown=False),
+        "stage": _review_choice(raw["stage"], "stage", REVIEW_STAGES),
+        "round": rnd,
+        "verdict": _review_choice(raw["verdict"], "verdict", REVIEW_VERDICTS),
+        "invocation_id": invocation_id,
+        "invocation_unknown_reason": unknown_reason,
+        "provenance": {
+            "source": _review_choice(prov["source"], "provenance.source", REVIEW_PROVENANCE_SOURCES),
+            "basis": _review_choice(prov["basis"], "provenance.basis", REVIEW_PROVENANCE_BASES),
+            "reference": _review_text(prov["reference"], "provenance.reference"),
+        },
+    }
+
+
+def load_review_record_input(path):
+    """Read and validate a review-record JSON file (UTF-8, at most
+    REVIEW_INPUT_MAX_BYTES, no duplicate keys or NaN/Infinity)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(REVIEW_INPUT_MAX_BYTES + 1)
+    except OSError as ex:
+        raise ReviewRecordError("cannot read input file %r: %s" % (path, ex))
+    if len(data) > REVIEW_INPUT_MAX_BYTES:
+        raise ReviewRecordError("input file exceeds %d bytes" % REVIEW_INPUT_MAX_BYTES)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as ex:
+        raise ReviewRecordError("input file is not valid UTF-8: %s" % ex)
+    if not text.strip():
+        raise ReviewRecordError("input file is empty")
+    try:
+        raw = json.loads(text, object_pairs_hook=_review_no_duplicate_keys,
+                         parse_constant=_review_reject_constant)
+    except json.JSONDecodeError as ex:
+        raise ReviewRecordError("input file is not valid JSON: %s" % ex)
+    return validate_review_record(raw)
+
+
+def _stored_review_core(stored):
+    keys = ("record_id", "task_id", "session_id", "cycle_id", "stage", "round", "verdict",
+            "invocation_id", "invocation_unknown_reason", "provenance")
+    return {k: stored.get(k) for k in keys}
+
+
+def apply_review_record(task, record):
+    """Validate `record` against the task's existing review records and add
+    it. Returns "recorded" or "duplicate" (identical replay; task unchanged).
+    Raises ReviewRecordError on any conflict or policy violation, leaving
+    `task` unchanged."""
+    reviews = task.get("reviews")
+    if reviews is None:
+        reviews = {"schema_version": REVIEWS_SCHEMA_VERSION, "records": {}}
+    elif (not isinstance(reviews, dict) or reviews.get("schema_version") != REVIEWS_SCHEMA_VERSION
+          or not isinstance(reviews.get("records"), dict)):
+        raise ReviewRecordError("task '%s' has an unsupported or malformed 'reviews' block; refusing to modify it"
+                                % record["task_id"])
+    records = reviews["records"]
+
+    existing = records.get(record["record_id"])
+    if existing is not None:
+        if isinstance(existing, dict) and _stored_review_core(existing) == record:
+            return "duplicate"
+        raise ReviewRecordError("record_id '%s' is already recorded for task '%s' with different content"
+                                % (record["record_id"], record["task_id"]))
+
+    same_slot = [r for r in records.values() if isinstance(r, dict)
+                 and r.get("cycle_id") == record["cycle_id"] and r.get("stage") == record["stage"]]
+    for r in same_slot:
+        if r.get("round") == record["round"]:
+            what = "a broad review (round 0)" if record["round"] == 0 else "focused round %d" % record["round"]
+            raise ReviewRecordError(
+                "cycle '%s' already has %s for stage %s (record '%s'); a second one is not allowed "
+                "and a new session does not reset the budget" % (
+                    record["cycle_id"], what, record["stage"], r.get("record_id")))
+    for r in same_slot:
+        if r.get("verdict") in REVIEW_TERMINAL_VERDICTS:
+            raise ReviewRecordError(
+                "cycle '%s' stage %s already ended with verdict '%s' at round %s; no further rounds may be "
+                "recorded" % (record["cycle_id"], record["stage"], r.get("verdict"), r.get("round")))
+    if record["round"] > 0 and not any(r.get("round") == record["round"] - 1 for r in same_slot):
+        raise ReviewRecordError(
+            "round %d for cycle '%s' stage %s requires round %d to be recorded first" % (
+                record["round"], record["cycle_id"], record["stage"], record["round"] - 1))
+
+    stored = dict(record)
+    stored["provenance"] = dict(record["provenance"])
+    stored["recorded_at"] = now_iso()
+    records[record["record_id"]] = stored
+    reviews["updated_at"] = stored["recorded_at"]
+    task["reviews"] = reviews
+    return "recorded"
+
+
+def _load_task_file_strict(tpath, task_id):
+    """Strict task-file read shared by record-review and ingest: returns
+    (task_or_None, error). A missing file is a legitimate new task
+    (None, None). A file that exists but is unreadable, not valid UTF-8 JSON,
+    not a JSON object, or that names a different task is an error and is
+    never silently replaced. The stored identity is `task_id`, else the
+    pre-2.0 `jira_key`; it matches when it equals `task_id` exactly or
+    normalizes to it (legacy un-normalized ids), and a file with neither key
+    is accepted as before. Reading has no side effects."""
+    if not os.path.exists(tpath):
+        return None, None
+    try:
+        with open(tpath, "rb") as f:
+            task = json.loads(f.read().decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as ex:
+        return None, "task file %s is unreadable (%s); refusing to overwrite it" % (tpath, ex)
+    if not isinstance(task, dict):
+        return None, "task file %s does not contain a JSON object; refusing to overwrite it" % tpath
+    for key in ("task_id", "jira_key"):
+        if key in task:
+            stored = task[key]
+            if stored != task_id and (not isinstance(stored, str) or normalize_task_id(stored) != task_id):
+                return None, ("task file %s belongs to task %r, not '%s'; refusing to modify it"
+                              % (tpath, stored, task_id))
+            break
+    return task, None
 
 
 # --------------------------------------------------------------------------
@@ -3916,6 +4639,19 @@ def cmd_ingest(args):
         task_id = requested or sess_state.get("task_id") or UNASSIGNED
         sess_state["task_id"] = task_id
 
+        # Validate the destination task file BEFORE reading any telemetry or
+        # writing session state: task files now hold irreplaceable review
+        # records, so an unreadable/foreign file must never be replaced by
+        # an empty task. Refusing here leaves the task file, the state file
+        # and every offset/cursor untouched, so nothing is consumed and a
+        # later ingest (after the file is repaired) picks the data up.
+        existing_task, task_error = _load_task_file_strict(task_path(task_id), task_id)
+        if task_error:
+            print("Error: %s. Session '%s' was not ingested and its offsets were not advanced; "
+                  "repair or move the file, then ingest again." % (task_error, session_id),
+                  file=sys.stderr)
+            return 1
+
         # events.jsonl and OTEL are independent data sources with
         # independent lifecycles: build_delta seeds/reads each of them on
         # its own, so a not-yet-existing events.jsonl never suppresses OTEL
@@ -3928,14 +4664,16 @@ def cmd_ingest(args):
             and delta["premium_requests_delta"] == 0
             and not delta["agent_summaries"]
             and not delta["repositories"]
+            and not delta["attribution"]["invocation_events"]
         ):
             # Still persist offsets/cursors so we don't rescan the same
             # bytes forever, but nothing to merge into the task. Every
-            # mergeable delta field must be checked here — a premium-only
-            # or repository-only update (no new model calls/AIU/agent
-            # summaries) would otherwise be silently dropped even though
-            # build_delta's advanced offsets mean it can never be
-            # re-derived on a later ingest.
+            # mergeable delta field must be checked here — a premium-only,
+            # repository-only or invocation-registry-only update (e.g. a
+            # bare subagent.started with no model calls yet) would
+            # otherwise be silently dropped even though build_delta's
+            # advanced offsets mean it can never be re-derived on a later
+            # ingest.
             atomic_write(STATE_FILE, json.dumps(state, indent=2, default=list))
             return 0
 
@@ -3945,7 +4683,8 @@ def cmd_ingest(args):
         # counting) rather than a double-counted one.
         atomic_write(STATE_FILE, json.dumps(state, indent=2, default=list))
 
-        task = load_json(task_path(task_id), {})
+        # Validated above under this same lock; a missing file is a new task.
+        task = existing_task if existing_task is not None else {}
         task = merge_delta_into_task(task, delta, session_id, task_id)
         atomic_write(task_path(task_id), json.dumps(task, indent=2))
 
@@ -4004,6 +4743,47 @@ def cmd_normalize(args):
     return 0
 
 
+def cmd_record_review(args):
+    """Record one validated reviewer/test-reviewer round in the task JSON.
+
+    Under the ingest lock it reads the task file strictly, checks the record
+    against the task's existing review records, and atomically rewrites the
+    task file. It never ingests telemetry, fetches pricing, regenerates the
+    Markdown report, or changes usage/legacy/attribution data."""
+    try:
+        record = load_review_record_input(args.input)
+    except ReviewRecordError as ex:
+        print("Error: invalid review record: %s" % ex, file=sys.stderr)
+        return 1
+    task_id = record["task_id"]
+    with ingest_lock():
+        tpath = task_path(task_id)
+        task, error = _load_task_file_strict(tpath, task_id)
+        if error:
+            print("Error: %s" % error, file=sys.stderr)
+            return 1
+        if task is None:
+            # Conservative new-task file: only the identity and the review
+            # block. Usage fields (created_at, totals, attribution, ...) are
+            # created by the first real ingest, never by this command.
+            task = {"task_id": task_id}
+        try:
+            outcome = apply_review_record(task, record)
+        except ReviewRecordError as ex:
+            print("Error: review record rejected: %s" % ex, file=sys.stderr)
+            return 1
+        if outcome == "duplicate":
+            print("Review record '%s' is already recorded identically for task '%s'; nothing changed."
+                  % (record["record_id"], task_id))
+            return 0
+        atomic_write(tpath, json.dumps(task, indent=2))
+    print("Recorded review '%s' (task '%s', cycle '%s', %s round %d, verdict %s). The Markdown report is "
+          "not regenerated by this command; run `copilot-task-report.py report %s` to refresh it."
+          % (record["record_id"], task_id, record["cycle_id"], record["stage"], record["round"],
+             record["verdict"], task_id))
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Copilot task usage report helper")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -4025,6 +4805,15 @@ def main():
     p_norm = sub.add_parser("normalize-task-id", help="Validate/normalize a task ID or free-form task name (prints the normalized form; exit 1 if invalid)")
     p_norm.add_argument("raw", help="Raw task ID/name to normalize")
     p_norm.set_defaults(func=cmd_normalize)
+
+    p_review = sub.add_parser(
+        "record-review",
+        help="Record one validated reviewer/test-reviewer round (orchestrator-supplied, not telemetry) "
+             "in the task JSON; does not ingest, fetch pricing or regenerate the report")
+    p_review.add_argument("--input", required=True, metavar="JSON_FILE",
+                          help="Path to a review-record JSON file (schema %r, schema_version %d)"
+                               % (REVIEW_RECORD_SCHEMA, REVIEW_RECORD_SCHEMA_VERSION))
+    p_review.set_defaults(func=cmd_record_review)
 
     args = parser.parse_args()
     try:

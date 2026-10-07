@@ -306,6 +306,55 @@ prompted to keep, rename, or delete it.
   the report. Existing copies are left exactly as you edited them (nothing
   is migrated or deleted); the installer still copies them only if absent.
 
+### Attribution coverage and recorded reviews
+
+- **Attribution coverage.** Each report has an *Attribution Coverage*
+  section with exclusive buckets that add up to the Summary totals:
+  **legacy** (usage already on the task when attribution tracking started
+  for it — frozen, never re-derived or repriced), **unknown** (with an
+  explicit reason), and **attributed** (always 0 today). No supported
+  telemetry identifier links an OTEL model call to a custom-agent
+  invocation, so every new call is unknown; calls are never attributed from
+  timestamps, models, or agent time windows. *Unknown does not mean the
+  main session.* No per-agent cost is measured, and the official USD
+  estimate is unchanged.
+- **Observed invocations.** An informational registry lists agent
+  invocations seen as `subagent.started`/`subagent.completed` events
+  (keyed by session id + the event's `agentId`), including started-only or
+  completed-only ones. Being listed does not attribute any call or cost.
+  The self-reported *By Custom Agent* table is unchanged and separate.
+- **Recorded reviews.** The orchestrator records each reviewer /
+  test-reviewer round explicitly:
+
+  ```sh
+  python3 "$HOME/.local/bin/copilot-task-report.py" record-review --input review.json
+  ```
+
+  The input is a versioned JSON object (`schema`
+  `copilot-task-report.review-record`, `schema_version` 1) with
+  `record_id`, `task_id`, `session_id` (or `"unknown"`), `cycle_id`,
+  `stage` (`reviewer`/`test-reviewer`), `round` (0 = broad, 1–3 focused),
+  `verdict` (`approved`/`needs-fixes`/`escalated`/`unknown`),
+  `invocation_id` (or `"unknown"` plus `invocation_unknown_reason`), and
+  `provenance` (`source: orchestrator-supplied`, `basis:
+  agent-response|user-supplied`, `reference`). See
+  `instructions/copilot-instructions.md` for a complete example. Invalid,
+  conflicting, out-of-order, second-broad-in-cycle, or post-escalation
+  records are rejected with a message on stderr and a non-zero exit; an
+  identical replay is a no-op. `approved` does not close a stage: a later
+  focused round of the same cycle (still in order and at most round 3) may
+  check tests or fixes changed after the approval, and the report treats
+  the latest recorded round as the stage outcome (a later non-approved
+  round supersedes the earlier approval and is shown as not complete).
+  Records are orchestrator-supplied, not telemetry: they
+  are stored in the task JSON (`reviews`) under the ingest lock, never parsed
+  from agent prose, and never change usage, legacy, or cost data. The
+  command does not ingest, fetch pricing, or regenerate the Markdown report
+  — run `copilot-task-report.py report <task>` (or wait for the next
+  ingest) to see them. Invocation ids are checked by exact match against the
+  observed registry at render time; an id seen before its session is
+  ingested shows as not (yet) observed.
+
 ### Limitations
 
 - Usage is tracked only from the moment the toolkit is first used on a
@@ -361,6 +410,20 @@ prompted to keep, rename, or delete it.
   `~/Desktop/CopilotTaskReports` location).
 - Copilot-internal nano-AIU/premium-request figures are opaque accounting
   units reported by Copilot itself, kept separate from the USD estimate.
+- Model calls are not attributed to custom agents (no supported telemetry
+  link exists); existing task reports show their earlier usage as legacy
+  once re-ingested. Review records are only as accurate as the orchestrator
+  that supplies them, budgets are enforced per `cycle_id` (a new cycle id
+  cannot be verified as a genuinely new work item), and a task with no
+  records — including all work before this feature — is not evidence of a
+  skipped review.
+- Crash safety is unchanged: offsets are written before the task file, so a
+  crash between the two can undercount (never double count) usage and
+  registry events; ingestion is not exactly-once. An existing task file that
+  is unreadable or belongs to another task is never replaced: ingest refuses
+  with a non-zero exit before advancing any offsets. (When `copilot-s`
+  deletes a session, a failed ingest is only warned about and the session
+  directory is still removed, as before.)
 
 See [`docs/architecture.md`](docs/architecture.md) for the full list of
 documented tradeoffs.
@@ -476,6 +539,20 @@ stage. Only complex/high-risk work typically pulls in discovery,
 `fixer` agent: `coder`/`senior-coder` handle their own targeted fixes at
 whichever tier originally implemented the code, so there's no hand-off
 duplication.
+
+The default handoff order is: implement → run the relevant tests (`tester`
+writes them when new tests are needed; otherwise the built-in `task` route
+runs the existing ones) → one comprehensive `reviewer` pass over the whole
+code-and-test batch → `test-reviewer` for complex/high-risk work. Stages
+exchange a compact manifest (task/cycle/batch, changed files and authors,
+test results, unresolved findings); later fix rounds carry only the changed
+subset and finding numbers. Tests added after a coverage review are re-run
+and get a focused correctness check inside the same budgets of the same
+work-item cycle (reviewer and test-reviewer: 1 broad + up to 3 focused;
+tester: 1 initial + up to 3 retests), and exhausted budgets escalate. After each review response the
+main session records the round with `copilot-task-report.py record-review`
+(reviewers stay read-only); see [Attribution coverage and recorded
+reviews](#attribution-coverage-and-recorded-reviews).
 
 For standard, complex, and high-risk tasks, and for broad discovery or
 design planning at any tier, the orchestrator asks the user to approve

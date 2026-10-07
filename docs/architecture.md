@@ -184,6 +184,53 @@ aggregate as Markdown.
   recorded offset (e.g. rotated/rewound), ingestion prints a warning and
   resumes from the file's current end rather than stalling forever or
   risking a double-count reread.
+- **Attribution (versioned, additive)** — `merge_delta_into_task` starts a
+  `task["attribution"]` block (`schema_version` 1) the first time a task is
+  ingested by this version, freezing the task's existing totals as
+  `legacy`. Every new call is added to `unknown`, keyed by an explicit
+  reason: OTEL chat spans carry no observed agent/invocation identifier, and
+  calls are never attributed from timestamps, models, or agent intervals.
+  `legacy + unknown (+ attributed, always 0) == totals` is checked at render
+  time. A future evidenced join would add a separate bucket under a new
+  schema version. No per-agent cost is computed; `official_cost` is
+  untouched. An unsupported/malformed block is left unchanged and shown as
+  unreadable.
+- **Observed invocation registry** — `subagent.started`/`subagent.completed`
+  events that carry an `agentId` are stored under
+  `attribution.observed_invocations[<session id>][<agentId>]` (agent name,
+  started/completed flags and timestamps, model, conflicting-observation
+  count). Merging is idempotent per event kind (identical replays are
+  no-ops; a differing value keeps the first and counts a conflict), the
+  session-id key prevents cross-session collisions, and registry-only
+  deltas (e.g. a lone `subagent.started`) are merged even without model
+  calls. Registry presence is informational, not ownership; the
+  self-reported `by_agent` table is unchanged. The existing cursor,
+  partial-line, truncation and install-epoch semantics apply unchanged,
+  including the undercount-not-double-count crash behavior (not
+  exactly-once).
+- **Review records** — `record-review --input <file>` validates one
+  orchestrator-supplied reviewer/test-reviewer round record
+  (`copilot-task-report.review-record` v1; strict fields, no defaults,
+  duplicate JSON keys and NaN rejected, 64 KB cap), then under the ingest
+  lock reads the task file strictly (an unreadable file is never
+  overwritten), applies the bounded policy per `(task, cycle_id, stage)`
+  — one record per round slot (so no second broad review), round N needs
+  N−1, rounds ≤ 3, nothing after `escalated`, session changes never reset
+  the budget. `approved` is not terminal: a later in-order focused round of
+  the same cycle may check tests/fixes changed after the approval, and the
+  report's stage outcome is the latest recorded round (a later
+  non-approved round supersedes the approval and is not complete). It
+  atomically writes `task["reviews"]`. An
+  identical replay is a no-op; a conflicting one fails. A missing task file
+  gets only `task_id` and `reviews`. It never ingests, fetches pricing,
+  regenerates the report, or changes usage/attribution data; the report's
+  *Recorded Reviews* section checks invocation ids against the registry by
+  exact id at render time. `ingest` uses the same strict read before it
+  reads any telemetry or writes session state: an existing task file that is
+  unreadable, not a JSON object, or names another task (by `task_id`, else
+  legacy `jira_key`, exact or normalized) makes it exit non-zero with a
+  stderr message, leaving the task file, state file and offsets untouched
+  (a missing file is still a new task).
 
 ### Effort intent labeling
 
@@ -271,6 +318,18 @@ the Copilot CLI's custom-agent mechanism; every frontmatter description
 and body explicitly reinforces bounded scope, concise output, and no
 duplicated work, since that's part of this pipeline's cost-control
 design, not just documentation.
+
+The default handoff order is implement → relevant tests (`tester` only when
+new tests are needed; otherwise the built-in `task` route runs existing
+ones) → one comprehensive `reviewer` pass over the full code-and-test batch
+→ `test-reviewer` for complex/high-risk work, exchanging a compact handoff
+manifest rather than per-file narration. Tests added after a coverage
+review are re-run and focused-checked inside the same budgets of the same
+work-item cycle (one `cycle_id` per requested work item, not the lifetime of
+a task report). The
+main session records each review round with `record-review` (see above);
+reviewers stay read-only, and `cycle_id` scopes a budget to one requested
+work item.
 
 This is pure configuration — no code ties the pipeline to the session
 manager or the task reporter. You can adopt just the agents, just the

@@ -167,6 +167,8 @@ EXPECTED_ROUTING = {
             "review_budget": (
                 "one_comprehensive_pass_plus_up_to_3_focused_verification_rounds"
             ),
+            "broad_review_timing": "after_complete_code_and_test_batch",
+            "review_record_command": "copilot-task-report.py record-review",
         },
     },
     "routing_approval": {
@@ -525,6 +527,53 @@ class TestAgentInventory(unittest.TestCase):
         self.assertEqual(
             policy["review_budget"],
             "one_comprehensive_pass_plus_up_to_3_focused_verification_rounds",
+        )
+
+    def test_review_batch_order_cycles_and_recording_policy_are_explicit(self):
+        policy = parse_agent_routing(ROUTING_CONFIG)["task_routing"]["code_review"]
+        self.assertEqual(
+            policy["broad_review_timing"],
+            "after_complete_code_and_test_batch",
+        )
+        self.assertEqual(
+            policy["review_record_command"],
+            "copilot-task-report.py record-review",
+        )
+
+        with open(ORCHESTRATOR_INSTRUCTIONS, "r", encoding="utf-8") as f:
+            instructions = f.read()
+        handoff = " ".join(
+            instructions.split("## Batched handoff and review records", 1)[1].split()
+        )
+
+        # The batch must be implemented and tested before one comprehensive
+        # correctness review; the separate test-quality gate follows it.
+        default_order = handoff.split("- If new or changed tests", 1)[0]
+        ordered_markers = (
+            "implement → run the relevant tests → **one** comprehensive",
+            "reviewer` pass over the entire batch",
+            "`test-reviewer` coverage review",
+        )
+        positions = [default_order.index(marker) for marker in ordered_markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("do not run it in parallel with, or before, the tests", handoff)
+        self.assertIn("each get 1 broad pass +", handoff)
+        self.assertIn("up to 3 focused", handoff)
+        self.assertIn("A new session never resets these budgets.", handoff)
+
+        records = handoff.split("### Recording review outcomes", 1)[1]
+        self.assertIn("cycle_id` names one requested work item", records)
+        self.assertIn("Never start a new cycle id to get a fresh review budget.", records)
+        self.assertIn("Records are not moved if the session is later ingested under a different task.", records)
+        self.assertIn("a task report may contain many cycles", handoff)
+        normalized_handoff = " ".join(handoff.split()).casefold()
+        self.assertIn(
+            "per requested work item — one `cycle_id` — not the whole, possibly multi-week task report",
+            normalized_handoff,
+        )
+        self.assertIn(
+            "fixes, retests and follow-up sessions for the same work item stay in the same cycle",
+            normalized_handoff,
         )
 
     def test_review_instructions_cover_small_and_main_authored_code_batches(self):

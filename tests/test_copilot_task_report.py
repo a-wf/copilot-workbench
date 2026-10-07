@@ -814,6 +814,859 @@ class TestMultiSessionSameTicketAggregation(BaseTestCase):
         self.assertEqual(t["totals"]["completion_tokens"], 15)
 
 
+class TestModelCallAttribution(BaseTestCase):
+    """Model-call attribution stays conservative while the invocation
+    registry remains a separate, session-scoped source of observations."""
+
+    def test_calls_inside_overlapping_agent_windows_remain_unknown(self):
+        session_id = "sess-attribution-overlap"
+        agent_start = self.t0 + timedelta(minutes=1)
+        first_call = self.t0 + timedelta(minutes=2)
+        second_call = self.t0 + timedelta(minutes=3)
+        agent_end = self.t0 + timedelta(minutes=4)
+        write_jsonl(self.events_path(session_id), [
+            {
+                "type": "subagent.started",
+                "agentId": "agent-coder",
+                "timestamp": iso(agent_start),
+                "data": {"agentName": "coder"},
+            },
+            {
+                "type": "subagent.started",
+                "agentId": "agent-reviewer",
+                "timestamp": iso(agent_start),
+                "data": {"agentName": "reviewer"},
+            },
+            {
+                "type": "subagent.completed",
+                "agentId": "agent-coder",
+                "timestamp": iso(agent_end),
+                "data": {"agentName": "coder", "model": "same-model",
+                         "totalTokens": 900, "durationMs": 7000},
+            },
+            {
+                "type": "subagent.completed",
+                "agentId": "agent-reviewer",
+                "timestamp": iso(agent_end),
+                "data": {"agentName": "reviewer", "model": "same-model",
+                         "totalTokens": 800, "durationMs": 6000},
+            },
+            # A completion without its event-provided ID remains a
+            # self-reported summary only; it cannot create a registry ID.
+            {
+                "type": "subagent.completed",
+                "timestamp": iso(agent_end),
+                "data": {"agentName": "task", "model": "same-model",
+                         "totalTokens": 700, "durationMs": 5000},
+            },
+        ])
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id, "chat same-model", first_call,
+                first_call + timedelta(seconds=1),
+                usage_attrs("same-model", prompt=7, completion=3),
+            ),
+            otel_span(
+                session_id, "chat same-model", second_call,
+                second_call + timedelta(seconds=1),
+                usage_attrs("same-model", prompt=5, completion=5),
+            ),
+        ])
+
+        self.assertEqual(self.ingest(session_id, "ATTR-OVERLAP-1"), 0)
+        task = self.task("ATTR-OVERLAP-1")
+        summary = self.mod.summarize_attribution(task)
+        reason = self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+
+        self.assertEqual(task["totals"]["call_count"], 2)
+        self.assertEqual(task["totals"]["total_tokens"], 20)
+        self.assertEqual(summary["unknown"][reason], {"calls": 2, "total_tokens": 20})
+        self.assertEqual(summary["attributed_calls"], 0)
+        self.assertEqual(summary["attributed_tokens"], 0)
+        self.assertTrue(summary["reconciled"])
+        self.assertEqual(summary["registry_invocations"], 2)
+        self.assertEqual(task["by_agent"]["coder"]["total_tokens"], 900)
+        self.assertEqual(task["by_agent"]["reviewer"]["total_tokens"], 800)
+        self.assertEqual(task["by_agent"]["task"]["total_tokens"], 700)
+        self.assertNotEqual(task["by_agent"]["coder"]["total_tokens"],
+                            task["totals"]["total_tokens"])
+
+        with open(self.mod.report_path("ATTR-OVERLAP-1"), encoding="utf-8") as f:
+            report = f.read()
+        self.assertIn("Unknown is not the main session", report)
+        self.assertIn("not evidence of a skipped or failed review", report)
+
+    def test_registry_is_session_scoped_idempotent_and_conflicts_are_counted(self):
+        task = {"task_id": "ATTR-REGISTRY-1", "totals": self.mod.blank_agg()}
+        attribution = self.mod.prepare_attribution_block(task)
+        original_events = [
+            {"agent_id": "shared-agent", "event": "started", "ts": 100.0,
+             "agent_name": "coder", "model": None},
+            {"agent_id": "shared-agent", "event": "completed", "ts": 110.0,
+             "agent_name": "coder", "model": "model-a"},
+            {"agent_id": "started-only", "event": "started", "ts": 120.0,
+             "agent_name": "tester", "model": None},
+            {"agent_id": "completed-only", "event": "completed", "ts": 130.0,
+             "agent_name": "reviewer", "model": "model-b"},
+            # Missing/empty source IDs are ignored rather than synthesized.
+            {"agent_id": None, "event": "started", "ts": 140.0,
+             "agent_name": "guessed-agent", "model": None},
+        ]
+        delta = {"unknown": {}, "invocation_events": original_events}
+        self.mod.merge_attribution_delta(attribution, delta, "session-a")
+        self.mod.merge_attribution_delta(attribution, delta, "session-a")
+
+        shared = attribution["observed_invocations"]["session-a"]["shared-agent"]
+        self.assertEqual(shared["conflicting_observations"], 0)
+        self.assertEqual(len(attribution["observed_invocations"]["session-a"]), 3)
+
+        conflicting_completion = {
+            "unknown": {},
+            "invocation_events": [{
+                "agent_id": "shared-agent",
+                "event": "completed",
+                "ts": 111.0,
+                "agent_name": "reviewer",
+                "model": "model-c",
+            }],
+        }
+        self.mod.merge_attribution_delta(
+            attribution, conflicting_completion, "session-a"
+        )
+        self.mod.merge_attribution_delta(
+            attribution,
+            {"unknown": {}, "invocation_events": [{
+                "agent_id": "shared-agent",
+                "event": "started",
+                "ts": 100.0,
+                "agent_name": "coder",
+                "model": None,
+            }]},
+            "session-b",
+        )
+
+        summary = self.mod.summarize_attribution(task)
+        self.assertEqual(shared["conflicting_observations"], 3)
+        self.assertEqual(summary["registry_invocations"], 4)
+        self.assertEqual(summary["registry_sessions"], 2)
+        self.assertEqual(summary["registry_conflicts"], 3)
+        self.assertEqual(summary["registry"]["tester"]["started_only"], 1)
+        self.assertEqual(summary["registry"]["reviewer"]["completed_only"], 1)
+        self.assertEqual(
+            attribution["observed_invocations"]["session-b"]["shared-agent"][
+                "conflicting_observations"
+            ],
+            0,
+        )
+
+    def test_legacy_snapshot_and_incremental_calls_reconcile_without_replay(self):
+        task_id = "ATTR-LEGACY-1"
+        legacy_call = {
+            "prompt_tokens": 20, "completion_tokens": 10,
+            "reasoning_tokens": 2, "cache_read_tokens": 3,
+            "cache_write_tokens": 1, "total_tokens": 30,
+            "duration_ms": 500, "effort_key": "unknown",
+        }
+        legacy = self.mod.blank_agg()
+        self.mod.add_agg(legacy, legacy_call)
+        totals = dict(legacy)
+        totals.update({
+            "first_call_ts": self.t0.timestamp() - 60,
+            "last_call_ts": self.t0.timestamp() - 1,
+            "nano_aiu": 13,
+            "premium_requests": 2,
+        })
+        self.mod.atomic_write(
+            self.mod.task_path(task_id),
+            json.dumps({
+                "task_id": task_id,
+                "totals": totals,
+                "by_model": {"legacy-model": legacy},
+                "by_effort": {"unknown": legacy},
+            }),
+        )
+
+        session_id = "sess-attribution-legacy"
+        t1 = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(session_id, "chat current-model", t1, t1 + timedelta(seconds=1),
+                      usage_attrs("current-model", prompt=10, completion=5)),
+        ])
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+        first = self.task(task_id)
+        att_first = copy.deepcopy(first["attribution"])
+        self.assertEqual(att_first["legacy"], legacy)
+        reason = self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+        self.assertEqual(att_first["unknown"][reason]["call_count"], 1)
+        self.assertEqual(att_first["unknown"][reason]["total_tokens"], 15)
+        self.assertEqual(self.mod.summarize_attribution(first)["legacy_calls"], 1)
+
+        # A no-op replay must not add the same call to either total or
+        # attribution buckets.
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+        replayed = self.task(task_id)
+        self.assertEqual(replayed["attribution"], att_first)
+        self.assertEqual(replayed["totals"]["call_count"], 2)
+
+        t2 = self.t0 + timedelta(minutes=2)
+        write_jsonl(self.otel_path(), [
+            otel_span(session_id, "chat current-model", t2, t2 + timedelta(seconds=1),
+                      usage_attrs("current-model", prompt=2, completion=3)),
+        ])
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+        final = self.task(task_id)
+        summary = self.mod.summarize_attribution(final)
+        self.assertEqual(final["attribution"]["legacy"], legacy)
+        self.assertEqual(final["attribution"]["unknown"][reason]["call_count"], 2)
+        self.assertEqual(final["attribution"]["unknown"][reason]["total_tokens"], 20)
+        self.assertEqual(final["totals"]["call_count"], 3)
+        self.assertEqual(final["totals"]["total_tokens"], 50)
+        self.assertTrue(summary["reconciled"])
+
+    def test_old_delta_without_attribution_falls_back_to_unknown(self):
+        task = {"task_id": "ATTR-OLD-DELTA-1"}
+        call_agg = self.mod.blank_agg()
+        self.mod.add_agg(call_agg, {
+            "prompt_tokens": 4, "completion_tokens": 6,
+            "reasoning_tokens": 0, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "total_tokens": 10,
+            "duration_ms": 10, "effort_key": "unknown",
+        })
+        old_delta = {
+            "by_model": {"legacy-delta-model": call_agg},
+            "by_effort": {},
+            "agent_summaries": [],
+            "repositories": [],
+            "min_ts": None,
+            "max_ts": None,
+            "nano_aiu_delta": 0,
+            "premium_requests_delta": 0,
+        }
+
+        self.mod.merge_delta_into_task(task, old_delta, "session-old-delta", task["task_id"])
+        summary = self.mod.summarize_attribution(task)
+        reason = self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+        self.assertEqual(summary["unknown"][reason], {"calls": 1, "total_tokens": 10})
+        self.assertEqual(summary["attributed_calls"], 0)
+        self.assertTrue(summary["reconciled"])
+
+    def test_malformed_attribution_is_preserved_while_new_usage_is_counted(self):
+        task_id = "ATTR-MALFORMED-1"
+        malformed = {"schema_version": 99, "custom": {"keep": True}}
+        self.mod.atomic_write(
+            self.mod.task_path(task_id),
+            json.dumps({"task_id": task_id, "attribution": malformed}),
+        )
+        session_id = "sess-attribution-malformed"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(session_id, "chat model-x", start, start + timedelta(seconds=1),
+                      usage_attrs("model-x", prompt=2, completion=3)),
+        ])
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stderr(stderr_capture):
+            self.assertEqual(self.ingest(session_id, task_id), 0)
+
+        task = self.task(task_id)
+        self.assertEqual(task["attribution"], malformed)
+        self.assertEqual(task["totals"]["call_count"], 1)
+        self.assertEqual(self.mod.summarize_attribution(task)["status"], "unreadable")
+        self.assertIn("unsupported/malformed attribution block", stderr_capture.getvalue())
+        with open(self.mod.report_path(task_id), encoding="utf-8") as f:
+            report = f.read()
+        self.assertIn("unsupported or malformed schema", report)
+
+
+class TestReviewRecords(BaseTestCase):
+    """The explicit review recorder validates bounded per-work-item
+    outcomes and never mutates usage/pricing/report data."""
+
+    def review_record(self, **overrides):
+        record = {
+            "schema": "copilot-task-report.review-record",
+            "schema_version": 1,
+            "record_id": "work-1-reviewer-r0",
+            "task_id": "REVIEW-1",
+            "session_id": "unknown",
+            "cycle_id": "work-1",
+            "stage": "reviewer",
+            "round": 0,
+            "verdict": "needs-fixes",
+            "invocation_id": "unknown",
+            "invocation_unknown_reason": "task result did not expose an agent id",
+            "provenance": {
+                "source": "orchestrator-supplied",
+                "basis": "agent-response",
+                "reference": "reviewer broad review: findings 1 and 2",
+            },
+        }
+        record.update(overrides)
+        return record
+
+    def write_review_input(self, record, filename="review-input.json"):
+        path = os.path.join(self.tmp, filename)
+        self.mod.atomic_write(path, json.dumps(record))
+        return path
+
+    def run_recorder(self, record):
+        path = self.write_review_input(record)
+
+        class Args:
+            pass
+
+        args = Args()
+        args.input = path
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = self.mod.cmd_record_review(args)
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def apply(self, task, raw_record):
+        record = self.mod.validate_review_record(raw_record)
+        return self.mod.apply_review_record(task, record)
+
+    def test_review_record_validation_is_strict_and_normalizes_task_id(self):
+        valid = self.review_record(task_id="  review-123  ")
+        parsed = self.mod.validate_review_record(valid)
+        self.assertEqual(parsed["task_id"], "REVIEW-123")
+        self.assertEqual(parsed["invocation_id"], "unknown")
+        self.assertEqual(parsed["invocation_unknown_reason"],
+                         "task result did not expose an agent id")
+
+        invalid_records = []
+        bad = copy.deepcopy(valid)
+        bad["schema_version"] = True
+        invalid_records.append(("boolean schema version", bad))
+        bad = copy.deepcopy(valid)
+        bad["schema_version"] = 2
+        invalid_records.append(("unsupported schema version", bad))
+        bad = copy.deepcopy(valid)
+        bad["round"] = True
+        invalid_records.append(("boolean round", bad))
+        bad = copy.deepcopy(valid)
+        bad["round"] = 4
+        invalid_records.append(("round beyond budget", bad))
+        bad = copy.deepcopy(valid)
+        bad["unrecognized"] = "field"
+        invalid_records.append(("unknown field", bad))
+        bad = copy.deepcopy(valid)
+        bad.pop("invocation_unknown_reason")
+        invalid_records.append(("unknown invocation without reason", bad))
+        bad = copy.deepcopy(valid)
+        bad["invocation_id"] = "agent-real"
+        invalid_records.append(("unknown reason with a real invocation id", bad))
+        bad = copy.deepcopy(valid)
+        bad["invocation_id"] = "Unknown"
+        invalid_records.append(("noncanonical unknown literal", bad))
+        bad = copy.deepcopy(valid)
+        bad["stage"] = "coder"
+        invalid_records.append(("unsupported stage", bad))
+        bad = copy.deepcopy(valid)
+        bad["task_id"] = "../outside"
+        invalid_records.append(("unsafe task id", bad))
+        bad = copy.deepcopy(valid)
+        bad["provenance"]["source"] = "telemetry"
+        invalid_records.append(("unsupported provenance source", bad))
+        bad = copy.deepcopy(valid)
+        bad["provenance"]["reference"] = "line one\nline two"
+        invalid_records.append(("multiline provenance", bad))
+        bad = copy.deepcopy(valid)
+        bad["provenance"]["reference"] = "x" * 501
+        invalid_records.append(("overlong provenance", bad))
+
+        for label, invalid in invalid_records:
+            with self.subTest(case=label):
+                with self.assertRaises(self.mod.ReviewRecordError):
+                    self.mod.validate_review_record(invalid)
+
+    def test_review_input_rejects_duplicate_keys_nonfinite_oversize_and_bad_utf8(self):
+        valid_text = json.dumps(self.review_record())
+        invalid_inputs = [
+            ("empty", b" \n"),
+            ("invalid UTF-8", b"\xff"),
+            ("duplicate JSON keys", b'{"schema":"one","schema":"two"}'),
+            ("NaN", valid_text.replace('"round": 0', '"round": NaN').encode("utf-8")),
+            ("oversize", b" " * (self.mod.REVIEW_INPUT_MAX_BYTES + 1)),
+        ]
+        path = os.path.join(self.tmp, "strict-input.json")
+        for label, contents in invalid_inputs:
+            with self.subTest(case=label):
+                with open(path, "wb") as f:
+                    f.write(contents)
+                with self.assertRaises(self.mod.ReviewRecordError):
+                    self.mod.load_review_record_input(path)
+
+    def test_review_budget_is_per_cycle_and_stage_with_ordered_terminal_rounds(self):
+        task = {"task_id": "REVIEW-1"}
+        first = self.review_record(verdict="needs-fixes")
+        self.assertEqual(self.apply(task, first), "recorded")
+        after_first = copy.deepcopy(task)
+
+        # An identical record replay is idempotent; a different session
+        # cannot create another broad review in the same work-item cycle.
+        self.assertEqual(self.apply(task, first), "duplicate")
+        self.assertEqual(task, after_first)
+        second_broad = self.review_record(
+            record_id="work-1-reviewer-r0-again", session_id="different-session"
+        )
+        with self.assertRaisesRegex(self.mod.ReviewRecordError, "second one"):
+            self.apply(task, second_broad)
+        out_of_order = self.review_record(
+            record_id="work-1-reviewer-r2", round=2
+        )
+        with self.assertRaisesRegex(self.mod.ReviewRecordError, "requires round 1"):
+            self.apply(task, out_of_order)
+        self.assertEqual(task, after_first)
+
+        focused_approval = self.review_record(
+            record_id="work-1-reviewer-r1", session_id="different-session",
+            round=1, verdict="approved",
+        )
+        self.assertEqual(self.apply(task, focused_approval), "recorded")
+        post_approval = self.review_record(
+            record_id="work-1-reviewer-r2", session_id="third-session",
+            round=2, verdict="needs-fixes",
+        )
+        self.assertEqual(self.apply(task, post_approval), "recorded")
+        outcome = "\n".join(self.mod.render_review_section(task))
+        self.assertIn("latest verdict needs-fixes at focused 2 of 3", outcome)
+        self.assertIn("supersedes the earlier approval at focused 1 of 3", outcome)
+
+        # Only escalation ends a stage before the round limit; no later
+        # focused round can be recorded after an escalated verdict.
+        escalated = self.review_record(
+            record_id="work-escalated-reviewer-r0", cycle_id="work-escalated",
+            verdict="escalated",
+        )
+        self.assertEqual(self.apply(task, escalated), "recorded")
+        after_escalation = copy.deepcopy(task)
+        after_escalation_round = self.review_record(
+            record_id="work-escalated-reviewer-r1", cycle_id="work-escalated",
+            round=1, verdict="needs-fixes",
+        )
+        with self.assertRaisesRegex(self.mod.ReviewRecordError, "already ended"):
+            self.apply(task, after_escalation_round)
+        self.assertEqual(task, after_escalation)
+
+        # The test-reviewer stage has an independent budget, and a genuinely
+        # separate work cycle may be recorded on the same task.
+        test_review = self.review_record(
+            record_id="work-1-test-reviewer-r0", stage="test-reviewer",
+            verdict="approved",
+        )
+        self.assertEqual(self.apply(task, test_review), "recorded")
+        next_work_item = self.review_record(
+            record_id="work-2-reviewer-r0", cycle_id="work-2",
+            verdict="unknown",
+        )
+        self.assertEqual(self.apply(task, next_work_item), "recorded")
+
+    def test_approved_review_test_review_fixes_then_same_cycle_reviewer_round(self):
+        task = {"task_id": "REVIEW-1"}
+        broad_approval = self.review_record(
+            record_id="mixed-reviewer-r0", verdict="approved",
+        )
+        test_review_needs_fixes = self.review_record(
+            record_id="mixed-test-reviewer-r0", stage="test-reviewer",
+            verdict="needs-fixes",
+        )
+        reviewer_followup = self.review_record(
+            record_id="mixed-reviewer-r1", round=1, verdict="needs-fixes",
+        )
+
+        self.assertEqual(self.apply(task, broad_approval), "recorded")
+        self.assertEqual(self.apply(task, test_review_needs_fixes), "recorded")
+        self.assertEqual(self.apply(task, reviewer_followup), "recorded")
+        outcome = "\n".join(self.mod.render_review_section(task))
+        self.assertIn("supersedes the earlier approval at broad", outcome)
+
+    def test_known_invocation_is_exact_session_lookup_not_call_token_ownership(self):
+        task = {"task_id": "REVIEW-ID-1", "totals": self.mod.blank_agg()}
+        att = self.mod.prepare_attribution_block(task)
+        call = {
+            "prompt_tokens": 8, "completion_tokens": 2,
+            "reasoning_tokens": 0, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "total_tokens": 10,
+            "duration_ms": 100, "effort_key": "unknown",
+        }
+        self.mod.add_agg(task["totals"], call)
+        unknown = att["unknown"].setdefault(
+            self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK, self.mod.blank_agg()
+        )
+        self.mod.add_agg(unknown, call)
+        record = self.review_record(
+            record_id="review-known-id",
+            task_id="REVIEW-ID-1",
+            session_id="session-exact",
+            invocation_id="agent-observed-later",
+        )
+        record.pop("invocation_unknown_reason")
+        self.assertEqual(self.apply(task, record), "recorded")
+
+        pending_markdown = "\n".join(self.mod.render_review_section(task))
+        self.assertIn("not observed in this task's registry", pending_markdown)
+        self.assertEqual(
+            self.mod.observed_invocation_status(
+                task, "other-session", "agent-observed-later"
+            ),
+            "not observed in this task's registry (not ingested yet, or recorded under another task)",
+        )
+        self.assertEqual(self.mod.summarize_attribution(task)["attributed_calls"], 0)
+
+        self.mod.merge_attribution_delta(
+            att,
+            {"unknown": {}, "invocation_events": [{
+                "agent_id": "agent-observed-later",
+                "event": "started",
+                "ts": 123.0,
+                "agent_name": "reviewer",
+                "model": None,
+            }]},
+            "session-exact",
+        )
+        observed_markdown = "\n".join(self.mod.render_review_section(task))
+        summary = self.mod.summarize_attribution(task)
+        self.assertIn("observed in events.jsonl registry", observed_markdown)
+        self.assertEqual(summary["unknown_calls"], 1)
+        self.assertEqual(summary["attributed_calls"], 0)
+        self.assertTrue(summary["reconciled"])
+
+    def test_recording_preserves_usage_pricing_and_existing_report(self):
+        task_id = "PRESERVE-1"
+        task = {
+            "task_id": task_id,
+            "totals": dict(self.mod.blank_agg(), call_count=2, total_tokens=15),
+            "by_model": {"model-before-review": dict(self.mod.blank_agg(),
+                                                      call_count=2, total_tokens=15)},
+            "official_cost": {"sentinel": {"calls": 2, "usd": "frozen"}},
+            "attribution": {"schema_version": 1, "legacy": {"call_count": 2},
+                            "unknown": {}, "observed_invocations": {},
+                            "provenance": {"sentinel": "preserved"}},
+        }
+        before = copy.deepcopy(task)
+        self.mod.atomic_write(self.mod.task_path(task_id), json.dumps(task))
+        report_path = self.mod.report_path(task_id)
+        self.mod.atomic_write(report_path, "# previously generated report\n")
+        with open(report_path, encoding="utf-8") as f:
+            report_before = f.read()
+
+        record = self.review_record(task_id=task_id, verdict="approved")
+        with mock.patch.object(
+            self.mod, "build_delta", side_effect=AssertionError("must not ingest")
+        ), mock.patch.object(
+            self.mod, "refresh_official_pricing_if_due",
+            side_effect=AssertionError("must not fetch pricing")
+        ), mock.patch.object(
+            self.mod, "render_markdown",
+            side_effect=AssertionError("must not regenerate report")
+        ):
+            rc, _, stderr = self.run_recorder(record)
+
+        self.assertEqual(rc, 0, stderr)
+        stored = self.task(task_id)
+        for key, value in before.items():
+            self.assertEqual(stored[key], value, key)
+        self.assertIn("work-1-reviewer-r0", stored["reviews"]["records"])
+        with open(report_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), report_before)
+
+    def test_new_task_cli_record_is_minimal_idempotent_and_does_not_render(self):
+        home = os.path.join(self.tmp, "cli-home")
+        reports = os.path.join(self.tmp, "cli-reports")
+        os.makedirs(home)
+        record = self.review_record(
+            record_id="cli-cycle-review-r0",
+            task_id="cli-9",
+            cycle_id="cli-cycle",
+            verdict="approved",
+        )
+        input_path = self.write_review_input(record, "cli-review.json")
+        env = os.environ.copy()
+        env["HOME"] = home
+        env["COPILOT_TASK_REPORTS_DIR"] = reports
+        env["COPILOT_TASK_REPORT_PRICING_FETCH"] = "0"
+
+        command = [
+            sys.executable, MODULE_PATH, "record-review",
+            "--input", input_path,
+        ]
+        first = subprocess.run(
+            command, cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+            timeout=30,
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        task_path = os.path.join(
+            home, ".copilot", "task-reports", "tasks", "CLI-9.json"
+        )
+        with open(task_path, encoding="utf-8") as f:
+            stored = json.load(f)
+        self.assertEqual(set(stored), {"task_id", "reviews"})
+        self.assertEqual(stored["task_id"], "CLI-9")
+        self.assertFalse(os.path.exists(os.path.join(reports, "CLI-9.md")))
+        self.assertIn("not regenerated", first.stdout)
+
+        with open(task_path, "rb") as f:
+            before_replay = f.read()
+        replay = subprocess.run(
+            command, cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+            timeout=30,
+        )
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        self.assertIn("nothing changed", replay.stdout)
+        with open(task_path, "rb") as f:
+            self.assertEqual(f.read(), before_replay)
+
+    def test_unassigned_review_stays_unassigned_after_later_named_ingest(self):
+        record = self.review_record(
+            record_id="unassigned-review-r0",
+            task_id="UNASSIGNED",
+            cycle_id="unassigned-work",
+            verdict="approved",
+        )
+        rc, _, stderr = self.run_recorder(record)
+        self.assertEqual(rc, 0, stderr)
+
+        session_id = "sess-review-later-assigned"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(session_id, "chat model-after-review", start,
+                      start + timedelta(seconds=1),
+                      usage_attrs("model-after-review", prompt=4, completion=2)),
+        ])
+        self.assertEqual(self.ingest(session_id, "LATER-ASSIGNED-1"), 0)
+        unassigned = self.task("UNASSIGNED")
+        assigned = self.task("LATER-ASSIGNED-1")
+        self.assertIn("unassigned-review-r0", unassigned["reviews"]["records"])
+        self.assertNotIn("reviews", assigned)
+        self.assertEqual(assigned["attribution"]["legacy"]["call_count"], 0)
+        self.assertEqual(
+            assigned["attribution"]["unknown"][
+                self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+            ]["call_count"],
+            1,
+        )
+
+    def test_corrupt_existing_task_file_is_never_overwritten(self):
+        task_id = "CORRUPT-1"
+        path = self.mod.task_path(task_id)
+        original = b'{"task_id": "CORRUPT-1",'
+        with open(path, "wb") as f:
+            f.write(original)
+
+        rc, _, stderr = self.run_recorder(self.review_record(task_id=task_id))
+        self.assertEqual(rc, 1)
+        self.assertIn("refusing to overwrite it", stderr)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_ingest_rejects_invalid_existing_task_without_consuming_telemetry(self):
+        task_id = "STRICT-1"
+        session_id = "sess-strict-task-file"
+        task_path = self.mod.task_path(task_id)
+        invalid_documents = [
+            ("malformed JSON", b'{"task_id":'),
+            ("non-object JSON", b"[]"),
+            ("invalid UTF-8", b"\xff"),
+            ("mismatched task id", b'{"task_id":"OTHER-1"}'),
+            ("null task id", b'{"task_id":null}'),
+        ]
+        original_state = b'{"keep":{"task_id":"KEEP-1","sentinel":true}}\n'
+        with open(self.mod.STATE_FILE, "wb") as f:
+            f.write(original_state)
+
+        t = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(session_id, "chat model-strict", t, t + timedelta(seconds=1),
+                      usage_attrs("model-strict", prompt=7, completion=3)),
+        ])
+        write_jsonl(self.events_path(session_id), [
+            {"type": "session.usage_checkpoint", "timestamp": iso(t),
+             "data": {"totalNanoAiu": 1_000_000_000, "totalPremiumRequests": 2}},
+        ])
+
+        for label, contents in invalid_documents:
+            with self.subTest(case=label):
+                with open(task_path, "wb") as f:
+                    f.write(contents)
+                with mock.patch.object(
+                    self.mod, "build_delta",
+                    side_effect=AssertionError("invalid task file must be checked before telemetry"),
+                ) as build_delta:
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        rc = self.ingest(session_id, task_id)
+
+                self.assertEqual(rc, 1)
+                self.assertIn("was not ingested", stderr.getvalue())
+                build_delta.assert_not_called()
+                with open(task_path, "rb") as f:
+                    self.assertEqual(f.read(), contents)
+                with open(self.mod.STATE_FILE, "rb") as f:
+                    self.assertEqual(f.read(), original_state)
+
+        # Repairing the destination lets the still-unconsumed telemetry be
+        # ingested on a later attempt.
+        self.mod.atomic_write(task_path, json.dumps({"task_id": task_id}))
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+        repaired = self.task(task_id)
+        self.assertEqual(repaired["totals"]["call_count"], 1)
+        self.assertEqual(repaired["totals"]["nano_aiu"], 1_000_000_000)
+        self.assertEqual(repaired["totals"]["premium_requests"], 2)
+
+    def test_record_review_accepts_normalized_and_legacy_task_identity(self):
+        cases = [
+            ("LEGACY-17", {"jira_key": "legacy-17"}, " legacy-17 "),
+            ("LEGACY-18", {"task_id": " legacy-18 "}, "LEGACY-18"),
+        ]
+        for index, (task_id, existing, supplied_id) in enumerate(cases):
+            with self.subTest(task_id=task_id):
+                path = self.mod.task_path(task_id)
+                self.mod.atomic_write(path, json.dumps(existing))
+                record = self.review_record(
+                    task_id=supplied_id,
+                    record_id="legacy-record-%d" % index,
+                    cycle_id="legacy-cycle-%d" % index,
+                )
+                with mock.patch.object(
+                    self.mod, "refresh_official_pricing_if_due",
+                    side_effect=AssertionError("record-review must not refresh or reprice"),
+                ) as refresh:
+                    rc, _, stderr = self.run_recorder(record)
+
+                self.assertEqual(rc, 0, stderr)
+                refresh.assert_not_called()
+                stored = self.task(task_id)
+                for key, value in existing.items():
+                    self.assertEqual(stored[key], value)
+                self.assertIn(record["record_id"], stored["reviews"]["records"])
+
+    def test_review_markdown_escapes_provenance_and_unknown_is_not_success(self):
+        task = {"task_id": "REVIEW-MD-1"}
+        record = self.review_record(
+            record_id="review-md-r0",
+            task_id="REVIEW-MD-1",
+            verdict="unknown",
+            provenance={
+                "source": "orchestrator-supplied",
+                "basis": "user-supplied",
+                "reference": "review | outcome unclear",
+            },
+        )
+        self.assertEqual(self.apply(task, record), "recorded")
+        markdown = "\n".join(self.mod.render_review_section(task))
+        self.assertIn("review \\| outcome unclear", markdown)
+        self.assertIn("explicitly unknown", markdown)
+        self.assertIn("unknown outcome at latest recorded round", markdown)
+
+    def test_review_markdown_escapes_backslash_before_pipe_in_table_cell(self):
+        task = {"task_id": "REVIEW-MD-BACKSLASH-1"}
+        reference = r"literal a\|b"
+        record = self.review_record(
+            record_id="review-md-backslash-r0",
+            task_id=task["task_id"],
+            verdict="unknown",
+            provenance={
+                "source": "orchestrator-supplied",
+                "basis": "user-supplied",
+                "reference": reference,
+            },
+        )
+        self.assertEqual(self.apply(task, record), "recorded")
+
+        markdown = "\n".join(self.mod.render_review_section(task))
+        expected = "literal a" + "\\" * 3 + "|b"
+        self.assertIn(expected, markdown)
+
+    def test_recorded_review_survives_ingest_and_explicit_report(self):
+        task_id = "REVIEW-INTEGRATION-42"
+        record = self.review_record(
+            record_id="integration-review-r0",
+            task_id=task_id,
+            cycle_id="integration-cycle",
+        )
+        rc, _, stderr = self.run_recorder(record)
+        self.assertEqual(rc, 0, stderr)
+        reviews_before_ingest = copy.deepcopy(self.task(task_id)["reviews"])
+
+        session_id = "sess-review-integration"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(session_id, "chat model-review-integration", start,
+                      start + timedelta(seconds=1),
+                      usage_attrs("model-review-integration", prompt=4, completion=2)),
+        ])
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+
+        stored = self.task(task_id)
+        self.assertEqual(stored["reviews"], reviews_before_ingest)
+        self.assertEqual(stored["attribution"]["legacy"]["call_count"], 0)
+        reason = self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+        self.assertEqual(stored["attribution"]["unknown"][reason]["call_count"], 1)
+        self.assertEqual(stored["totals"]["call_count"], 1)
+
+        # Recording and ingesting are not a substitute for the explicit
+        # report command; exercise that command with a normalizable ID.
+        class Args:
+            pass
+
+        args = Args()
+        args.task_id = " review-integration-42 "
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = self.mod.cmd_report(args)
+        self.assertEqual(rc, 0, stderr.getvalue())
+        with open(self.mod.report_path(task_id), encoding="utf-8") as f:
+            report = f.read()
+        self.assertIn("Recorded Reviews", report)
+        self.assertIn("integration-cycle", report)
+        self.assertIn("Recorded Reviews", stdout.getvalue())
+        self.assertIn("integration-cycle", stdout.getvalue())
+
+    def test_conflicting_record_id_is_rejected_without_changing_task_bytes(self):
+        record = self.review_record(
+            record_id="conflicting-review-r0",
+            task_id="REVIEW-CONFLICT-42",
+            cycle_id="conflicting-cycle",
+        )
+        rc, _, stderr = self.run_recorder(record)
+        self.assertEqual(rc, 0, stderr)
+
+        task_path = self.mod.task_path(record["task_id"])
+        with open(task_path, "rb") as f:
+            before = f.read()
+        conflicting = copy.deepcopy(record)
+        conflicting["verdict"] = "approved"
+        rc, _, stderr = self.run_recorder(conflicting)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("different content", stderr)
+        with open(task_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_malformed_existing_reviews_block_is_rejected_without_overwrite(self):
+        task_id = "REVIEW-MALFORMED-42"
+        task_path = self.mod.task_path(task_id)
+        malformed_task = {
+            "task_id": task_id,
+            "reviews": {
+                "schema_version": self.mod.REVIEWS_SCHEMA_VERSION,
+                "records": [],
+            },
+        }
+        original = json.dumps(malformed_task, separators=(",", ":")).encode("utf-8")
+        with open(task_path, "wb") as f:
+            f.write(original)
+
+        rc, _, stderr = self.run_recorder(self.review_record(task_id=task_id))
+
+        self.assertEqual(rc, 1)
+        self.assertIn("unsupported or malformed 'reviews' block", stderr)
+        with open(task_path, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+
 class TestReportRendering(BaseTestCase):
     """cmd_ingest must write a Markdown report with meaningful rendered
     values, and cmd_report must print that report (not just return 0)."""

@@ -47,3 +47,12 @@ Output format:
 
 Hand off failures to the same tier that implemented the change; hand off a
 clean pass to `test-reviewer` (if warranted) or mark the task complete.
+
+Run before the broad `reviewer` pass, so the reviewer sees the complete
+code-and-test batch. If existing tests already cover the change, you are
+skipped and the orchestrator runs the chosen existing test command through
+the built-in `task` route instead. New or edited tests requested after a
+`test-reviewer` coverage review are a fix/retest round within your same
+4-invocation budget (never a reset), and they still need a focused
+`reviewer` correctness check. Report results in the compact handoff
+manifest form (test command, pass/fail counts, changed test files).
