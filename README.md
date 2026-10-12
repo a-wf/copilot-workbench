@@ -442,7 +442,7 @@ documented tradeoffs.
 
 | Role | Purpose | Example model¹ |
 |---|---|---|
-| `discovery` | Read-only mapping of broad/unfamiliar codebase areas before planning or coding starts | `gemini-3.8-flash` (effort: `low`) |
+| `discovery` | Read-only mapping of broad/unfamiliar codebase areas before planning or coding starts | `gpt-6-luna` (effort: `low`) |
 | `planner` | Turns an ambiguous/design-heavy task into an ordered implementation plan, consuming discovery's output instead of re-exploring | `gpt-6.1-sol` (effort: `medium`) |
 | `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `gpt-6-luna` (effort: `xhigh`) |
 | `senior-coder` | Complex implementation and targeted fixes: multi-file architecture, async state, schema/data-model changes, deep structural bugs, new services | `claude-opus-5.5` (effort: `high`) |
@@ -496,10 +496,9 @@ This recommendation is not a code-review benchmark or evidence of
 superior defect detection. The reviewer role links to the dated Artificial
 Analysis model pages and GitHub's official per-token pricing; actual cost
 varies with tokens, cache use, and verbosity.
-`discovery` keeps
-`gemini-3.8-flash` regardless of this tiering, since its value is a large
-context window for mapping broad codebases, not raw task-solving
-capability. Each `reasoningEffort` is a per-agent frontmatter default
+`discovery` uses
+`gpt-6-luna` at low effort with long context for mapping broad codebases.
+Each `reasoningEffort` is a per-agent frontmatter default
 (CLI v1.0.66+) — override per-installation via `/subagents` rather than
 editing `agents/*.agent.md` directly.
 

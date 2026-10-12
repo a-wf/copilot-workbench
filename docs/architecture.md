@@ -296,7 +296,8 @@ exhausted with code unchecked, work stops for escalation. The
 correctness review of tester-authored code.
 
 The bounded flow is: `discovery` (read-only, broad/unfamiliar context
-only) and `planner` (ambiguity/design only, consumes discovery's output
+only; `gpt-6-luna`, low effort, long context) and `planner`
+(ambiguity/design only, consumes discovery's output
 instead of re-exploring) feed `coder` (routine CRUD/UI/standard logic;
 writes and fixes production code only) or `senior-coder` (multi-file
 architecture, async state, schema/data-model changes, deep structural

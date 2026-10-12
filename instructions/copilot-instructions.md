@@ -112,7 +112,7 @@ for this task, follow the user's override and mention the deviation.
 
 | Agent | Model | Reasoning effort | Context tier |
 |---|---|---|---|
-| `discovery` | `gemini-3.8-flash` | `low` | `long_context` |
+| `discovery` | `gpt-6-luna` | `low` | `long_context` |
 | `planner` | `gpt-6.1-sol` | `medium` | `long_context` |
 | `coder` | `gpt-6-luna` | `xhigh` | `default` |
 | `senior-coder` | `claude-opus-5.5` | `high` | `long_context` |

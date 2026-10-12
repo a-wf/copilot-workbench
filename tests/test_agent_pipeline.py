@@ -48,7 +48,7 @@ EXPECTED_AGENTS = {
     # (not a personal `/subagents` override), update this map to match, per
     # README.md's "Agent pipeline" section.
     "discovery": {
-        "model": "gemini-3.8-flash",
+        "model": "gpt-6-luna",
         "reasoningEffort": "low",
         "tools": ["read", "search"],
     },
@@ -88,7 +88,7 @@ EXPECTED_ROUTING = {
     "agents": {
         "discovery": {
             "role": "Codebase Mapping Specialist",
-            "model": "gemini-3.8-flash",
+            "model": "gpt-6-luna",
             "reasoning_effort": "low",
             "context_tier": "long_context",
         },

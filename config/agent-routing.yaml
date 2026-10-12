@@ -17,7 +17,7 @@ agents:
   # routes belong in built_in_tools below, not in agents/*.agent.md.
   discovery:
     role: Codebase Mapping Specialist
-    copilot: { model: gemini-3.8-flash, reasoning_effort: low, context_tier: long_context }
+    copilot: { model: gpt-6-luna, reasoning_effort: low, context_tier: long_context }
   planner:
     role: Implementation Planner
     copilot: { model: gpt-6.1-sol, reasoning_effort: medium, context_tier: long_context }
