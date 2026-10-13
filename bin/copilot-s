@@ -71,6 +71,16 @@ MAX_TASK_ID_LEN=200
 # actual source of truth for where reports are written).
 TASK_REPORTS_DIR_DISPLAY="${COPILOT_TASK_REPORTS_DIR:-$HOME/Desktop/CopilotTaskReports}"
 
+# --- Per-session context metrics (future copilot-s sessions only) ---
+# Must match CONTEXT_SIDECAR_NAME in copilot-task-report.py. Only sessions
+# that copilot-s itself created (and identified unambiguously after the run)
+# ever get this file; legacy/imported/external sessions never do, and the
+# session list only ever reads existing sidecars (never events logs).
+CONTEXT_SIDECAR_NAME="copilot-s-context.json"
+# Parallel to the lines of $FILTERED_FILE (index = line number - 1); filled
+# by load_context_labels. Plain indexed array: bash 3.2 compatible.
+CONTEXT_LABELS=()
+
 BOLD='\033[1m'
 DIM='\033[2m'
 CYAN='\033[36m'
@@ -407,6 +417,125 @@ detect_new_session() {
   done
 }
 
+# --- Strictly detect the session a brand-new `copilot` run created ---
+# Used ONLY to decide context-metrics enrollment (the keep/rename/delete
+# flow keeps using detect_new_session above, unchanged). Never guesses:
+#   prints the id and returns 0 only if exactly ONE session directory
+#     appeared during the run and its workspace.yaml cwd is $PWD;
+#   returns 1 (no output) if no new session directory appeared;
+#   returns 2 (no output) if the result is ambiguous (several new
+#     directories, e.g. a concurrent Copilot session, or a cwd mismatch).
+detect_enrollable_new_session() {
+  local before_file="$1"
+  local found="" count=0 dir id
+  for dir in "$SESSION_STATE_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    id=$(basename "$dir")
+    if ! grep -qxF -- "$id" "$before_file" 2>/dev/null; then
+      count=$((count + 1))
+      found="$id"
+    fi
+  done
+  [[ $count -eq 0 ]] && return 1
+  [[ $count -gt 1 ]] && return 2
+  local cwd
+  cwd=$(grep '^cwd:' "$SESSION_STATE_DIR/$found/workspace.yaml" 2>/dev/null | sed 's/^cwd: *//' || true)
+  [[ "$cwd" == "$PWD" ]] || return 2
+  echo "$found"
+  return 0
+}
+
+# --- Warn that a brand-new run's session was not enrolled for metrics ---
+# Shared by the stop flow (ambiguous mode) and run_copilot (when no session
+# could be attributed to the keep/rename/delete flow at all, e.g. the only
+# new session directory's workspace cwd differs from $PWD). Never invokes
+# the helper, never creates a sidecar.
+warn_context_not_enrolled() {
+  echo -e "${YELLOW}Warning: could not unambiguously identify the new session created by this run (e.g. another Copilot session started concurrently, or its workspace directory differs from the current directory) — context metrics were not recorded for it.${RESET}" >&2
+}
+
+# --- Show (and record) context metrics when a session stops ---
+#   $1 = session id, $2 = mode, $3 = epoch just before `copilot` launched
+# Modes:
+#   enroll    - brand-new session created by this copilot-s run, detected
+#               unambiguously: create its sidecar, then show metrics.
+#   ambiguous - brand-new run whose session could not be identified with
+#               certainty: warn, record nothing.
+#   update    - anything else (resume): refresh + show ONLY if the session
+#               already has a sidecar; legacy sessions are left untouched
+#               (no helper process, no events scan, no output).
+# Never fatal: every failure is a visible stderr warning.
+show_session_context_metrics() {
+  local session_id="${1:-}" mode="${2:-update}" started_epoch="${3:-}"
+  [[ -z "$session_id" ]] && return 0
+  local session_dir="$SESSION_STATE_DIR/$session_id"
+
+  local extra=()
+  case "$mode" in
+    ambiguous)
+      warn_context_not_enrolled
+      return 0
+      ;;
+    enroll)
+      extra=(--enroll --expect-cwd "$PWD")
+      [[ -n "$started_epoch" ]] && extra+=(--started-after "$started_epoch")
+      ;;
+    *)
+      [[ -f "$session_dir/$CONTEXT_SIDECAR_NAME" ]] || return 0
+      ;;
+  esac
+
+  if [[ ! -f "$TASK_REPORT_HELPER" ]]; then
+    echo -e "${YELLOW}Warning: task report helper not found at $TASK_REPORT_HELPER — context metrics not recorded.${RESET}" >&2
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo -e "${YELLOW}Warning: python3 not found — context metrics not recorded.${RESET}" >&2; return 0; }
+
+  local out="" rc=0
+  out=$(python3 "$TASK_REPORT_HELPER" context-update \
+      --session-id "$session_id" \
+      --session-dir "$session_dir" \
+      "${extra[@]+"${extra[@]}"}") || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${YELLOW}Warning: context metrics update failed (exit $rc); session handling continues normally.${RESET}" >&2
+  fi
+  if [[ -n "$out" ]]; then
+    local line
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && echo -e "  ${DIM}${line}${RESET}"
+    done <<< "$out"
+  fi
+  return 0
+}
+
+# --- Load compact context labels for the listed sessions ---
+# Fills CONTEXT_LABELS (parallel to $FILTERED_FILE lines) from EXISTING
+# sidecars only. Costs nothing for legacy sessions: the helper is only
+# spawned (once, for the whole list) if at least one listed session has a
+# sidecar file; it never reads events logs. Failures just leave labels empty.
+load_context_labels() {
+  CONTEXT_LABELS=()
+  [[ -n "${FILTERED_FILE:-}" && -f "$FILTERED_FILE" ]] || return 0
+  local any=false id _rest
+  while IFS='|' read -r id _rest; do
+    if [[ -n "$id" && -f "$SESSION_STATE_DIR/$id/$CONTEXT_SIDECAR_NAME" ]]; then
+      any=true
+      break
+    fi
+  done < "$FILTERED_FILE"
+  [[ "$any" == "true" ]] || return 0
+  [[ -f "$TASK_REPORT_HELPER" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  local out="" line
+  out=$(cut -d'|' -f1 "$FILTERED_FILE" | python3 "$TASK_REPORT_HELPER" context-list \
+      --session-state-dir "$SESSION_STATE_DIR" 2>/dev/null) || return 0
+  while IFS= read -r line; do
+    CONTEXT_LABELS+=("$line")
+  done <<< "$out"
+  return 0
+}
+
 # --- Import any sessions from copilot state not yet tracked ---
 sync_sessions() {
   [[ -d "$SESSION_STATE_DIR" ]] || return 0
@@ -466,6 +595,8 @@ list_sessions() {
   fi
   echo ""
 
+  load_context_labels
+
   local i=1
   while IFS='|' read -r id name timestamp cwd; do
     [[ -z "$id" ]] && continue
@@ -487,7 +618,13 @@ list_sessions() {
       dir_info="  ${DIM}$(short_path "$cwd")${RESET}"
     fi
 
-    echo -e "  ${status}${BOLD}${i})${RESET} ${name:-unnamed}  ${DIM}[${short_id}…]  ${display_date}${RESET}${dir_info}"
+    local ctx_info=""
+    local ctx_label="${CONTEXT_LABELS[$((i - 1))]:-}"
+    if [[ -n "$ctx_label" ]]; then
+      ctx_info="  ${DIM}(${ctx_label})${RESET}"
+    fi
+
+    echo -e "  ${status}${BOLD}${i})${RESET} ${name:-unnamed}  ${DIM}[${short_id}…]  ${display_date}${RESET}${dir_info}${ctx_info}"
     i=$((i + 1))
   done < "$FILTERED_FILE"
 
@@ -506,6 +643,8 @@ list_sessions() {
 post_session() {
   local session_id="${1:-}"
   local task_id="${2:-}"
+  local metrics_mode="${3:-update}"
+  local started_epoch="${4:-}"
   [[ -z "$session_id" ]] && return 0
 
   local session_dir="$SESSION_STATE_DIR/$session_id"
@@ -531,6 +670,9 @@ post_session() {
 
   echo ""
   echo -e "${BOLD}Session:${RESET} ${display_name}  ${DIM}[${session_id:0:8}…]${RESET}"
+  # Context metrics (enrolled copilot-s sessions only) are shown before the
+  # keep/rename/delete choice; a later delete removes them with the session.
+  show_session_context_metrics "$session_id" "$metrics_mode" "$started_epoch"
   echo -ne "  ${GREEN}k)${RESET} Keep  ${YELLOW}r)${RESET} Rename  ${RED}d)${RESET} Delete  ${DIM}[K/r/d]:${RESET} "
   local action=""
   prompt_read action
@@ -589,6 +731,11 @@ run_copilot() {
     ls "$SESSION_STATE_DIR" > "$before_file" 2>/dev/null || true
   fi
 
+  # Launch time, used to sanity-check that a detected brand-new session was
+  # really created by this run before enrolling it for context metrics.
+  local started_epoch
+  started_epoch=$(date +%s)
+
   echo -e "${CYAN}Starting copilot...${RESET}\n"
   if [[ -n "$session_id" ]]; then
     copilot --resume="$session_id" "$@" || true
@@ -601,10 +748,32 @@ run_copilot() {
   # Figure out which session was used
   local detected_id
   detected_id=$(detect_new_session "$before_file") || true
+
+  # Context-metrics enrollment is decided independently and conservatively:
+  # only a brand-new run ("n"/no sessions) whose single new session
+  # directory is unambiguous gets enrolled; resumes only refresh sessions
+  # that are already enrolled.
+  local metrics_mode="update"
+  if [[ -z "$session_id" ]]; then
+    local enroll_id="" enroll_rc=0
+    enroll_id=$(detect_enrollable_new_session "$before_file") || enroll_rc=$?
+    if [[ $enroll_rc -eq 0 && -n "$enroll_id" && "$enroll_id" == "${detected_id:-}" ]]; then
+      metrics_mode="enroll"
+    elif [[ $enroll_rc -ne 1 ]]; then
+      metrics_mode="ambiguous"
+    fi
+  fi
   rm -f "$before_file"
 
   local final_id="${detected_id:-$session_id}"
-  post_session "${final_id:-}" "$task_id"
+  # detect_new_session only attributes a new directory whose cwd is $PWD, so
+  # a new session with a mismatched (or missing) workspace cwd leaves no id
+  # for the stop flow, and post_session would return before it could warn.
+  # Surface the non-enrollment here instead; still no helper call/sidecar.
+  if [[ -z "$final_id" && "$metrics_mode" == "ambiguous" ]]; then
+    warn_context_not_enrolled
+  fi
+  post_session "${final_id:-}" "$task_id" "$metrics_mode" "$started_epoch"
   exit 0
 }
 
@@ -797,6 +966,9 @@ ${BOLD}Usage:${RESET}
 ${BOLD}Features:${RESET}
   - Resume, rename, or delete sessions (single/range/multi-select)
   - Prompts to keep/rename/delete a session when \`copilot\` exits
+  - For sessions created by copilot-s from now on: shows the context fill
+    last observed before a compaction and the successful compaction count
+    on exit and in the session list (older sessions are never scanned)
   - Per-task usage reports (\`--report\`/\`--task\`), attributed via the current
     git branch (KEY-123-style IDs only) or an interactive prompt that also
     accepts free-form task names

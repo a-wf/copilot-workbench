@@ -217,6 +217,38 @@ From the session list you can resume, rename, or delete sessions
 (single/range/multi-select). On exiting a `copilot` session you'll be
 prompted to keep, rename, or delete it.
 
+### Context metrics (new copilot-s sessions only)
+
+For sessions **created by `copilot-s` from this version on** (`n`, or the
+automatic new session), `copilot-s` shows two numbers when the session
+stops (before the keep/rename/delete prompt) and next to it in the session
+list:
+
+- **Context % last observed before compaction** — `currentTokens /
+  tokenLimit` from the latest valid `session.compaction_start` event. It is
+  the fill level at the most recent compaction trigger, **not** the live or
+  at-exit usage (the shutdown event has no verified token limit, so the two
+  are never combined). Values over 100% are shown as recorded. `N/A` means
+  no valid pre-compaction snapshot has been recorded — either no compaction
+  has started yet, or every compaction start had missing/invalid/out-of-range
+  token fields (those are counted and reported, never guessed).
+- **Successful compactions** — `session.compaction_complete` events with
+  `success: true` only.
+
+Enrollment is conservative: a new session is enrolled only if exactly one
+new session directory (with this cwd, created after launch) appeared during
+the run; otherwise a warning is printed and nothing is recorded. A session
+whose `workspace.yaml` `created_at` is missing or unparseable cannot be
+verified as created after launch and is likewise not enrolled (warning).
+Existing, imported, or externally created sessions are never enrolled or
+scanned.
+Values are cached in `copilot-s-context.json` inside the session directory
+(numbers and a read cursor only — no message text), refreshed when an
+enrolled session is resumed and stopped; the list reads only that file. If
+`events.jsonl` is missing/unreadable the count is shown as unknown, and
+corrupt or truncated lines are reported (`>=N`, "log incomplete") rather
+than hidden. No per-task summary is generated.
+
 ## Task usage reporting
 
 > **Upgrading from a pre-2.0 checkout?** This was previously Jira-specific

@@ -20,11 +20,17 @@ tests. Self-contained: stdlib-only (unittest), no network, no writes
 outside per-test temp directories.
 """
 
+import json
 import os
+import pty
+import select
+import signal
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -475,6 +481,379 @@ class TestInstallerPrefixArgValidation(BaseHomeTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(os.path.exists(os.path.join(custom_prefix, "copilot-s")))
+
+
+class TestContextMetricsSessionManager(BaseHomeTestCase):
+    """Drive copilot-s through a PTY with a fake Copilot CLI and helper to
+    check conservative enrollment, list alignment, and stop-time handling."""
+
+    CONTEXT_SUMMARY = (
+        "Context: 73.2% (732/1,000 tokens) last observed before compaction "
+        "· Compactions: 2 successful"
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.cwd = os.path.realpath(os.path.join(self.home, "worktree"))
+        os.makedirs(self.cwd)
+        subprocess.run(["git", "init", "-q", self.cwd], check=True)
+        subprocess.run(
+            ["git", "-C", self.cwd, "symbolic-ref", "HEAD", "refs/heads/ABC-123"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", self.cwd, "-c", "user.name=Tester", "-c",
+             "user.email=test@example.com", "commit", "--allow-empty", "-m", "fixture"],
+            check=True, stdout=subprocess.DEVNULL,
+        )
+        self.state_dir = os.path.join(self.home, ".copilot", "session-state")
+        os.makedirs(self.state_dir, exist_ok=True)
+        self.sessions_file = os.path.join(self.home, ".copilot-sessions")
+        self.fake_bin = os.path.join(self.home, "fake-bin")
+        os.makedirs(self.fake_bin)
+        self.helper_log = os.path.join(self.home, "helper.jsonl")
+        self.copilot_log = os.path.join(self.home, "copilot.json")
+        self.helper = os.path.join(self.home, "fake-task-report.py")
+        with open(self.helper, "w", encoding="utf-8") as f:
+            f.write(
+                "#!%s\n"
+                "import json, os, sys\n"
+                "with open(os.environ['HELPER_LOG'], 'a', encoding='utf-8') as log:\n"
+                "    log.write(json.dumps({'command': sys.argv[1], 'args': sys.argv[2:]}) + '\\n')\n"
+                "command = sys.argv[1]\n"
+                "if command == 'context-list':\n"
+                "    labels = json.loads(os.environ.get('FAKE_CONTEXT_LABELS', '{}'))\n"
+                "    for session_id in sys.stdin.read().splitlines():\n"
+                "        print(labels.get(session_id, ''))\n"
+                "elif command == 'context-update':\n"
+                "    if os.environ.get('FAIL_CONTEXT_UPDATE') == '1':\n"
+                "        print('simulated context update failure', file=sys.stderr)\n"
+                "        sys.exit(7)\n"
+                "    if os.environ.get('CONTEXT_UPDATE_EXIT'):\n"
+                "        print('simulated context enrollment verification warning', file=sys.stderr)\n"
+                "        sys.exit(int(os.environ['CONTEXT_UPDATE_EXIT']))\n"
+                "    print(%r)\n"
+                % (sys.executable, self.CONTEXT_SUMMARY)
+            )
+        os.chmod(self.helper, os.stat(self.helper).st_mode | stat.S_IEXEC)
+
+        copilot = os.path.join(self.fake_bin, "copilot")
+        with open(copilot, "w", encoding="utf-8") as f:
+            f.write(
+                "#!%s\n"
+                "import datetime, json, os, pathlib, sys\n"
+                "with open(os.environ['COPILOT_LOG'], 'w', encoding='utf-8') as log:\n"
+                "    json.dump(sys.argv[1:], log)\n"
+                "root = pathlib.Path(os.environ['HOME']) / '.copilot' / 'session-state'\n"
+                "mode = os.environ.get('FAKE_COPILOT_MODE', 'idle')\n"
+                "if mode in ('new', 'multiple'):\n"
+                "    session_ids = os.environ.get('FAKE_SESSION_IDS', 'fresh-session').split(',')\n"
+                "    for session_id in session_ids:\n"
+                "        directory = root / session_id\n"
+                "        directory.mkdir(parents=True, exist_ok=True)\n"
+                "        created = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')\n"
+                "        cwd = os.environ.get('FAKE_SESSION_CWD', os.getcwd())\n"
+                "        (directory / 'workspace.yaml').write_text(\n"
+                "            'created_at: ' + created + '\\n' + 'cwd: ' + cwd + '\\n' + 'name: Fake session\\n',\n"
+                "            encoding='utf-8')\n"
+                % sys.executable
+            )
+        os.chmod(copilot, os.stat(copilot).st_mode | stat.S_IEXEC)
+
+    def _env(self, extra=None):
+        additions = {
+            "PATH": os.pathsep.join(
+                [self.fake_bin, os.path.dirname(sys.executable), "/usr/bin", "/bin"]
+            ),
+            "COPILOT_TASK_REPORT_HELPER": self.helper,
+            "HELPER_LOG": self.helper_log,
+            "COPILOT_LOG": self.copilot_log,
+            "PWD": self.cwd,
+        }
+        if extra:
+            additions.update(extra)
+        return self.env(additions)
+
+    def _run_tty(self, env, actions=(), timeout=20):
+        """Run the real script with a controlling terminal and answer prompts
+        only when they appear, so flush_stdin cannot consume later answers."""
+        pid, master = pty.fork()
+        if pid == 0:
+            os.chdir(self.cwd)
+            os.execve("/bin/bash", ["/bin/bash", COPILOT_S], env)
+        output = bytearray()
+        actions = list(actions)
+        action_index = 0
+        status = None
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([master], [], [], 0.1)
+                if readable:
+                    try:
+                        chunk = os.read(master, 8192)
+                    except OSError:
+                        if status is None:
+                            try:
+                                _, child_status = os.waitpid(pid, 0)
+                                status = os.waitstatus_to_exitcode(child_status)
+                            except ChildProcessError:
+                                pass
+                        break
+                    if not chunk:
+                        if status is None:
+                            try:
+                                _, child_status = os.waitpid(pid, 0)
+                                status = os.waitstatus_to_exitcode(child_status)
+                            except ChildProcessError:
+                                pass
+                        break
+                    output.extend(chunk)
+                    while action_index < len(actions):
+                        marker, response = actions[action_index]
+                        if marker.encode() not in output:
+                            break
+                        os.write(master, response.encode())
+                        action_index += 1
+                if status is None:
+                    waited, child_status = os.waitpid(pid, os.WNOHANG)
+                    if waited == pid:
+                        status = os.waitstatus_to_exitcode(child_status)
+                elif not readable:
+                    break
+            else:
+                raise AssertionError(
+                    "copilot-s PTY run timed out:\n%s"
+                    % output.decode("utf-8", errors="replace")
+                )
+        finally:
+            if status is None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+            os.close(master)
+        return status, output.decode("utf-8", errors="replace"), action_index
+
+    def _helper_calls(self):
+        if not os.path.exists(self.helper_log):
+            return []
+        with open(self.helper_log, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _session(self, session_id, *, sidecar=False, name=None):
+        directory = os.path.join(self.state_dir, session_id)
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "workspace.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                "created_at: 2026-10-13T10:00:00Z\n"
+                "cwd: %s\n"
+                "branch: ABC-123\n"
+                "name: %s\n"
+                % (self.cwd, name or session_id)
+            )
+        if sidecar:
+            with open(os.path.join(directory, "copilot-s-context.json"), "w", encoding="utf-8") as f:
+                f.write("{}\n")
+        return directory
+
+    def _commands(self, name):
+        return [call for call in self._helper_calls() if call["command"] == name]
+
+    def test_fresh_session_enrolls_exact_id_and_prints_metrics_before_keep_prompt(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "fresh-session",
+            }),
+            actions=[("[K/r/d]:", "k\n")],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 1, output)
+        self.assertLess(output.index(self.CONTEXT_SUMMARY), output.index("[K/r/d]:"))
+        calls = self._commands("context-update")
+        self.assertEqual(len(calls), 1)
+        args = calls[0]["args"]
+        self.assertIn("--session-id", args)
+        self.assertEqual(args[args.index("--session-id") + 1], "fresh-session")
+        self.assertIn("--enroll", args)
+        self.assertEqual(args[args.index("--expect-cwd") + 1], self.cwd)
+        started_after = float(args[args.index("--started-after") + 1])
+        self.assertLessEqual(started_after, time.time())
+        self.assertFalse(os.path.exists(os.path.join(self.state_dir, "other-session",
+                                                     "copilot-s-context.json")))
+        with open(self.sessions_file, encoding="utf-8") as f:
+            rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "fresh-session")
+        self.assertEqual(len(rows[0]), 4)  # preserve the legacy index format
+
+    def test_new_session_with_cwd_mismatch_warns_and_is_not_enrolled(self):
+        status, output, _ = self._run_tty(self._env({
+            "FAKE_COPILOT_MODE": "new",
+            "FAKE_SESSION_IDS": "wrong-cwd-session",
+            "FAKE_SESSION_CWD": os.path.join(self.home, "different-directory"),
+        }))
+        self.assertEqual(status, 0, output)
+        self.assertIn("could not unambiguously identify", output)
+        self.assertEqual(self._commands("context-update"), [])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, "wrong-cwd-session", "copilot-s-context.json"
+        )))
+
+    def test_multiple_new_sessions_warn_and_never_enroll(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "multiple",
+                "FAKE_SESSION_IDS": "new-one,new-two",
+            }),
+            actions=[("[K/r/d]:", "k\n")],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 1, output)
+        self.assertIn("could not unambiguously identify", output)
+        self.assertEqual(self._commands("context-update"), [])
+        for session_id in ("new-one", "new-two"):
+            self.assertFalse(os.path.exists(os.path.join(
+                self.state_dir, session_id, "copilot-s-context.json"
+            )))
+
+    def test_legacy_resume_does_not_call_context_helper_or_create_sidecar(self):
+        self._session("legacy-session")
+        status, output, actions = self._run_tty(
+            self._env({"FAKE_COPILOT_MODE": "idle"}),
+            actions=[
+                ("Select session to resume", "1\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        with open(self.copilot_log, encoding="utf-8") as f:
+            copilot_args = json.load(f)
+        self.assertIn("--resume=legacy-session", copilot_args)
+        commands = [call["command"] for call in self._helper_calls()]
+        self.assertIn("ingest", commands)
+        self.assertNotIn("context-list", commands)
+        self.assertNotIn("context-update", commands)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, "legacy-session", "copilot-s-context.json"
+        )))
+
+    def test_enrolled_resume_refreshes_without_enrolling_again(self):
+        self._session("enrolled-session", sidecar=True)
+        status, output, actions = self._run_tty(
+            self._env({"FAKE_COPILOT_MODE": "idle"}),
+            actions=[
+                ("Select session to resume", "1\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertLess(output.index(self.CONTEXT_SUMMARY), output.index("[K/r/d]:"))
+        calls = self._commands("context-update")
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--enroll", calls[0]["args"])
+        self.assertEqual(calls[0]["args"][calls[0]["args"].index("--session-id") + 1],
+                         "enrolled-session")
+
+    def test_context_update_failure_is_visible_but_keep_flow_continues(self):
+        self._session("enrolled-failure", sidecar=True)
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "idle",
+                "FAIL_CONTEXT_UPDATE": "1",
+            }),
+            actions=[
+                ("Select session to resume", "1\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertIn("context metrics update failed", output)
+        self.assertIn("session handling continues normally", output)
+        self.assertIn("Session kept", output)
+
+    def test_enrollment_verification_rejection_does_not_block_new_session_flow(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "unverified-session",
+                "CONTEXT_UPDATE_EXIT": "3",
+            }),
+            actions=[("[K/r/d]:", "k\n")],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 1, output)
+        self.assertIn("simulated context enrollment verification warning", output)
+        self.assertIn("context metrics update failed (exit 3)", output)
+        self.assertIn("session handling continues normally", output)
+        self.assertIn("Session kept", output)
+        calls = self._commands("context-update")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--enroll", calls[0]["args"])
+        self.assertIn("--started-after", calls[0]["args"])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.state_dir, "unverified-session", "copilot-s-context.json"
+        )))
+
+    def test_session_list_aligns_labels_without_changing_index_columns(self):
+        ids = ["listed-first", "listed-legacy", "listed-third"]
+        self._session(ids[0], sidecar=True, name="First")
+        self._session(ids[1], name="Legacy")
+        self._session(ids[2], sidecar=True, name="Third")
+        with open(self.sessions_file, "w", encoding="utf-8") as f:
+            for session_id, name in zip(ids, ("First", "Legacy", "Third")):
+                f.write("%s|%s|2026-10-13T10:00:00Z|%s\n" % (session_id, name, self.cwd))
+        labels = {
+            ids[0]: "ctx 25.0% first-session-label",
+            ids[2]: "ctx 150.0% third-session-label",
+        }
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "idle",
+                "FAKE_CONTEXT_LABELS": json.dumps(labels),
+            }),
+            actions=[("Select session to resume", "q\n")],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 1, output)
+        import re
+        plain_output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+        first = plain_output.index("1) First")
+        legacy = plain_output.index("2) Legacy")
+        third = plain_output.index("3) Third")
+        self.assertLess(first, legacy)
+        self.assertLess(legacy, third)
+        self.assertIn("ctx 25.0% first-session-label", plain_output[first:legacy])
+        self.assertNotIn("ctx ", plain_output[legacy:third])
+        self.assertIn("ctx 150.0% third-session-label", plain_output[third:])
+        calls = self._commands("context-list")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"], ["--session-state-dir", self.state_dir])
+        with open(self.sessions_file, encoding="utf-8") as f:
+            self.assertTrue(all(len(line.rstrip("\n").split("|")) == 4
+                                for line in f if line.strip()))
+
+    def test_q_still_exits_without_launching_or_updating_a_session(self):
+        self._session("quit-session")
+        with open(self.sessions_file, "w", encoding="utf-8") as f:
+            f.write("quit-session|Quit me|2026-10-13T10:00:00Z|%s\n" % self.cwd)
+        status, output, actions = self._run_tty(
+            self._env({"FAKE_COPILOT_MODE": "idle"}),
+            actions=[("Select session to resume", "q\n")],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 1, output)
+        self.assertIn("Bye!", output)
+        self.assertFalse(os.path.exists(self.copilot_log))
+        self.assertEqual(self._commands("context-update"), [])
 
 
 class TestNormalizeAndValidateTaskFastPathStderr(BaseHomeTestCase):

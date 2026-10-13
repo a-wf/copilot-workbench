@@ -6,6 +6,17 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Added — context metrics for new copilot-s sessions
+
+- Sessions newly created by `copilot-s` (and identified unambiguously after
+  the run) show the context % *last observed before compaction* (latest
+  valid `session.compaction_start` `currentTokens / tokenLimit`, not
+  live/at-exit usage) and the number of successful compactions, on exit
+  before keep/rename/delete and in the session list. Cached per session in
+  `copilot-s-context.json` via new `copilot-task-report.py context-update`
+  / `context-list` commands. Existing sessions are never enrolled or
+  scanned; the `~/.copilot-sessions` format is unchanged.
+
 ### Added — batched review handoff, attribution coverage, review records
 
 - Default handoff order is now implement → relevant tests → one

@@ -4603,6 +4603,444 @@ def _load_task_file_strict(tpath, task_id):
 
 
 # --------------------------------------------------------------------------
+# Per-session context metrics sidecar (copilot-s new sessions only)
+# --------------------------------------------------------------------------
+#
+# Sessions created by copilot-s (after this feature exists) and identified
+# unambiguously after the run are "enrolled": a small sidecar JSON file is
+# written into the session's own state directory. Nothing else is ever
+# enrolled or backfilled — legacy, imported or externally created sessions
+# never get a sidecar, so copilot-s never scans their event logs.
+#
+# What is recorded (and nothing more — no message text, no summaryContent):
+#   - last_precompaction_snapshot: currentTokens / tokenLimit from the LATEST
+#     valid `session.compaction_start` event. This is the context fill
+#     *last observed right before a compaction* — NOT the live/current or
+#     at-exit context usage. `session.shutdown` carries currentTokens but no
+#     verified tokenLimit (and the model may have changed since the last
+#     compaction), so it is deliberately never paired with an old limit.
+#     Values above 100% are kept as recorded, never capped. Token fields
+#     must be strict ints within [0, 2**53] / [1, 2**53]; anything else is
+#     counted in invalid_snapshot_events and never stored.
+#   - successful_compactions: number of `session.compaction_complete` events
+#     whose `data.success` is exactly true (starts and failed completions are
+#     not counted).
+#   - an incremental read cursor over events.jsonl (byte offset of the last
+#     complete line + a fingerprint of the head of the file, so a truncated or
+#     rewritten log triggers a full rescan instead of a silent miscount), plus
+#     malformed-line / partial-trailing-line bookkeeping so an unreadable log
+#     is reported as such and never turned into zeros.
+#
+# These commands never touch task reports, pricing, ingest state or legacy
+# migrations (they are dispatched before run_startup_migrations()).
+
+CONTEXT_SIDECAR_NAME = "copilot-s-context.json"
+CONTEXT_SCHEMA = "copilot-s-context"
+CONTEXT_SCHEMA_VERSION = 1
+CONTEXT_HEAD_FINGERPRINT_BYTES = 4096
+CONTEXT_TRIGGER_MAX_LEN = 40
+# Tolerance (seconds) when checking that a newly-detected session was created
+# after copilot-s launched copilot (clock granularity / filesystem skew).
+CONTEXT_ENROLL_SKEW_SECONDS = 5
+# Upper bound for currentTokens / tokenLimit and the integer counters in the
+# sidecar: larger values are rejected (never stored) so formatting/percent
+# math can never overflow a float or produce a nonsense percentage.
+CONTEXT_MAX_INT = 2 ** 53
+_CONTEXT_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+
+
+class ContextSidecarError(ValueError):
+    pass
+
+
+def _context_valid_session_id(session_id):
+    return bool(session_id) and bool(_CONTEXT_SESSION_ID_RE.match(session_id)) and session_id not in (".", "..")
+
+
+def _is_strict_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _context_int_in_range(value, minimum):
+    """Strict (non-bool) int within [minimum, CONTEXT_MAX_INT]."""
+    return _is_strict_int(value) and minimum <= value <= CONTEXT_MAX_INT
+
+
+def context_sidecar_path(session_dir):
+    return os.path.join(session_dir, CONTEXT_SIDECAR_NAME)
+
+
+def _context_blank_events_state():
+    return {
+        "offset": 0,
+        "head_len": 0,
+        "head_sha256": "",
+        "malformed_lines": 0,
+        "invalid_snapshot_events": 0,
+        "trailing_partial_line": False,
+        "status": "not_read",
+        "last_error": None,
+        "last_read_ok_at": None,
+    }
+
+
+def _context_new_sidecar(session_id):
+    ts = now_iso()
+    return {
+        "schema": CONTEXT_SCHEMA,
+        "schema_version": CONTEXT_SCHEMA_VERSION,
+        "session_id": session_id,
+        "enrolled_by": "copilot-s",
+        "enrolled_at": ts,
+        "updated_at": ts,
+        "successful_compactions": 0,
+        "last_precompaction_snapshot": None,
+        "events": _context_blank_events_state(),
+    }
+
+
+def _validate_context_snapshot(snap):
+    if snap is None:
+        return
+    if not isinstance(snap, dict):
+        raise ContextSidecarError("last_precompaction_snapshot is not an object")
+    cur, lim = snap.get("current_tokens"), snap.get("token_limit")
+    if not _context_int_in_range(cur, 0):
+        raise ContextSidecarError("snapshot current_tokens invalid")
+    if not _context_int_in_range(lim, 1):
+        raise ContextSidecarError("snapshot token_limit invalid")
+    for key in ("trigger", "timestamp"):
+        if snap.get(key) is not None and not isinstance(snap.get(key), str):
+            raise ContextSidecarError("snapshot %s invalid" % key)
+
+
+def validate_context_sidecar(data, session_id):
+    """Strictly validate a parsed sidecar for `session_id`. Raises
+    ContextSidecarError on anything unexpected (never guesses/repairs)."""
+    if not isinstance(data, dict):
+        raise ContextSidecarError("not a JSON object")
+    if data.get("schema") != CONTEXT_SCHEMA:
+        raise ContextSidecarError("unknown schema")
+    if data.get("schema_version") != CONTEXT_SCHEMA_VERSION:
+        raise ContextSidecarError("unsupported schema_version %r" % (data.get("schema_version"),))
+    if data.get("session_id") != session_id:
+        raise ContextSidecarError("session_id does not match its session directory")
+    count = data.get("successful_compactions")
+    if not _context_int_in_range(count, 0):
+        raise ContextSidecarError("successful_compactions invalid")
+    _validate_context_snapshot(data.get("last_precompaction_snapshot"))
+    ev = data.get("events")
+    if not isinstance(ev, dict):
+        raise ContextSidecarError("events cursor missing")
+    for key in ("offset", "head_len", "malformed_lines", "invalid_snapshot_events"):
+        if not _context_int_in_range(ev.get(key), 0):
+            raise ContextSidecarError("events.%s invalid" % key)
+    if ev.get("head_len") > ev.get("offset") or ev.get("head_len") > CONTEXT_HEAD_FINGERPRINT_BYTES:
+        raise ContextSidecarError("events.head_len inconsistent")
+    if not isinstance(ev.get("head_sha256"), str):
+        raise ContextSidecarError("events.head_sha256 invalid")
+    if not isinstance(ev.get("trailing_partial_line"), bool):
+        raise ContextSidecarError("events.trailing_partial_line invalid")
+    if ev.get("status") not in ("not_read", "complete", "partial", "missing", "unreadable"):
+        raise ContextSidecarError("events.status invalid")
+    return data
+
+
+def load_context_sidecar(session_dir, session_id):
+    """Return (data, error). data is None when the sidecar does not exist
+    (error None) or is unreadable/invalid (error set)."""
+    path = context_sidecar_path(session_dir)
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ContextSidecarError("file too large")
+        data = json.loads(raw.decode("utf-8"), parse_constant=_reject_json_constant)
+        return validate_context_sidecar(data, session_id), None
+    except (OSError, ValueError, UnicodeDecodeError, TypeError, OverflowError, RecursionError,
+            ContextSidecarError) as ex:
+        return None, str(ex) or ex.__class__.__name__
+
+
+def _context_apply_event(obj, sidecar):
+    """Fold one parsed event into the sidecar. Only the two compaction event
+    types are consulted, and only the numeric/trigger fields are copied."""
+    if not isinstance(obj, dict):
+        return
+    etype = obj.get("type")
+    if etype not in ("session.compaction_start", "session.compaction_complete"):
+        return
+    data = obj.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    if etype == "session.compaction_complete":
+        if data.get("success") is True:
+            sidecar["successful_compactions"] += 1
+        return
+    cur, lim = data.get("currentTokens"), data.get("tokenLimit")
+    # Out-of-range/bool/float/missing values are counted as invalid and never
+    # replace the previous valid snapshot (bounded so no huge int is stored).
+    if not (_context_int_in_range(cur, 0) and _context_int_in_range(lim, 1)):
+        sidecar["events"]["invalid_snapshot_events"] += 1
+        return
+    trigger = data.get("trigger")
+    if isinstance(trigger, str):
+        trigger = re.sub(r"[^A-Za-z0-9_.:-]", "", trigger)[:CONTEXT_TRIGGER_MAX_LEN] or None
+    else:
+        trigger = None
+    ts = obj.get("timestamp")
+    if not (isinstance(ts, str) and parse_ts(ts) is not None and len(ts) <= 64):
+        ts = None
+    sidecar["last_precompaction_snapshot"] = {
+        "current_tokens": cur,
+        "token_limit": lim,
+        "trigger": trigger,
+        "timestamp": ts,
+    }
+
+
+def _context_reset_scan(sidecar):
+    sidecar["successful_compactions"] = 0
+    sidecar["last_precompaction_snapshot"] = None
+    sidecar["events"] = _context_blank_events_state()
+
+
+def context_scan_events(sidecar, events_path):
+    """Incrementally fold events.jsonl into `sidecar` (mutated in place).
+
+    Resumes from the stored byte offset when the file still has the same head
+    and is at least that long; otherwise (truncated/rewritten/replaced) it
+    resets and rescans from byte 0. A trailing line without a newline is
+    never consumed (it is re-read next time) and is flagged as partial. A
+    missing/unreadable log leaves the cached metrics untouched and records
+    the status, so it is never reported as zero compactions.
+
+    All counting happens on a private copy that is committed only after the
+    read finished, so an I/O error mid-read can never leave counts advanced
+    without the matching cursor (which would double count next time)."""
+    ev_orig = sidecar["events"]
+    try:
+        f = open(events_path, "rb")
+    except FileNotFoundError:
+        ev_orig["status"] = "missing"
+        ev_orig["last_error"] = "events.jsonl not found"
+        return
+    except OSError as ex:
+        ev_orig["status"] = "unreadable"
+        ev_orig["last_error"] = ex.__class__.__name__
+        return
+    work = json.loads(json.dumps(sidecar))
+    try:
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            offset = work["events"]["offset"]
+            rescan = size < offset
+            if not rescan and work["events"]["head_len"] > 0:
+                head = f.read(work["events"]["head_len"])
+                if hashlib.sha256(head).hexdigest() != work["events"]["head_sha256"]:
+                    rescan = True
+            if rescan:
+                _context_reset_scan(work)
+                offset = 0
+            ev = work["events"]
+            f.seek(offset)
+            trailing_partial = False
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    trailing_partial = True
+                    break
+                offset += len(raw)
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line.decode("utf-8"), parse_constant=_reject_json_constant)
+                except (ValueError, UnicodeDecodeError, TypeError, OverflowError, RecursionError):
+                    ev["malformed_lines"] += 1
+                    continue
+                _context_apply_event(obj, work)
+            head_len = min(offset, CONTEXT_HEAD_FINGERPRINT_BYTES)
+            f.seek(0)
+            head = f.read(head_len)
+    except OSError as ex:
+        ev_orig["status"] = "unreadable"
+        ev_orig["last_error"] = ex.__class__.__name__
+        return
+    sidecar.clear()
+    sidecar.update(work)
+    ev = sidecar["events"]
+    ev["offset"] = offset
+    ev["head_len"] = len(head)
+    ev["head_sha256"] = hashlib.sha256(head).hexdigest()
+    ev["trailing_partial_line"] = trailing_partial
+    ev["status"] = "partial" if (trailing_partial or ev["malformed_lines"]) else "complete"
+    ev["last_error"] = None
+    ev["last_read_ok_at"] = now_iso()
+
+
+def _fmt_context_percent(snap):
+    pct = snap["current_tokens"] * 100.0 / snap["token_limit"]
+    return "%.1f%%" % pct
+
+
+def format_context_metrics(sidecar, compact=False):
+    """Human-readable, ANSI-free one-line summary of a validated sidecar."""
+    ev = sidecar["events"]
+    snap = sidecar.get("last_precompaction_snapshot")
+    status = ev.get("status")
+    count = sidecar["successful_compactions"]
+    unknown_count = status in ("missing", "unreadable", "not_read")
+    lower_bound = status == "partial"
+    if compact:
+        ctx = ("ctx %s last observed before compaction" % _fmt_context_percent(snap)) if snap else "ctx N/A"
+        if unknown_count:
+            cmp_txt = "compactions unknown"
+        else:
+            cmp_txt = "%s%d compaction%s" % (">=" if lower_bound else "", count, "" if count == 1 else "s")
+        return "%s · %s%s" % (ctx, cmp_txt, " (log incomplete)" if (lower_bound or unknown_count) else "")
+    if snap:
+        ctx = "Context: %s (%s/%s tokens) last observed before compaction" % (
+            _fmt_context_percent(snap), format(snap["current_tokens"], ","), format(snap["token_limit"], ","))
+    else:
+        ctx = "Context: N/A (no valid pre-compaction snapshot recorded)"
+    if unknown_count:
+        cmp_txt = "Compactions: unknown (events log %s)" % ("missing" if status == "missing" else "unreadable")
+    else:
+        cmp_txt = "Compactions: %s%d successful" % (">=" if lower_bound else "", count)
+    parts = [ctx, cmp_txt]
+    if lower_bound:
+        issues = []
+        if ev.get("malformed_lines"):
+            issues.append("%d unreadable line(s)" % ev["malformed_lines"])
+        if ev.get("trailing_partial_line"):
+            issues.append("truncated last line")
+        parts.append("events log incomplete: %s" % ", ".join(issues))
+    if ev.get("invalid_snapshot_events"):
+        parts.append("%d compaction start(s) without valid token fields ignored" % ev["invalid_snapshot_events"])
+    return " · ".join(parts)
+
+
+def _read_workspace_field(session_dir, field):
+    """Read a top-level `field: value` line from workspace.yaml (the same
+    simple line format copilot-s reads with grep/sed)."""
+    path = os.path.join(session_dir, "workspace.yaml")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return line[len(field) + 1:].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _context_created_epoch(session_dir):
+    """workspace.yaml created_at as a finite epoch, or None when it is
+    missing, empty or unparseable."""
+    created_raw = (_read_workspace_field(session_dir, "created_at") or "").strip().strip("'\"")
+    if not created_raw:
+        return None
+    try:
+        created = parse_ts(created_raw)
+    except (ValueError, OverflowError, OSError):
+        return None
+    if created is None or not math.isfinite(created):
+        return None
+    return created
+
+
+def cmd_context_update(args):
+    """Enroll (with --enroll) or refresh an already-enrolled session's
+    context-metrics sidecar, then print a one-line summary. Without
+    --enroll, a session that has no sidecar is left completely untouched."""
+    session_id = args.session_id
+    if not _context_valid_session_id(session_id):
+        print("Error: invalid session id for context metrics.", file=sys.stderr)
+        return 1
+    if args.started_after is not None and not math.isfinite(args.started_after):
+        print("Error: --started-after must be a finite epoch; context metrics not recorded.", file=sys.stderr)
+        return 1
+    session_dir = args.session_dir or os.path.join(SESSION_STATE_DIR, session_id)
+    if os.path.basename(os.path.normpath(session_dir)) != session_id or not os.path.isdir(session_dir):
+        print("Error: session directory does not match session id; context metrics not recorded.", file=sys.stderr)
+        return 1
+
+    sidecar, error = load_context_sidecar(session_dir, session_id)
+    if sidecar is None and error is None:
+        if not args.enroll:
+            return 0  # not enrolled: never create, never scan
+        if args.expect_cwd is not None:
+            cwd = _read_workspace_field(session_dir, "cwd")
+            if cwd != args.expect_cwd:
+                print("Warning: new session's recorded cwd does not match the launch directory; "
+                      "context metrics not recorded for this session.", file=sys.stderr)
+                return 3
+        if args.started_after is not None:
+            # When a launch time is supplied, a session whose creation time
+            # cannot be verified is never enrolled (it might be an old one).
+            created = _context_created_epoch(session_dir)
+            if created is None:
+                print("Warning: detected session has no readable created_at in workspace.yaml, so it "
+                      "cannot be verified as created by this copilot launch; context metrics not "
+                      "recorded for this session.", file=sys.stderr)
+                return 3
+            if created < args.started_after - CONTEXT_ENROLL_SKEW_SECONDS:
+                print("Warning: detected session predates this copilot launch; context metrics not "
+                      "recorded for this session.", file=sys.stderr)
+                return 3
+        sidecar = _context_new_sidecar(session_id)
+    elif sidecar is None:
+        # The sidecar name is only ever written by this command, so its
+        # presence means the session was enrolled; rebuild it from a full
+        # rescan rather than trusting or silently discarding bad content.
+        print("Warning: context metrics file for this session was unreadable (%s); rebuilding it "
+              "from a full rescan of the events log." % error, file=sys.stderr)
+        sidecar = _context_new_sidecar(session_id)
+
+    context_scan_events(sidecar, os.path.join(session_dir, "events.jsonl"))
+    sidecar["updated_at"] = now_iso()
+    try:
+        validate_context_sidecar(sidecar, session_id)
+    except ContextSidecarError as ex:
+        # Never persist state that a later read would reject.
+        print("Error: computed context metrics are invalid (%s); sidecar not written." % ex, file=sys.stderr)
+        return 1
+    atomic_write(context_sidecar_path(session_dir), json.dumps(sidecar, indent=2) + "\n")
+    if sidecar["events"]["status"] in ("missing", "unreadable"):
+        print("Warning: could not read this session's events log (%s); compaction metrics are "
+              "unknown, not zero." % sidecar["events"]["last_error"], file=sys.stderr)
+    print(format_context_metrics(sidecar))
+    return 0
+
+
+def cmd_context_list(args):
+    """Read session ids (one per line) from stdin and print exactly one line
+    per input line: a compact metrics label from that session's existing
+    sidecar, or an empty line. Reads sidecars only — never events logs —
+    and never creates or modifies anything."""
+    state_dir = args.session_state_dir or SESSION_STATE_DIR
+    for raw in sys.stdin:
+        session_id = raw.rstrip("\r\n")
+        label = ""
+        if _context_valid_session_id(session_id):
+            sdir = os.path.join(state_dir, session_id)
+            sidecar, error = load_context_sidecar(sdir, session_id)
+            if sidecar is not None:
+                # One bad sidecar must only affect its own line, never abort
+                # the labels of the other sessions.
+                try:
+                    label = format_context_metrics(sidecar, compact=True)
+                except (ValueError, TypeError, KeyError, OverflowError, ZeroDivisionError):
+                    label = "ctx metrics unreadable"
+            elif error is not None:
+                label = "ctx metrics unreadable"
+        print(label)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
 
@@ -4815,9 +5253,35 @@ def main():
                                % (REVIEW_RECORD_SCHEMA, REVIEW_RECORD_SCHEMA_VERSION))
     p_review.set_defaults(func=cmd_record_review)
 
+    p_ctx_update = sub.add_parser(
+        "context-update",
+        help="Enroll (--enroll) or refresh a copilot-s session's context-metrics sidecar and print a "
+             "one-line summary; sessions without a sidecar are untouched unless --enroll is given. "
+             "Never touches task reports, pricing or ingest state")
+    p_ctx_update.add_argument("--session-id", required=True)
+    p_ctx_update.add_argument("--session-dir", default="", help="Override session directory path")
+    p_ctx_update.add_argument("--enroll", action="store_true",
+                              help="Create the sidecar for a brand-new session copilot-s just launched")
+    p_ctx_update.add_argument("--expect-cwd", default=None,
+                              help="With --enroll: refuse unless workspace.yaml cwd equals this path")
+    p_ctx_update.add_argument("--started-after", type=float, default=None, metavar="EPOCH",
+                              help="With --enroll: refuse if workspace.yaml created_at predates this "
+                                   "finite epoch, or is missing/unparseable")
+    p_ctx_update.set_defaults(func=cmd_context_update, skip_migrations=True)
+
+    p_ctx_list = sub.add_parser(
+        "context-list",
+        help="Read session ids from stdin; print one compact metrics label (or empty line) per id "
+             "from existing sidecars only (read-only; never reads events logs)")
+    p_ctx_list.add_argument("--session-state-dir", default="", help="Override the session-state directory")
+    p_ctx_list.set_defaults(func=cmd_context_list, skip_migrations=True)
+
     args = parser.parse_args()
     try:
-        run_startup_migrations()
+        # Context-metrics commands are read-only with respect to task-report
+        # storage, so they deliberately skip the legacy storage migrations.
+        if not getattr(args, "skip_migrations", False):
+            run_startup_migrations()
         sys.exit(args.func(args) or 0)
     except Exception as ex:  # noqa: BLE001 - this tool must never crash the caller's shell
         print("copilot-task-report.py error: %s" % ex, file=sys.stderr)

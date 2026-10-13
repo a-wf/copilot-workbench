@@ -80,6 +80,24 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
   here is reported as a warning and never blocks the keep/rename/delete
   flow.
 
+- **Context metrics (future sessions only)** — for a brand-new session it
+  can identify unambiguously (exactly one new session directory, matching
+  cwd, `created_at` present, parseable and not before launch), `copilot-s` calls
+  `copilot-task-report.py context-update --enroll` after `copilot` exits
+  and shows the result before the keep/rename/delete prompt; on later
+  resumes it refreshes only sessions that already have the sidecar
+  (`<session-dir>/copilot-s-context.json`: latest valid
+  `session.compaction_start` `currentTokens`/`tokenLimit` snapshot (strict
+  integers, `0 ≤ currentTokens ≤ 2^53`, `1 ≤ tokenLimit ≤ 2^53`; otherwise
+  counted as invalid and ignored, shown as `N/A` if none is valid) —
+  "last observed before compaction", never the current usage — the count
+  of `session.compaction_complete` events with `success: true`, and an
+  incremental `events.jsonl` cursor with head fingerprint and
+  malformed/truncated-line bookkeeping). The list calls `context-list`
+  once, and only when a listed session has a sidecar; it never reads event
+  logs. These commands skip task-report migrations and never touch
+  reports, pricing, or ingest state. Legacy sessions are never enrolled.
+
 `copilot-s` is intentionally the *only* place that knows about git branches,
 terminal prompts, and the session index; it treats the reporter as an
 external, swappable helper it shells out to.

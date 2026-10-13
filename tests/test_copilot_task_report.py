@@ -32,6 +32,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -891,7 +892,10 @@ class TestModelCallAttribution(BaseTestCase):
         self.assertNotEqual(task["by_agent"]["coder"]["total_tokens"],
                             task["totals"]["total_tokens"])
 
-        with open(self.mod.report_path("ATTR-OVERLAP-1"), encoding="utf-8") as f:
+        with open(
+            self.mod.report_path(self.mod.normalize_task_id("ATTR-OVERLAP-1")),
+            encoding="utf-8",
+        ) as f:
             report = f.read()
         self.assertIn("Unknown is not the main session", report)
         self.assertIn("not evidence of a skipped or failed review", report)
@@ -977,7 +981,7 @@ class TestModelCallAttribution(BaseTestCase):
             "premium_requests": 2,
         })
         self.mod.atomic_write(
-            self.mod.task_path(task_id),
+            self.mod.task_path(self.mod.normalize_task_id(task_id)),
             json.dumps({
                 "task_id": task_id,
                 "totals": totals,
@@ -1054,7 +1058,7 @@ class TestModelCallAttribution(BaseTestCase):
         task_id = "ATTR-MALFORMED-1"
         malformed = {"schema_version": 99, "custom": {"keep": True}}
         self.mod.atomic_write(
-            self.mod.task_path(task_id),
+            self.mod.task_path(self.mod.normalize_task_id(task_id)),
             json.dumps({"task_id": task_id, "attribution": malformed}),
         )
         session_id = "sess-attribution-malformed"
@@ -1072,7 +1076,10 @@ class TestModelCallAttribution(BaseTestCase):
         self.assertEqual(task["totals"]["call_count"], 1)
         self.assertEqual(self.mod.summarize_attribution(task)["status"], "unreadable")
         self.assertIn("unsupported/malformed attribution block", stderr_capture.getvalue())
-        with open(self.mod.report_path(task_id), encoding="utf-8") as f:
+        with open(
+            self.mod.report_path(self.mod.normalize_task_id(task_id)),
+            encoding="utf-8",
+        ) as f:
             report = f.read()
         self.assertIn("unsupported or malformed schema", report)
 
@@ -1617,7 +1624,10 @@ class TestReviewRecords(BaseTestCase):
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             rc = self.mod.cmd_report(args)
         self.assertEqual(rc, 0, stderr.getvalue())
-        with open(self.mod.report_path(task_id), encoding="utf-8") as f:
+        with open(
+            self.mod.report_path(self.mod.normalize_task_id(task_id)),
+            encoding="utf-8",
+        ) as f:
             report = f.read()
         self.assertIn("Recorded Reviews", report)
         self.assertIn("integration-cycle", report)
@@ -1633,7 +1643,9 @@ class TestReviewRecords(BaseTestCase):
         rc, _, stderr = self.run_recorder(record)
         self.assertEqual(rc, 0, stderr)
 
-        task_path = self.mod.task_path(record["task_id"])
+        task_path = self.mod.task_path(
+            self.mod.normalize_task_id(record["task_id"])
+        )
         with open(task_path, "rb") as f:
             before = f.read()
         conflicting = copy.deepcopy(record)
@@ -1647,7 +1659,7 @@ class TestReviewRecords(BaseTestCase):
 
     def test_malformed_existing_reviews_block_is_rejected_without_overwrite(self):
         task_id = "REVIEW-MALFORMED-42"
-        task_path = self.mod.task_path(task_id)
+        task_path = self.mod.task_path(self.mod.normalize_task_id(task_id))
         malformed_task = {
             "task_id": task_id,
             "reviews": {
@@ -5223,6 +5235,621 @@ class TestNoLegacyEnvVarsHaveEffect(BaseTestCase):
                     pass
             else:
                 os.environ["COPILOT_TASK_REPORTS_DIR"] = old_env
+
+
+class TestContextMetricsSidecars(BaseTestCase):
+    """Context metrics are opt-in per session, snapshot only pre-compaction
+    token fields, and remain isolated from task-report ingestion/state."""
+
+    def _make_session(self, session_id, cwd="/tmp/context-metrics-work", created_at=None,
+                      state_dir=None):
+        session_dir = os.path.join(state_dir or self.mod.SESSION_STATE_DIR, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        if created_at is None:
+            created_at = iso(datetime.now(timezone.utc))
+        with open(os.path.join(session_dir, "workspace.yaml"), "w", encoding="utf-8") as f:
+            f.write("created_at: %s\ncwd: %s\n" % (created_at, cwd))
+        return session_dir
+
+    def _event(self, event_type, data=None, timestamp="2026-10-13T10:00:00Z", **extra):
+        obj = {"type": event_type, "timestamp": timestamp, "data": data or {}}
+        obj.update(extra)
+        return obj
+
+    def _write_events(self, session_dir, records):
+        path = os.path.join(session_dir, "events.jsonl")
+        with open(path, "wb") as f:
+            for record in records:
+                f.write(json.dumps(record).encode("utf-8") + b"\n")
+        return path
+
+    def _context_update(self, session_id, session_dir, *, enroll=False,
+                        expect_cwd=None, started_after=None):
+        args = type("Args", (), {})()
+        args.session_id = session_id
+        args.session_dir = session_dir
+        args.enroll = enroll
+        args.expect_cwd = expect_cwd
+        args.started_after = started_after
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = self.mod.cmd_context_update(args)
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def _run_context_update_cli(self, session_id, session_dir, *options):
+        old_argv = sys.argv
+        stdout, stderr = io.StringIO(), io.StringIO()
+        try:
+            sys.argv = [
+                "copilot-task-report.py", "context-update",
+                "--session-id", session_id,
+                "--session-dir", session_dir,
+                *options,
+            ]
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                try:
+                    self.mod.main()
+                    rc = 0
+                except SystemExit as ex:
+                    rc = ex.code if isinstance(ex.code, int) else (0 if ex.code is None else 1)
+        finally:
+            sys.argv = old_argv
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def _run_context_list_cli(self, session_state_dir, session_ids):
+        old_argv = sys.argv
+        stdout, stderr = io.StringIO(), io.StringIO()
+        try:
+            sys.argv = [
+                    "copilot-task-report.py", "context-list",
+                    "--session-state-dir", session_state_dir,
+            ]
+            stdin = io.StringIO("\n".join(session_ids) + "\n")
+            with mock.patch.object(sys, "stdin", stdin), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    try:
+                        self.mod.main()
+                        rc = 0
+                    except SystemExit as ex:
+                        rc = ex.code if isinstance(ex.code, int) else (0 if ex.code is None else 1)
+        finally:
+            sys.argv = old_argv
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def test_cli_enrollment_requires_verifiable_created_at(self):
+        cases = (
+            ("missing-created-at", None),
+            ("unparseable-created-at", "not-a-timestamp"),
+        )
+        for session_id, created_at in cases:
+            with self.subTest(session_id=session_id):
+                session_dir = self._make_session(session_id, created_at=created_at)
+                if created_at is None:
+                    with open(os.path.join(session_dir, "workspace.yaml"), "w",
+                              encoding="utf-8") as f:
+                        f.write("cwd: /tmp/context-metrics-work\n")
+
+                rc, out, err = self._run_context_update_cli(
+                    session_id, session_dir,
+                    "--enroll", "--expect-cwd", "/tmp/context-metrics-work",
+                    "--started-after", str(time.time()),
+                )
+
+                self.assertEqual(rc, 3, err)
+                self.assertEqual(out, "")
+                self.assertIn("created_at", err)
+                self.assertIn("cannot be verified", err)
+                self.assertFalse(os.path.exists(self.mod.context_sidecar_path(session_dir)))
+
+    def test_cli_enrollment_rejects_nonfinite_started_after_before_writing(self):
+        for value in ("nan", "inf", "-inf", "1e400"):
+            with self.subTest(started_after=value):
+                session_id = "nonfinite-" + value.replace("-", "minus")
+                session_dir = self._make_session(session_id)
+                rc, out, err = self._run_context_update_cli(
+                    session_id, session_dir,
+                    "--enroll", "--expect-cwd", "/tmp/context-metrics-work",
+                    "--started-after=" + value,
+                )
+
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(out, "")
+                self.assertIn("--started-after must be a finite epoch", err)
+                self.assertFalse(os.path.exists(self.mod.context_sidecar_path(session_dir)))
+
+    def test_legacy_session_without_enroll_is_not_scanned_or_modified(self):
+        session_id = "legacy-session"
+        session_dir = self._make_session(session_id)
+        # A directory at events.jsonl would raise if the unenrolled path tried
+        # to scan it; it must return before opening any event log.
+        os.mkdir(os.path.join(session_dir, "events.jsonl"))
+        with open(self.mod.PRICING_FILE, encoding="utf-8") as f:
+            pricing_before = f.read()
+        reports_before = (
+            sorted(os.listdir(self.mod.REPORTS_DIR))
+            if os.path.isdir(self.mod.REPORTS_DIR) else None
+        )
+
+        rc, out, err = self._context_update(session_id, session_dir)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+        self.assertFalse(os.path.exists(self.mod.context_sidecar_path(session_dir)))
+        self.assertFalse(os.path.exists(self.mod.STATE_FILE))
+        self.assertEqual(os.listdir(self.mod.TASKS_DIR), [])
+        self.assertEqual(
+            sorted(os.listdir(self.mod.REPORTS_DIR))
+            if os.path.isdir(self.mod.REPORTS_DIR) else None,
+            reports_before,
+        )
+        with open(self.mod.PRICING_FILE, encoding="utf-8") as f:
+            self.assertEqual(f.read(), pricing_before)
+
+    def test_enrollment_requires_matching_cwd_and_recent_workspace(self):
+        stale_time = iso(datetime.now(timezone.utc) - timedelta(hours=1))
+        stale_dir = self._make_session("stale-session", created_at=stale_time)
+        rc, out, err = self._context_update(
+            "stale-session", stale_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time(),
+        )
+        self.assertEqual(rc, 3)
+        self.assertIn("predates", err)
+        self.assertFalse(os.path.exists(self.mod.context_sidecar_path(stale_dir)))
+
+        wrong_cwd = self._make_session("wrong-cwd", cwd="/tmp/other-work")
+        rc, out, err = self._context_update(
+            "wrong-cwd", wrong_cwd, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+        self.assertEqual(rc, 3)
+        self.assertIn("cwd does not match", err)
+        self.assertFalse(os.path.exists(self.mod.context_sidecar_path(wrong_cwd)))
+
+    def test_enrollment_writes_private_schema_without_event_content(self):
+        session_id = "fresh-session"
+        session_dir = self._make_session(session_id)
+        self._write_events(session_dir, [
+            self._event(
+                "session.compaction_start",
+                {"currentTokens": 765, "tokenLimit": 1000, "trigger": "turn_end"},
+                summaryContent="PRIVATE-SUMMARY-MUST-NOT-BE-STORED",
+            ),
+            self._event("session.compaction_complete", {"success": True}),
+        ])
+
+        rc, out, err = self._context_update(
+            session_id, session_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Context: 76.5%", out)
+        self.assertIn("Compactions: 1 successful", out)
+        self.assertEqual(err, "")
+        sidecar_path = self.mod.context_sidecar_path(session_dir)
+        sidecar = self.mod.load_json(sidecar_path, {})
+        self.assertEqual(sidecar["schema"], "copilot-s-context")
+        self.assertEqual(sidecar["schema_version"], 1)
+        self.assertEqual(sidecar["session_id"], session_id)
+        self.assertEqual(sidecar["successful_compactions"], 1)
+        self.assertEqual(sidecar["last_precompaction_snapshot"]["current_tokens"], 765)
+        self.assertEqual(sidecar["last_precompaction_snapshot"]["token_limit"], 1000)
+        self.assertEqual(stat.S_IMODE(os.stat(sidecar_path).st_mode), 0o600)
+        with open(sidecar_path, encoding="utf-8") as f:
+            self.assertNotIn("PRIVATE-SUMMARY-MUST-NOT-BE-STORED", f.read())
+
+    def test_events_fold_exact_shapes_success_only_and_uncapped_percent(self):
+        session_id = "metrics-session"
+        session_dir = self._make_session(session_id)
+        self._write_events(session_dir, [
+            self._event("session.compaction_start", {
+                "currentTokens": 900, "tokenLimit": 1000, "trigger": "automatic",
+            }),
+            self._event("session.compaction_complete", {"success": False}),
+            self._event("session.compaction_complete", {"success": True}),
+            self._event("session.compaction_complete", {"success": "true"}),
+            self._event("session.compaction_start", {
+                "currentTokens": 1501, "tokenLimit": 1000, "trigger": "manual",
+            }),
+            # Invalid later snapshots must not replace the latest valid one.
+            self._event("session.compaction_start", {
+                "currentTokens": 5, "tokenLimit": 0,
+            }),
+        ])
+
+        rc, out, err = self._context_update(
+            session_id, session_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Context: 150.1%", out)
+        self.assertIn("Compactions: 1 successful", out)
+        sidecar = self.mod.load_json(self.mod.context_sidecar_path(session_dir), {})
+        self.assertEqual(sidecar["successful_compactions"], 1)
+        self.assertEqual(sidecar["last_precompaction_snapshot"]["current_tokens"], 1501)
+        self.assertEqual(sidecar["events"]["invalid_snapshot_events"], 1)
+
+    def test_only_compaction_start_drives_snapshot_and_displayed_context(self):
+        session_id = "precompaction-only-snapshot"
+        session_dir = self._make_session(session_id)
+        self._write_events(session_dir, [
+            self._event("session.compaction_start", {
+                "currentTokens": 732, "tokenLimit": 1000, "trigger": "turn_end",
+            }),
+            self._event("session.shutdown", {
+                "currentTokens": 990, "tokenLimit": 1200,
+            }),
+            self._event("assistant.message", {
+                "currentTokens": 1400, "tokenLimit": 1500,
+                "usage": {"input_tokens": 1300, "output_tokens": 100},
+            }),
+        ])
+
+        rc, out, err = self._context_update(
+            session_id, session_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(
+            out,
+            "Context: 73.2% (732/1,000 tokens) last observed before compaction · "
+            "Compactions: 0 successful\n",
+        )
+        sidecar = self.mod.load_json(self.mod.context_sidecar_path(session_dir), {})
+        self.assertEqual(
+            sidecar["last_precompaction_snapshot"],
+            {
+                "current_tokens": 732,
+                "token_limit": 1000,
+                "trigger": "turn_end",
+                "timestamp": "2026-10-13T10:00:00Z",
+            },
+        )
+        self.assertNotIn("82.5%", out)
+        self.assertNotIn("93.3%", out)
+        self.assertNotIn("140.0%", out)
+
+    def test_oversized_and_non_integer_snapshots_are_ignored_without_replacing_valid_one(self):
+        session_id = "bounded-snapshots"
+        session_dir = self._make_session(session_id)
+        huge = int("9" * 400)
+        records = [
+            self._event("session.compaction_start", {
+                "currentTokens": 73, "tokenLimit": 100,
+            }),
+            self._event("session.compaction_start", {
+                "currentTokens": 2 ** 53 + 1, "tokenLimit": 100,
+            }),
+            self._event("session.compaction_start", {
+                "currentTokens": 10, "tokenLimit": 2 ** 53 + 1,
+            }),
+            self._event("session.compaction_start", {
+                "currentTokens": huge, "tokenLimit": 100,
+            }),
+            self._event("session.compaction_start", {
+                "currentTokens": 10, "tokenLimit": huge,
+            }),
+            self._event("session.compaction_start", {
+                "currentTokens": True, "tokenLimit": 100,
+            }),
+            self._event("session.compaction_start", {
+                "currentTokens": 10, "tokenLimit": True,
+            }),
+            self._event("session.compaction_start", {
+                "currentTokens": -1, "tokenLimit": 100,
+            }),
+            self._event("session.compaction_start", {
+                "currentTokens": 10, "tokenLimit": 0,
+            }),
+        ]
+        self._write_events(session_dir, records)
+
+        rc, out, err = self._context_update(
+            session_id, session_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Context: 73.0% (73/100 tokens)", out)
+        self.assertIn("8 compaction start(s) without valid token fields ignored", out)
+        sidecar_path = self.mod.context_sidecar_path(session_dir)
+        sidecar = self.mod.load_json(sidecar_path, {})
+        self.assertEqual(sidecar["last_precompaction_snapshot"]["current_tokens"], 73)
+        self.assertEqual(sidecar["last_precompaction_snapshot"]["token_limit"], 100)
+        self.assertEqual(sidecar["events"]["invalid_snapshot_events"], 8)
+        with open(sidecar_path, encoding="utf-8") as f:
+            self.assertNotIn("9" * 400, f.read())
+
+        no_valid_id = "only-invalid-snapshots"
+        no_valid_dir = self._make_session(no_valid_id)
+        self._write_events(no_valid_dir, [
+            self._event("session.compaction_start", {
+                "currentTokens": huge, "tokenLimit": 100,
+            }),
+        ])
+        rc, out, err = self._context_update(
+            no_valid_id, no_valid_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Context: N/A (no valid pre-compaction snapshot recorded)", out)
+        no_valid_sidecar = self.mod.load_json(self.mod.context_sidecar_path(no_valid_dir), {})
+        self.assertIsNone(no_valid_sidecar["last_precompaction_snapshot"])
+        self.assertEqual(no_valid_sidecar["events"]["invalid_snapshot_events"], 1)
+
+    def test_incremental_updates_are_idempotent_and_rewritten_logs_rescan(self):
+        session_id = "incremental-session"
+        session_dir = self._make_session(session_id)
+        events_path = self._write_events(session_dir, [
+            self._event("session.compaction_start", {"currentTokens": 20, "tokenLimit": 100}),
+            self._event("session.compaction_complete", {"success": True}),
+        ])
+        options = dict(enroll=True, expect_cwd="/tmp/context-metrics-work",
+                       started_after=time.time() - 1)
+        rc, _, err = self._context_update(session_id, session_dir, **options)
+        self.assertEqual(rc, 0, err)
+        rc, _, err = self._context_update(session_id, session_dir)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(
+            self.mod.load_json(self.mod.context_sidecar_path(session_dir), {})["successful_compactions"],
+            1,
+        )
+
+        with open(events_path, "ab") as f:
+            f.write((json.dumps(self._event("session.compaction_complete", {"success": True})) + "\n").encode())
+            f.write((json.dumps(self._event("session.compaction_start", {
+                "currentTokens": 220, "tokenLimit": 100,
+            })) + "\n").encode())
+        rc, _, err = self._context_update(session_id, session_dir)
+        self.assertEqual(rc, 0, err)
+        rc, _, err = self._context_update(session_id, session_dir)
+        self.assertEqual(rc, 0, err)
+        sidecar = self.mod.load_json(self.mod.context_sidecar_path(session_dir), {})
+        self.assertEqual(sidecar["successful_compactions"], 2)
+        self.assertEqual(sidecar["last_precompaction_snapshot"]["current_tokens"], 220)
+
+        # A shorter replacement must invalidate the cursor and rebuild metrics,
+        # rather than retaining counts from the old file.
+        self._write_events(session_dir, [
+            self._event("session.compaction_start", {"currentTokens": 30, "tokenLimit": 100}),
+        ])
+        rc, _, err = self._context_update(session_id, session_dir)
+        self.assertEqual(rc, 0, err)
+        sidecar = self.mod.load_json(self.mod.context_sidecar_path(session_dir), {})
+        self.assertEqual(sidecar["successful_compactions"], 0)
+        self.assertEqual(sidecar["last_precompaction_snapshot"]["current_tokens"], 30)
+
+    def test_partial_line_is_not_consumed_then_replayed_when_completed(self):
+        session_id = "partial-session"
+        session_dir = self._make_session(session_id)
+        events_path = os.path.join(session_dir, "events.jsonl")
+        complete = json.dumps(self._event(
+            "session.compaction_complete", {"success": True},
+        )).encode("utf-8") + b"\n"
+        partial = json.dumps(self._event(
+            "session.compaction_complete", {"success": True},
+        )).encode("utf-8")
+        with open(events_path, "wb") as f:
+            f.write(complete + partial)
+        options = dict(enroll=True, expect_cwd="/tmp/context-metrics-work",
+                       started_after=time.time() - 1)
+        rc, out, err = self._context_update(session_id, session_dir, **options)
+        self.assertEqual(rc, 0, err)
+        sidecar = self.mod.load_json(self.mod.context_sidecar_path(session_dir), {})
+        self.assertEqual(sidecar["successful_compactions"], 1)
+        self.assertTrue(sidecar["events"]["trailing_partial_line"])
+        self.assertIn("Compactions: >=1 successful", out)
+        self.assertIn("truncated last line", out)
+
+        with open(events_path, "ab") as f:
+            f.write(b"\n")
+        rc, _, err = self._context_update(session_id, session_dir)
+        self.assertEqual(rc, 0, err)
+        sidecar = self.mod.load_json(self.mod.context_sidecar_path(session_dir), {})
+        self.assertEqual(sidecar["successful_compactions"], 2)
+        self.assertEqual(sidecar["events"]["status"], "complete")
+
+        with open(events_path, "ab") as f:
+            f.write(b"{malformed json}\n")
+        rc, out, err = self._context_update(session_id, session_dir)
+        self.assertEqual(rc, 0, err)
+        sidecar = self.mod.load_json(self.mod.context_sidecar_path(session_dir), {})
+        self.assertEqual(sidecar["successful_compactions"], 2)
+        self.assertEqual(sidecar["events"]["malformed_lines"], 1)
+        self.assertIn("Compactions: >=2 successful", out)
+        self.assertIn("events log incomplete", out)
+
+    def test_missing_and_unreadable_logs_are_unknown_not_zero(self):
+        missing_id = "missing-log"
+        missing_dir = self._make_session(missing_id)
+        rc, out, err = self._context_update(
+            missing_id, missing_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("Compactions: unknown", out)
+        self.assertNotIn("Compactions: 0 successful", out)
+        self.assertIn("could not read", err)
+
+        unreadable_id = "unreadable-log"
+        unreadable_dir = self._make_session(unreadable_id)
+        os.mkdir(os.path.join(unreadable_dir, "events.jsonl"))
+        rc, out, err = self._context_update(
+            unreadable_id, unreadable_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("Compactions: unknown", out)
+        self.assertNotIn("Compactions: 0 successful", out)
+        self.assertIn("could not read", err)
+        self.assertEqual(
+            self.mod.load_json(self.mod.context_sidecar_path(unreadable_dir), {})["events"]["status"],
+            "unreadable",
+        )
+
+    def test_context_list_is_sidecar_only_and_preserves_input_lines(self):
+        listed_id = "listed-session"
+        listed_dir = self._make_session(listed_id)
+        self._write_events(listed_dir, [
+            self._event("session.compaction_start", {"currentTokens": 15, "tokenLimit": 100}),
+        ])
+        rc, _, err = self._context_update(
+            listed_id, listed_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+        self.assertEqual(rc, 0, err)
+        # A directory at events.jsonl proves context-list does not scan events.
+        os.remove(os.path.join(listed_dir, "events.jsonl"))
+        os.mkdir(os.path.join(listed_dir, "events.jsonl"))
+
+        legacy_dir = self._make_session("legacy-list-session")
+        os.mkdir(os.path.join(legacy_dir, "events.jsonl"))
+        invalid_dir = self._make_session("invalid-sidecar")
+        invalid_sidecar = self.mod._context_new_sidecar("invalid-sidecar")
+        invalid_sidecar["successful_compactions"] = int("9" * 400)
+        self.mod.atomic_write(
+            self.mod.context_sidecar_path(invalid_dir),
+            json.dumps(invalid_sidecar),
+        )
+
+        other_listed_id = "listed-other-session"
+        other_listed_dir = self._make_session(other_listed_id)
+        self._write_events(other_listed_dir, [
+            self._event("session.compaction_start", {
+                "currentTokens": 50, "tokenLimit": 100,
+            }),
+        ])
+        rc, _, err = self._context_update(
+            other_listed_id, other_listed_dir, enroll=True,
+            expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+        )
+        self.assertEqual(rc, 0, err)
+
+        ids = [
+            listed_id, "invalid-sidecar", other_listed_id,
+            "legacy-list-session", "../escape", "absent",
+        ]
+        args = type("Args", (), {"session_state_dir": self.mod.SESSION_STATE_DIR})()
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO("\n".join(ids) + "\n")), contextlib.redirect_stdout(stdout):
+            rc = self.mod.cmd_context_list(args)
+
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(lines), len(ids))
+        self.assertEqual(lines[0], "ctx 15.0% last observed before compaction · 0 compactions")
+        self.assertEqual(lines[1], "ctx metrics unreadable")
+        self.assertEqual(lines[2], "ctx 50.0% last observed before compaction · 0 compactions")
+        self.assertEqual(lines[3:], ["", "", ""])
+        self.assertFalse(os.path.exists(self.mod.context_sidecar_path(legacy_dir)))
+
+    def test_context_list_uses_cached_event_statuses_and_emits_exact_labels(self):
+        state_dir = os.path.join(self.tmp, "context-list-override")
+        os.makedirs(state_dir)
+        session_ids = [
+            "cached-missing-log",
+            "cached-unreadable-log",
+            "cached-partial-log",
+            "cached-no-snapshot",
+        ]
+        session_dirs = {
+            session_id: self._make_session(session_id, state_dir=state_dir)
+            for session_id in session_ids
+        }
+        os.mkdir(os.path.join(session_dirs["cached-unreadable-log"], "events.jsonl"))
+        self._write_events(session_dirs["cached-partial-log"], [
+            self._event("session.compaction_start", {
+                "currentTokens": 37, "tokenLimit": 100,
+            }),
+            self._event("session.compaction_complete", {"success": True}),
+        ])
+        with open(os.path.join(session_dirs["cached-partial-log"], "events.jsonl"), "ab") as f:
+            f.write(b'{"type":"unfinished"')
+        self._write_events(session_dirs["cached-no-snapshot"], [
+            self._event("session.compaction_complete", {"success": True}),
+        ])
+
+        expected_statuses = {
+            "cached-missing-log": "missing",
+            "cached-unreadable-log": "unreadable",
+            "cached-partial-log": "partial",
+            "cached-no-snapshot": "complete",
+        }
+        for session_id in session_ids:
+            with self.subTest(session_id=session_id):
+                rc, _out, err = self._context_update(
+                    session_id, session_dirs[session_id], enroll=True,
+                    expect_cwd="/tmp/context-metrics-work", started_after=time.time() - 1,
+                )
+                self.assertEqual(rc, 0, err)
+                sidecar = self.mod.load_json(
+                    self.mod.context_sidecar_path(session_dirs[session_id]), {}
+                )
+                self.assertEqual(sidecar["events"]["status"], expected_statuses[session_id])
+
+        # These logs are no longer readable (or present); context-list must
+        # render the cached sidecar status and snapshot without rescanning.
+        for session_id in ("cached-partial-log", "cached-no-snapshot"):
+            events_path = os.path.join(session_dirs[session_id], "events.jsonl")
+            os.remove(events_path)
+            os.mkdir(events_path)
+
+        rc, out, err = self._run_context_list_cli(state_dir, session_ids)
+
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(err, "")
+        self.assertEqual(
+            out.splitlines(),
+            [
+                "ctx N/A · compactions unknown (log incomplete)",
+                "ctx N/A · compactions unknown (log incomplete)",
+                "ctx 37.0% last observed before compaction · >=1 compaction (log incomplete)",
+                "ctx N/A · 1 compaction",
+            ],
+        )
+        self.assertEqual(len(out.splitlines()), len(session_ids))
+        self.assertFalse(any("0 compaction" in line for line in out.splitlines()))
+
+    def test_context_update_rebuilds_huge_invalid_sidecar_from_events_only(self):
+        session_id = "rebuild-huge-sidecar"
+        session_dir = self._make_session(session_id)
+        huge = int("8" * 400)
+        invalid_sidecar = self.mod._context_new_sidecar(session_id)
+        invalid_sidecar["successful_compactions"] = huge
+        invalid_sidecar["last_precompaction_snapshot"] = {
+            "current_tokens": huge,
+            "token_limit": 100,
+            "trigger": None,
+            "timestamp": None,
+        }
+        self.mod.atomic_write(
+            self.mod.context_sidecar_path(session_dir),
+            json.dumps(invalid_sidecar),
+        )
+        self._write_events(session_dir, [
+            self._event("session.compaction_start", {
+                "currentTokens": 42, "tokenLimit": 100,
+            }),
+            self._event("session.compaction_complete", {"success": True}),
+        ])
+
+        rc, out, err = self._context_update(session_id, session_dir)
+
+        self.assertEqual(rc, 0, err)
+        self.assertIn("unreadable", err)
+        self.assertIn("rebuilding it", err)
+        self.assertIn("Context: 42.0% (42/100 tokens)", out)
+        self.assertIn("Compactions: 1 successful", out)
+        self.assertNotIn(str(huge), out)
+        sidecar_path = self.mod.context_sidecar_path(session_dir)
+        rebuilt = self.mod.load_json(sidecar_path, {})
+        self.assertEqual(rebuilt["successful_compactions"], 1)
+        self.assertEqual(rebuilt["last_precompaction_snapshot"]["current_tokens"], 42)
+        self.assertEqual(rebuilt["last_precompaction_snapshot"]["token_limit"], 100)
+        with open(sidecar_path, encoding="utf-8") as f:
+            self.assertNotIn(str(huge), f.read())
 
 
 if __name__ == "__main__":
