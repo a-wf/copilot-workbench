@@ -294,7 +294,14 @@ groups and reasons, and choices to approve delegation, choose main-session
 handling, or specify a custom route. Only minimal classification reads are
 allowed beforehand. Cancellation or decline stops work. Routing approval
 does not authorize implementation, plan-mode execution, tests, or commits;
-significant route changes require renewed approval. This is an
+significant route changes require renewed approval. For every blocking
+`ask_user` call, the first visible line of the same assistant response,
+immediately before the tool call, starts with
+`🛑 **NEEDS YOUR APPROVAL**`; a blocking non-approval question uses
+`🛑 **NEEDS YOUR INPUT**`. The visible preamble and tool prompt are
+separate; the label cannot appear only in the tool form, an earlier turn,
+or hidden commentary. If `ask_user` is unavailable, use the same label in
+a plain-text pause request and wait for a reply if supported. This is an
 orchestrator instruction, not deterministic CLI enforcement. Small/casual
 implementation retains its automatic coder route, followed by review for
 code changes; simple questions remain direct. There is no

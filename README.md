@@ -593,9 +593,15 @@ user can approve delegation, choose main-session handling, or give custom
 routing. Only minimal classification reads are allowed first. Declining or
 cancelling stops work, and routing approval does not itself approve a plan,
 implementation, tests, commits, or pushes. Significant route changes need
-renewed approval. The toolkit instructions describe this as an
-orchestrator convention; they do not claim the CLI enforces it
-deterministically.
+renewed approval. For every blocking `ask_user` call, the first visible
+line of the same assistant response, immediately before the tool call,
+starts with `🛑 **NEEDS YOUR APPROVAL**`; a blocking non-approval question
+uses `🛑 **NEEDS YOUR INPUT**`. The visible preamble and tool prompt are
+separate parts of that response; the label cannot be supplied only in the
+tool form, an earlier turn, or hidden commentary. If `ask_user` is
+unavailable, use the same label in a plain-text pause request and wait for
+a reply if supported. This is an orchestrator convention, not deterministic
+CLI enforcement.
 
 The orchestrator must communicate those decisions rather than skipping
 silently. Before substantive work it reports the task tier, which stage

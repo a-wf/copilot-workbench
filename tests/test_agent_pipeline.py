@@ -639,31 +639,32 @@ class TestAgentInventory(unittest.TestCase):
 
     def test_routing_approval_instructions_match_config_scope_and_exceptions(self):
         with open(ORCHESTRATOR_INSTRUCTIONS, "r", encoding="utf-8") as f:
-            instructions = " ".join(f.read().split()).lower().replace("*", "")
+            raw_instructions = " ".join(f.read().split())
+        instructions = raw_instructions.lower().replace("*", "").replace("`", "")
 
         required_phrases = (
-            "for standard, complex, and high-risk tasks",
-            "broad discovery or design planning regardless of tier",
-            "preliminary minimal reads needed to classify the request are allowed",
+            "standard, complex, and high-risk",
+            "broad discovery or design planning",
+            "minimal reads needed to classify",
             "before substantive work",
-            "do not use this gate for simple questions or routine small/casual implementation work",
-            "keeps its automatic `coder` route",
+            "do not use this gate for simple questions",
+            "automatic coder route",
             "ask_user",
             "approve recommended delegation",
             "main-session alternative",
             "custom routing",
-            "wait for explicit approval before continuing",
+            "wait for explicit approval",
             "cancellation means no work",
             "a decline is not consent",
-            "routing approval authorizes only the approved stages, ownership, and model route",
+            "routing approval authorizes only",
             "distinct from plan-mode approval",
-            "does not authorize code edits, tests, commits, pushes",
-            "do not start implementation until any required plan approval is also given",
+            "does not authorize code edits",
+            "do not start implementation until",
             "obtain renewed routing approval",
-            "routine file reads and bounded fixes/retests performed by already-approved roles do not require repeated approval",
-            "honor a user's explicit authorization of the exact route without asking redundantly",
+            "bounded fixes/retests",
+            "explicit authorization of the exact route",
             "auto dynamically selected; underlying model not identified",
-            "if `ask_user` is unavailable, pause and request plain-text approval",
+            "plain-text approval",
         )
         for phrase in required_phrases:
             with self.subTest(phrase=phrase):
@@ -672,6 +673,45 @@ class TestAgentInventory(unittest.TestCase):
                     instructions,
                     f"missing routing approval instruction: {phrase}",
                 )
+
+        self.assertIn("🛑 **NEEDS YOUR APPROVAL**", raw_instructions)
+        self.assertIn("🛑 **NEEDS YOUR INPUT**", raw_instructions)
+        self.assertRegex(
+            instructions,
+            r"first visible line .*?begin exactly with 🛑 needs your approval",
+        )
+        self.assertRegex(
+            instructions,
+            r"same assistant response .*?invokes ask_user, immediately before the tool call",
+        )
+        self.assertRegex(
+            instructions,
+            r"blocking question .*?does not require approval, use 🛑 needs your input instead",
+        )
+        self.assertRegex(
+            instructions,
+            r"decision and .*work or action paused .*visible preamble",
+        )
+        self.assertRegex(
+            instructions,
+            r"ask_user call/form as a separate, concise prompt .*repeats the requested decision",
+        )
+        self.assertRegex(
+            instructions,
+            r"routing-only approval does not authorize code edits or commits",
+        )
+        self.assertRegex(
+            instructions,
+            r"do not present a success finale .*work is pending",
+        )
+        self.assertRegex(
+            instructions,
+            r"do not call task_complete .*waiting for the user's answer",
+        )
+        self.assertRegex(
+            instructions,
+            r"ask_user is unavailable.{0,100}same exact first-line label.{0,100}plain-text pause request",
+        )
 
         approval = EXPECTED_ROUTING["routing_approval"]
         self.assertEqual(

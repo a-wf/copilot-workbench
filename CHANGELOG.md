@@ -6,6 +6,15 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — visible signals for blocking user requests
+
+- Require the preceding user-facing message to start with
+  `🛑 **NEEDS YOUR APPROVAL**` before blocking approval requests, or
+  `🛑 **NEEDS YOUR INPUT**` for blocking non-approval questions. Apply this
+  to routing, plan/action authorization, and clarification pauses; retain
+  distinct permission scopes and do not signal a request only in a final
+  response. This is an instruction convention, not enforceable CLI behavior.
+
 ### Added — context metrics for new copilot-s sessions
 
 - Sessions newly created by `copilot-s` (and identified unambiguously after

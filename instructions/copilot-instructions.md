@@ -100,6 +100,52 @@ Do not turn this gate into an automatic heavy pipeline: use the tier
 matrix, conditional stages, and skip reasons to recommend only justified
 work.
 
+### Make every blocking request visible
+
+For **every** blocking request that uses `ask_user`, make the first visible
+line of the user-facing response begin exactly with `🛑 **NEEDS YOUR
+APPROVAL**` if the user must approve or authorize a route, plan,
+implementation/action, or other approval-gated decision. For a blocking
+question or clarification that does not require approval, use
+`🛑 **NEEDS YOUR INPUT**` instead. The label must be the first visible line
+in the **same assistant response** that invokes `ask_user`, immediately
+before the tool call. Do not rely on the tool form alone, a message from an
+earlier turn, or hidden commentary. Put the concrete decision and the work
+or action paused next in the visible preamble; include options or a
+deadline when relevant. Preserve permission scope: routing-only approval
+does not authorize code edits or commits.
+
+Keep the `ask_user` call/form as a separate, concise prompt that repeats
+the requested decision. For example, the assistant response should first
+show this visible preamble:
+
+> 🛑 **NEEDS YOUR APPROVAL** — Work is paused until you approve routing;
+> choose recommended delegation, main-session handling, or custom routing.
+> This approves routing only, not implementation or commits.
+
+Then, immediately following that preamble in the same response, invoke
+`ask_user` with a concise prompt such as: “Which routing option do you
+approve?”
+
+For a blocking question without an authorization decision, use the same
+sequence and label:
+
+> 🛑 **NEEDS YOUR INPUT** — Work is paused until you clarify which
+> configuration file to update.
+
+Then invoke `ask_user` separately with: “Which configuration file should I
+update?”
+
+Apply this to the routing gate above, plan/action authorization, and
+blocked questions. If `ask_user` is unavailable, use the same exact
+first-line label in the plain-text pause request and wait for the user's
+reply when the runtime supports replies; otherwise stop without doing the
+substantive work. Do not bury a generic “please approve” at the end of an
+otherwise complete success/final response, do not present a success
+finale while the work is pending, and do not call `task_complete` while
+waiting for the user's answer. Declines and cancellations stop work as
+described above.
+
 ## Hard routing defaults
 
 When you invoke one of this toolkit's custom agents through the task tool,
