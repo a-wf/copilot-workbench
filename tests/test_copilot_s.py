@@ -574,16 +574,27 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
             additions.update(extra)
         return self.env(additions)
 
-    def _run_tty(self, env, actions=(), timeout=20):
+    def _run_tty(
+        self, env, actions=(), timeout=20, copilot_s_args=(), input_burst=None
+    ):
         """Run the real script with a controlling terminal and answer prompts
-        only when they appear, so flush_stdin cannot consume later answers."""
+        only when they appear, so flush_stdin cannot consume later answers.
+
+        ``input_burst`` is a (prompt marker, text) pair used to simulate
+        multiple lines pasted together while the first prompt is displayed.
+        """
         pid, master = pty.fork()
         if pid == 0:
             os.chdir(self.cwd)
-            os.execve("/bin/bash", ["/bin/bash", COPILOT_S], env)
+            os.execve(
+                "/bin/bash",
+                ["/bin/bash", COPILOT_S, *copilot_s_args],
+                env,
+            )
         output = bytearray()
         actions = list(actions)
         action_index = 0
+        input_burst_sent = False
         status = None
         deadline = time.monotonic() + timeout
         try:
@@ -609,6 +620,13 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                                 pass
                         break
                     output.extend(chunk)
+                    if (
+                        input_burst is not None
+                        and not input_burst_sent
+                        and input_burst[0].encode() in output
+                    ):
+                        os.write(master, input_burst[1].encode())
+                        input_burst_sent = True
                     while action_index < len(actions):
                         marker, response = actions[action_index]
                         if marker.encode() not in output:
@@ -637,7 +655,11 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 except ChildProcessError:
                     pass
             os.close(master)
-        return status, output.decode("utf-8", errors="replace"), action_index
+        return (
+            status,
+            output.decode("utf-8", errors="replace"),
+            action_index + int(input_burst_sent),
+        )
 
     def _helper_calls(self):
         if not os.path.exists(self.helper_log):
@@ -670,10 +692,13 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "FAKE_COPILOT_MODE": "new",
                 "FAKE_SESSION_IDS": "fresh-session",
             }),
-            actions=[("[K/r/d]:", "k\n")],
+            actions=[
+                ("Session name (Enter for automatic):", "\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
         )
         self.assertEqual(status, 0, output)
-        self.assertEqual(actions, 1, output)
+        self.assertEqual(actions, 2, output)
         self.assertLess(output.index(self.CONTEXT_SUMMARY), output.index("[K/r/d]:"))
         calls = self._commands("context-update")
         self.assertEqual(len(calls), 1)
@@ -692,13 +717,202 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertEqual(rows[0][0], "fresh-session")
         self.assertEqual(len(rows[0]), 4)  # preserve the legacy index format
 
-    def test_new_session_with_cwd_mismatch_warns_and_is_not_enrolled(self):
-        status, output, _ = self._run_tty(self._env({
-            "FAKE_COPILOT_MODE": "new",
-            "FAKE_SESSION_IDS": "wrong-cwd-session",
-            "FAKE_SESSION_CWD": os.path.join(self.home, "different-directory"),
-        }))
+    def test_new_launch_forces_auto_and_preserves_non_model_arguments(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "new-auto-session",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", "\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+            copilot_s_args=[
+                "--model", "caller-model",
+                "--auto-tier", "caller-tier",
+                "--custom-option", "kept-value",
+                "--model=other-caller-model",
+                "--auto-tier=other-caller-tier",
+                "--another-option=value",
+                "positional-argument",
+            ],
+        )
         self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        with open(self.copilot_log, encoding="utf-8") as f:
+            copilot_args = json.load(f)
+        self.assertEqual(
+            copilot_args,
+            [
+                "--custom-option", "kept-value",
+                "--another-option=value",
+                "positional-argument",
+                "--model", "auto",
+                "--auto-tier", "efficiency",
+            ],
+        )
+
+    def test_new_session_prompts_before_launch_and_persists_chosen_name(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "named-session",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", "Planning notes\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertLess(
+            output.index("Session name (Enter for automatic):"),
+            output.index("Starting copilot..."),
+            "the name must be requested before Copilot launches",
+        )
+        with open(self.sessions_file, encoding="utf-8") as f:
+            rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
+        named_rows = [row for row in rows if row[0] == "named-session"]
+        self.assertEqual(len(named_rows), 1)
+        self.assertEqual(named_rows[0][1], "Planning notes")
+
+    def test_blank_new_session_name_uses_automatic_name(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "automatic-session",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", "\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        with open(self.sessions_file, encoding="utf-8") as f:
+            rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
+        automatic_rows = [row for row in rows if row[0] == "automatic-session"]
+        self.assertEqual(len(automatic_rows), 1)
+        self.assertEqual(automatic_rows[0][1], "Fake session")
+
+    def test_whitespace_only_new_session_name_uses_automatic_name(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "whitespace-session",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", "   \t  \n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        with open(self.sessions_file, encoding="utf-8") as f:
+            rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
+        whitespace_rows = [row for row in rows if row[0] == "whitespace-session"]
+        self.assertEqual(len(whitespace_rows), 1)
+        self.assertEqual(whitespace_rows[0][1], "Fake session")
+
+    def test_ambiguous_new_sessions_do_not_receive_typed_name(self):
+        chosen_name = "Do not attach"
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "multiple",
+                "FAKE_SESSION_IDS": "ambiguous-one,ambiguous-two",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", chosen_name + "\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        with open(self.sessions_file, encoding="utf-8") as f:
+            rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
+        self.assertFalse(
+            any(row[1] == chosen_name for row in rows),
+            "an ambiguous run must not associate the typed name with any session",
+        )
+        for session_id in ("ambiguous-one", "ambiguous-two"):
+            with open(
+                os.path.join(self.state_dir, session_id, "workspace.yaml"),
+                encoding="utf-8",
+            ) as f:
+                self.assertNotIn("name: " + chosen_name, f.read())
+
+    def test_pipe_in_new_session_name_does_not_corrupt_session_fields(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "pipe-session",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", "Planning|notes\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        with open(self.sessions_file, encoding="utf-8") as f:
+            rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
+        pipe_rows = [row for row in rows if row[0] == "pipe-session"]
+        self.assertEqual(len(pipe_rows), 1)
+        self.assertEqual(len(pipe_rows[0]), 4)
+        self.assertEqual(pipe_rows[0][1], "Planning notes")
+        self.assertEqual(pipe_rows[0][3], self.cwd)
+
+    def test_task_id_prompt_still_accepts_input_for_a_new_session(self):
+        subprocess.run(
+            [
+                "git", "-C", self.cwd, "symbolic-ref", "HEAD",
+                "refs/heads/feature/ordinary-work",
+            ],
+            check=True,
+        )
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "tasked-session",
+            }),
+            actions=[
+                ("[K/r/d]:", "k\n"),
+            ],
+            input_burst=(
+                "Session name (Enter for automatic):",
+                "Tasked session\nABC-456\n",
+            ),
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertLess(
+            output.index("Session name (Enter for automatic):"),
+            output.index("No task ID detected on this branch."),
+        )
+        self.assertLess(
+            output.index("No task ID detected on this branch."),
+            output.index("Starting copilot..."),
+        )
+        ingest_calls = self._commands("ingest")
+        self.assertEqual(len(ingest_calls), 1)
+        self.assertIn("--task=ABC-456", ingest_calls[0]["args"])
+        with open(self.sessions_file, encoding="utf-8") as f:
+            rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
+        tasked_rows = [row for row in rows if row[0] == "tasked-session"]
+        self.assertEqual(len(tasked_rows), 1)
+        self.assertEqual(tasked_rows[0][1], "Tasked session")
+
+    def test_new_session_with_cwd_mismatch_warns_and_is_not_enrolled(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "wrong-cwd-session",
+                "FAKE_SESSION_CWD": os.path.join(self.home, "different-directory"),
+            }),
+            actions=[("Session name (Enter for automatic):", "\n")],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 1, output)
         self.assertIn("could not unambiguously identify", output)
         self.assertEqual(self._commands("context-update"), [])
         self.assertFalse(os.path.exists(os.path.join(
@@ -711,10 +925,13 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "FAKE_COPILOT_MODE": "multiple",
                 "FAKE_SESSION_IDS": "new-one,new-two",
             }),
-            actions=[("[K/r/d]:", "k\n")],
+            actions=[
+                ("Session name (Enter for automatic):", "\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
         )
         self.assertEqual(status, 0, output)
-        self.assertEqual(actions, 1, output)
+        self.assertEqual(actions, 2, output)
         self.assertIn("could not unambiguously identify", output)
         self.assertEqual(self._commands("context-update"), [])
         for session_id in ("new-one", "new-two"):
@@ -733,6 +950,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         )
         self.assertEqual(status, 0, output)
         self.assertEqual(actions, 2, output)
+        self.assertNotIn("Session name (Enter for automatic):", output)
         with open(self.copilot_log, encoding="utf-8") as f:
             copilot_args = json.load(f)
         self.assertIn("--resume=legacy-session", copilot_args)
@@ -743,6 +961,40 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertFalse(os.path.exists(os.path.join(
             self.state_dir, "legacy-session", "copilot-s-context.json"
         )))
+
+    def test_resumed_launch_forces_auto_and_preserves_non_model_arguments(self):
+        self._session("resumed-auto-session")
+        status, output, actions = self._run_tty(
+            self._env({"FAKE_COPILOT_MODE": "idle"}),
+            actions=[
+                ("Select session to resume", "1\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+            copilot_s_args=[
+                "--model", "caller-model",
+                "--auto-tier", "caller-tier",
+                "--custom-option", "kept-value",
+                "--model=other-caller-model",
+                "--auto-tier=other-caller-tier",
+                "--another-option=value",
+                "positional-argument",
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        with open(self.copilot_log, encoding="utf-8") as f:
+            copilot_args = json.load(f)
+        self.assertEqual(
+            copilot_args,
+            [
+                "--resume=resumed-auto-session",
+                "--custom-option", "kept-value",
+                "--another-option=value",
+                "positional-argument",
+                "--model", "auto",
+                "--auto-tier", "efficiency",
+            ],
+        )
 
     def test_enrolled_resume_refreshes_without_enrolling_again(self):
         self._session("enrolled-session", sidecar=True)
@@ -787,10 +1039,13 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "FAKE_SESSION_IDS": "unverified-session",
                 "CONTEXT_UPDATE_EXIT": "3",
             }),
-            actions=[("[K/r/d]:", "k\n")],
+            actions=[
+                ("Session name (Enter for automatic):", "\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
         )
         self.assertEqual(status, 0, output)
-        self.assertEqual(actions, 1, output)
+        self.assertEqual(actions, 2, output)
         self.assertIn("simulated context enrollment verification warning", output)
         self.assertIn("context metrics update failed (exit 3)", output)
         self.assertIn("session handling continues normally", output)

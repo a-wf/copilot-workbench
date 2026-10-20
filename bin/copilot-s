@@ -124,8 +124,9 @@ format_timestamp() {
 prompt_read() {
   local varname="$1"
   local result=""
+  # Use Bash's builtin read for a single line from the controlling terminal.
+  IFS= read -r result < /dev/tty 2>/dev/null || true
   # shellcheck disable=SC2034  # read via eval below, not a direct reference
-  result=$(head -n1 < /dev/tty 2>/dev/null) || true
   eval "$varname=\$result"
 }
 
@@ -344,6 +345,11 @@ with open(sys.argv[1]) as f:
 save_session() {
   local session_id="$1" name="$2" timestamp="$3" cwd="$4"
   local force="${5:-false}"
+  # Names occupy one pipe-delimited field. Keep the serialized value safe and
+  # use the same normalized value for subsequent display/listing.
+  name="${name//|/ }"
+  name="${name#"${name%%[![:space:]]*}"}"
+  name="${name%"${name##*[![:space:]]}"}"
 
   # Update existing entry
   if [[ -f "$SESSIONS_FILE" ]] && grep -q "^${session_id}|" "$SESSIONS_FILE" 2>/dev/null; then
@@ -699,6 +705,9 @@ post_session() {
       echo -ne "${YELLOW}New name: ${RESET}"
       local new_name=""
       prompt_read new_name
+      new_name="${new_name//|/ }"
+      new_name="${new_name#"${new_name%%[![:space:]]*}"}"
+      new_name="${new_name%"${new_name##*[![:space:]]}"}"
       if [[ -n "$new_name" ]]; then
         display_name="$new_name"
       fi
@@ -717,6 +726,35 @@ post_session() {
 run_copilot() {
   local session_id="${1:-}"
   shift 2>/dev/null || true
+
+  # copilot-s always uses Copilot's automatic efficiency tier. Remove caller-
+  # supplied model and auto-tier options in either supported spelling before
+  # appending the forced values, so caller arguments cannot override them.
+  local -a copilot_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model|--auto-tier)
+        shift
+        [[ $# -gt 0 ]] && shift
+        ;;
+      --model=*|--auto-tier=*)
+        shift
+        ;;
+      *)
+        copilot_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+  copilot_args+=(--model auto --auto-tier efficiency)
+
+  # Ask for a name only when starting a genuinely new session. An empty
+  # response keeps the existing automatic name resolution as the fallback.
+  local session_name=""
+  if [[ -z "$session_id" ]]; then
+    echo -ne "${YELLOW}Session name (Enter for automatic): ${RESET}" >&2
+    prompt_read session_name
+  fi
 
   # Resolve which task this run's usage should be attributed to,
   # before copilot starts (prompts once only for a brand-new session with no
@@ -738,9 +776,9 @@ run_copilot() {
 
   echo -e "${CYAN}Starting copilot...${RESET}\n"
   if [[ -n "$session_id" ]]; then
-    copilot --resume="$session_id" "$@" || true
+    copilot --resume="$session_id" "${copilot_args[@]}" || true
   else
-    copilot "$@" || true
+    copilot "${copilot_args[@]}" || true
   fi
 
   flush_stdin
@@ -749,14 +787,37 @@ run_copilot() {
   local detected_id
   detected_id=$(detect_new_session "$before_file") || true
 
+  # Strict detection is also the authority for associating a typed name.
+  # The permissive detector remains in place for existing post-session
+  # behavior, but must not attach names when attribution is ambiguous.
+  local enroll_id="" enroll_rc=0
+  if [[ -z "$session_id" ]]; then
+    enroll_id=$(detect_enrollable_new_session "$before_file") || enroll_rc=$?
+  fi
+
+  # Persist the requested name as soon as the newly created session has
+  # been identified unambiguously, so it is available to listings and the
+  # post-session flow. Empty/whitespace input retains automatic naming.
+  if [[ -z "$session_id" && -n "$detected_id" && $enroll_rc -eq 0 && "$enroll_id" == "$detected_id" ]]; then
+    local session_dir="$SESSION_STATE_DIR/$detected_id"
+    local created_at cwd
+    created_at=$(grep '^created_at:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^created_at: *//' || true)
+    cwd=$(grep '^cwd:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^cwd: *//' || true)
+    session_name="${session_name//|/ }"
+    session_name="${session_name#"${session_name%%[![:space:]]*}"}"
+    session_name="${session_name%"${session_name##*[![:space:]]}"}"
+    if [[ -z "$session_name" ]]; then
+      session_name=$(get_session_name "$session_dir")
+    fi
+    save_session "$detected_id" "$session_name" "$created_at" "$cwd"
+  fi
+
   # Context-metrics enrollment is decided independently and conservatively:
   # only a brand-new run ("n"/no sessions) whose single new session
   # directory is unambiguous gets enrolled; resumes only refresh sessions
   # that are already enrolled.
   local metrics_mode="update"
   if [[ -z "$session_id" ]]; then
-    local enroll_id="" enroll_rc=0
-    enroll_id=$(detect_enrollable_new_session "$before_file") || enroll_rc=$?
     if [[ $enroll_rc -eq 0 && -n "$enroll_id" && "$enroll_id" == "${detected_id:-}" ]]; then
       metrics_mode="enroll"
     elif [[ $enroll_rc -ne 1 ]]; then
@@ -964,6 +1025,8 @@ ${BOLD}Usage:${RESET}
   copilot-s --version | -v      Show the version and exit
 
 ${BOLD}Features:${RESET}
+  - Copilot launches use Auto with the Efficiency tier; organization model
+    policies may still restrict routing
   - Resume, rename, or delete sessions (single/range/multi-select)
   - Prompts to keep/rename/delete a session when \`copilot\` exits
   - For sessions created by copilot-s from now on: shows the context fill
