@@ -123,11 +123,10 @@ format_timestamp() {
 # Read a line from the terminal, safe against EOF and leftover stdin
 prompt_read() {
   local varname="$1"
-  local result=""
   # Use Bash's builtin read for a single line from the controlling terminal.
-  IFS= read -r result < /dev/tty 2>/dev/null || true
-  # shellcheck disable=SC2034  # read via eval below, not a direct reference
-  eval "$varname=\$result"
+  # The caller's variable is the intentional dynamic read target.
+  # shellcheck disable=SC2229
+  IFS= read -r "$varname" < /dev/tty 2>/dev/null || true
 }
 
 # Drain any leftover bytes in /dev/tty after copilot exits
