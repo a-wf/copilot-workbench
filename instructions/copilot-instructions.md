@@ -160,12 +160,12 @@ for this task, follow the user's override and mention the deviation.
 |---|---|---|---|
 | `discovery` | `gpt-6-luna` | `low` | `long_context` |
 | `planner` | `gpt-6.1-sol` | `medium` | `long_context` |
-| `coder` | `gpt-6-luna` | `xhigh` | `default` |
+| `coder` | `gpt-6.1-sol` | `xhigh` | `default` |
 | `senior-coder` | `claude-opus-5.5` | `high` | `long_context` |
 | `reviewer` default | `claude-sonnet-5.5` | `high` | `long_context` |
 | `reviewer` stronger override | `claude-opus-5.5` | `high` | `long_context` |
-| `tester` | `gpt-6-luna` | `xhigh` | `default` |
-| `test-reviewer` | `claude-opus-5.5` | `high` | `long_context` |
+| `tester` | `gpt-6.1-sol` | `xhigh` | `default` |
+| `test-reviewer` | `claude-sonnet-5.5` | `high` | `long_context` |
 
 ### Built-in Task tool route — routine mechanical work
 
@@ -341,8 +341,9 @@ configuration; no-executable-behavior is not an exemption for tests or
 configuration. Review each coherent batch, not each individual edit.
 Pure prose/docs and mechanical git-only operations are normally exempt.
 Default to
-`claude-sonnet-5.5` at high effort and long context for routine coder/GPT-6
-Luna work and other known routine implementations. Use the stronger
+`claude-sonnet-5.5` at high effort and long context for routine coder work
+(GPT-6.1 Sol by default, or GPT-6 Luna on the small/casual route) and other
+known routine implementations. Use the stronger
 `claude-opus-5.5` high/long-context route for senior-coder-authored,
 complex/high-risk, or unknown implementation-model work. Apply this
 convention to the reviewer task call; it is not native CLI config.

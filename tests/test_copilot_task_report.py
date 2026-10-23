@@ -68,18 +68,34 @@ def write_jsonl(path, records):
             f.write(json.dumps(r) + "\n")
 
 
-def otel_span(session_id, name, start_dt, end_dt, attrs):
+def otel_span(
+    session_id,
+    name,
+    start_dt,
+    end_dt,
+    attrs,
+    trace_id=None,
+    span_id=None,
+    parent_span_id=None,
+):
     start_ts = start_dt.timestamp()
     end_ts = end_dt.timestamp()
     a = {"gen_ai.conversation.id": session_id}
     a.update(attrs)
-    return {
+    span = {
         "type": "span",
         "name": name,
         "startTime": [int(start_ts), int((start_ts % 1) * 1e9)],
         "endTime": [int(end_ts), int((end_ts % 1) * 1e9)],
         "attributes": a,
     }
+    if trace_id is not None:
+        span["traceId"] = trace_id
+    if span_id is not None:
+        span["spanId"] = span_id
+    if parent_span_id is not None:
+        span["parentSpanId"] = parent_span_id
+    return span
 
 
 def usage_attrs(model, prompt=100, completion=50, reasoning=0, cache_read=0, cache_write=0, level=None):
@@ -819,6 +835,591 @@ class TestModelCallAttribution(BaseTestCase):
     """Model-call attribution stays conservative while the invocation
     registry remains a separate, session-scoped source of observations."""
 
+    def test_same_trace_direct_parent_attributes_usage_time_model_and_cost(self):
+        session_id = "sess-attribution-direct-parent"
+        coder_start = self.t0 + timedelta(minutes=1)
+        reviewer_start = self.t0 + timedelta(minutes=2)
+        call_start = self.t0 + timedelta(minutes=3)
+        records = [
+            otel_span(
+                session_id,
+                "invoke_agent",
+                coder_start,
+                coder_start + timedelta(seconds=5),
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.agent.name": "coder",
+                    "github.copilot.agent.type": "custom",
+                },
+                trace_id="trace-direct",
+                span_id="invoke-coder",
+            ),
+            otel_span(
+                session_id,
+                "invoke_agent",
+                reviewer_start,
+                reviewer_start + timedelta(seconds=4),
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.agent.name": "reviewer",
+                    "github.copilot.agent.type": "custom",
+                },
+                trace_id="trace-direct",
+                span_id="invoke-reviewer",
+            ),
+            otel_span(
+                session_id,
+                "chat gpt-6.1-sol",
+                call_start,
+                call_start + timedelta(milliseconds=1250),
+                usage_attrs("gpt-6.1-sol", prompt=10, completion=5, reasoning=2),
+                trace_id="trace-direct",
+                span_id="call-priced",
+                parent_span_id="invoke-coder",
+            ),
+            otel_span(
+                session_id,
+                "chat unsupported-model",
+                call_start + timedelta(seconds=1),
+                call_start + timedelta(milliseconds=1750),
+                usage_attrs("unsupported-model", prompt=3, completion=2),
+                trace_id="trace-direct",
+                span_id="call-unpriced",
+                parent_span_id="invoke-coder",
+            ),
+            otel_span(
+                session_id,
+                "chat gpt-6.1-sol",
+                call_start + timedelta(seconds=2),
+                call_start + timedelta(milliseconds=2500),
+                usage_attrs("gpt-6.1-sol", prompt=4, completion=1),
+                trace_id="trace-direct",
+                span_id="call-reviewer",
+                parent_span_id="invoke-reviewer",
+            ),
+        ]
+        write_jsonl(self.otel_path(), records)
+        # The self-reported event stream must remain separate from OTEL chat
+        # usage, even when its agent name matches an attributed agent.
+        write_jsonl(self.events_path(session_id), [{
+            "type": "subagent.completed",
+            "agentId": "event-coder-id",
+            "timestamp": iso(call_start + timedelta(seconds=3)),
+            "data": {
+                "agentName": "coder",
+                "model": "gpt-6.1-sol",
+                "totalTokens": 777,
+                "durationMs": 6000,
+            },
+        }])
+        self.write_official_snapshot()
+
+        self.assertEqual(self.ingest(session_id, "ATTR-DIRECT-1"), 0)
+        task = self.task("ATTR-DIRECT-1")
+        summary = self.mod.summarize_attribution(task)
+
+        self.assertEqual(summary["attributed_calls"], 3)
+        self.assertEqual(summary["attributed_tokens"], 25)
+        self.assertEqual(summary["unknown_calls"], 0)
+        self.assertTrue(summary["reconciled"])
+        self.assertEqual(task["totals"]["call_count"], 3)
+        self.assertEqual(task["totals"]["total_tokens"], 25)
+        coder = summary["agents"]["coder"]
+        self.assertEqual(coder["agent_type"], "custom")
+        self.assertEqual(coder["invocation_spans"], 1)
+        self.assertEqual(coder["calls"], 2)
+        self.assertEqual(coder["prompt_tokens"], 13)
+        self.assertEqual(coder["completion_tokens"], 7)
+        self.assertEqual(coder["reasoning_tokens"], 2)
+        self.assertEqual(coder["total_tokens"], 20)
+        self.assertEqual(coder["duration_ms"], 2000)
+        self.assertEqual(coder["models"], {"gpt-6.1-sol": 1, "unsupported-model": 1})
+        self.assertEqual(coder["priced_calls"], 1)
+        self.assertEqual(coder["unpriced_calls"], 1)
+        self.assertAlmostEqual(coder["usd"], 0.00007)
+        reviewer = summary["agents"]["reviewer"]
+        self.assertEqual(reviewer["invocation_spans"], 1)
+        self.assertEqual(reviewer["calls"], 1)
+        self.assertEqual(reviewer["duration_ms"], 500)
+        self.assertEqual(reviewer["models"], {"gpt-6.1-sol": 1})
+        self.assertEqual(reviewer["priced_calls"], 1)
+        self.assertEqual(reviewer["unpriced_calls"], 0)
+        self.assertAlmostEqual(reviewer["usd"], 0.000018)
+        self.assertAlmostEqual(summary["attributed_usd"], 0.000088)
+        self.assertEqual(task["by_agent"]["coder"]["total_tokens"], 777)
+        self.assertNotEqual(task["by_agent"]["coder"]["total_tokens"], coder["total_tokens"])
+
+        with open(
+            self.mod.report_path(self.mod.normalize_task_id("ATTR-DIRECT-1")),
+            encoding="utf-8",
+        ) as f:
+            report = f.read()
+        self.assertIn("## Attribution Coverage (model calls → agent invocations)", report)
+        self.assertIn("### By Agent (OTEL-measured via explicit trace parent)", report)
+        self.assertIn("### Attribution data quality", report)
+        self.assertIn(
+            "| Agent | Type | Invocation spans | Calls | Prompt | Completion | Reasoning | "
+            "Total Tokens | Model-call Time | Models (calls) | Est. USD (official) |",
+            report,
+        )
+        self.assertIn("partial: 1 of 2 calls", report)
+        self.assertIn("1 attributed call(s) unpriced — lower bound", report)
+        self.assertIn("By Custom Agent", report)
+
+        # Replaying unchanged telemetry must not add agent usage, calls, cost,
+        # or invocation spans a second time.
+        first_attribution = copy.deepcopy(task["attribution"])
+        self.assertEqual(self.ingest(session_id, "ATTR-DIRECT-1"), 0)
+        replayed = self.task("ATTR-DIRECT-1")
+        self.assertEqual(replayed["attribution"], first_attribution)
+        self.assertEqual(replayed["totals"]["call_count"], 3)
+
+    def test_agent_names_and_types_are_escaped_in_report_table_with_bounded_keys(self):
+        session_id = "sess-attribution-report-safe-cells"
+        start = self.t0 + timedelta(minutes=1)
+        trace_id = "trace-report-safe-cells"
+        records = []
+
+        def add_invocation(offset, span_id, agent_name, agent_type=None, parent_span_id=None):
+            attrs = {"gen_ai.operation.name": "invoke_agent"}
+            if agent_name is not None:
+                attrs["gen_ai.agent.name"] = agent_name
+            if agent_type is not None:
+                attrs["github.copilot.agent.type"] = agent_type
+            agent_start = start + timedelta(seconds=offset)
+            records.append(otel_span(
+                session_id,
+                "invoke_agent",
+                agent_start,
+                agent_start + timedelta(seconds=2),
+                attrs,
+                trace_id=trace_id,
+                span_id=span_id,
+                parent_span_id=parent_span_id,
+            ))
+            call_start = agent_start + timedelta(seconds=1)
+            records.append(otel_span(
+                session_id,
+                "chat report-safe-model",
+                call_start,
+                call_start + timedelta(milliseconds=500),
+                usage_attrs("report-safe-model", prompt=1, completion=1),
+                trace_id=trace_id,
+                span_id=span_id + "-call",
+                parent_span_id=span_id,
+            ))
+
+        escaped_name = "agent|name\nline\\tail"
+        escaped_type = "custom|worker\nline\\kind"
+        long_name = "long-" + ("x" * 210)
+        add_invocation(0, "escaped-agent", escaped_name, escaped_type)
+        add_invocation(3, "long-agent", long_name, "custom")
+        add_invocation(6, "root-agent", None)
+        add_invocation(9, "unnamed-agent", None, parent_span_id="root-agent")
+        write_jsonl(self.otel_path(), records)
+
+        self.assertEqual(self.ingest(session_id, "ATTR-REPORT-SAFE-CELLS-1"), 0)
+        task = self.task("ATTR-REPORT-SAFE-CELLS-1")
+        self.assertEqual(task["totals"]["call_count"], 4)
+        max_key_len = self.mod.ATTRIBUTION_MAX_AGENT_KEY_LEN
+        self.assertEqual(len(long_name), max_key_len + 15)
+        self.assertIn(long_name[:max_key_len], task["attribution"]["attributed"])
+        self.assertNotIn(long_name, task["attribution"]["attributed"])
+
+        with open(
+            self.mod.report_path(self.mod.normalize_task_id("ATTR-REPORT-SAFE-CELLS-1")),
+            encoding="utf-8",
+        ) as f:
+            report = f.read()
+        self.assertIn(
+            r"| agent\|name line\\tail | custom\|worker line\\kind | 1 | 1 |",
+            report,
+        )
+        self.assertIn(
+            "| %s | custom | 1 | 1 |" % long_name[:max_key_len],
+            report,
+        )
+        self.assertIn(
+            "| %s | — | 1 | 1 |" % self.mod.ATTRIBUTION_ROOT_AGENT_KEY,
+            report,
+        )
+        self.assertIn(
+            "| %s | — | 1 | 1 |" % self.mod.ATTRIBUTION_UNNAMED_AGENT_KEY,
+            report,
+        )
+
+    def test_missing_trace_or_parent_and_non_agent_or_wrong_trace_parent_stay_unknown(self):
+        session_id = "sess-attribution-unknown-reasons"
+        start = self.t0 + timedelta(minutes=1)
+        records = [
+            # A spanId/parentSpanId without traceId cannot identify a parent.
+            otel_span(
+                session_id, "chat no-trace", start, start + timedelta(seconds=1),
+                usage_attrs("no-trace", prompt=1, completion=1),
+                span_id="no-trace-call", parent_span_id="agent-parent",
+            ),
+            # A traceId without parentSpanId is also missing the join key.
+            otel_span(
+                session_id, "chat no-parent", start + timedelta(seconds=1),
+                start + timedelta(seconds=2),
+                usage_attrs("no-parent", prompt=2, completion=1),
+                trace_id="trace-no-parent", span_id="no-parent-call",
+            ),
+            # Even a matching spanId is insufficient when the trace differs.
+            otel_span(
+                session_id, "invoke_agent", start, start + timedelta(seconds=3),
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.agent.name": "coder",
+                },
+                trace_id="trace-parent",
+                span_id="same-span-id",
+            ),
+            otel_span(
+                session_id, "chat wrong-trace", start + timedelta(seconds=2),
+                start + timedelta(seconds=3),
+                usage_attrs("wrong-trace", prompt=3, completion=1),
+                trace_id="trace-child",
+                span_id="wrong-trace-call",
+                parent_span_id="same-span-id",
+            ),
+            # Direct parent exists in the same trace, but is not invoke_agent.
+            otel_span(
+                session_id, "internal operation", start + timedelta(seconds=3),
+                start + timedelta(seconds=4), {},
+                trace_id="trace-non-agent",
+                span_id="ordinary-parent",
+            ),
+            otel_span(
+                session_id, "chat non-agent-parent", start + timedelta(seconds=4),
+                start + timedelta(seconds=5),
+                usage_attrs("non-agent-parent", prompt=4, completion=1),
+                trace_id="trace-non-agent",
+                span_id="non-agent-call",
+                parent_span_id="ordinary-parent",
+            ),
+            # A direct parent id that was not present in this ingest batch.
+            otel_span(
+                session_id, "chat absent-parent", start + timedelta(seconds=5),
+                start + timedelta(seconds=6),
+                usage_attrs("absent-parent", prompt=5, completion=1),
+                trace_id="trace-absent",
+                span_id="absent-parent-call",
+                parent_span_id="not-exported",
+            ),
+        ]
+        write_jsonl(self.otel_path(), records)
+
+        self.assertEqual(self.ingest(session_id, "ATTR-UNKNOWN-REASONS-1"), 0)
+        task = self.task("ATTR-UNKNOWN-REASONS-1")
+        summary = self.mod.summarize_attribution(task)
+        self.assertEqual(summary["unknown_calls"], 5)
+        self.assertEqual(summary["attributed_calls"], 0)
+        self.assertEqual(summary["total_calls"], 5)
+        self.assertEqual(
+            summary["unknown"][self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK]["calls"],
+            2,
+        )
+        self.assertEqual(
+            summary["unknown"][self.mod.ATTRIBUTION_REASON_PARENT_NOT_OBSERVED]["calls"],
+            2,
+        )
+        self.assertEqual(
+            summary["unknown"][self.mod.ATTRIBUTION_REASON_PARENT_NOT_AGENT]["calls"],
+            1,
+        )
+        self.assertTrue(summary["reconciled"])
+        with open(
+            self.mod.report_path(
+                self.mod.normalize_task_id("ATTR-UNKNOWN-REASONS-1")
+            ),
+            encoding="utf-8",
+        ) as f:
+            report = f.read()
+        no_link = self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+        parent_missing = self.mod.ATTRIBUTION_REASON_PARENT_NOT_OBSERVED
+        parent_not_agent = self.mod.ATTRIBUTION_REASON_PARENT_NOT_AGENT
+        self.assertIn("| Unknown — %s | 2 |" % no_link, report)
+        self.assertIn("the chat spans carried no `traceId`/`parentSpanId`", report)
+        self.assertIn("| Unknown — %s | 2 |" % parent_missing, report)
+        self.assertIn("the parent span was not in the same ingest batch", report)
+        self.assertIn("| Unknown — %s | 1 |" % parent_not_agent, report)
+        self.assertIn(
+            "the direct parent was another span kind; ancestors are deliberately not walked",
+            report,
+        )
+
+    def test_grandparent_agent_and_timing_overlap_do_not_attribute_without_direct_parent(self):
+        session_id = "sess-attribution-no-heuristic"
+        start = self.t0 + timedelta(minutes=1)
+        records = [
+            otel_span(
+                session_id,
+                "invoke_agent",
+                start,
+                start + timedelta(seconds=5),
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.agent.name": "coder",
+                },
+                trace_id="trace-grandparent",
+                span_id="grandparent-agent",
+            ),
+            otel_span(
+                session_id,
+                "internal operation",
+                start + timedelta(seconds=1),
+                start + timedelta(seconds=4),
+                {},
+                trace_id="trace-grandparent",
+                span_id="non-agent-parent",
+                parent_span_id="grandparent-agent",
+            ),
+            otel_span(
+                session_id,
+                "chat grandchild",
+                start + timedelta(seconds=2),
+                start + timedelta(seconds=3),
+                usage_attrs("grandchild-model", prompt=1, completion=1),
+                trace_id="trace-grandparent",
+                span_id="grandchild-call",
+                parent_span_id="non-agent-parent",
+            ),
+            otel_span(
+                session_id,
+                "invoke_agent",
+                start + timedelta(seconds=10),
+                start + timedelta(seconds=20),
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.agent.name": "reviewer",
+                },
+                trace_id="trace-timing-window",
+                span_id="timing-window-agent",
+            ),
+            # Same trace and inside the invocation window, but no parentSpanId.
+            otel_span(
+                session_id,
+                "chat inside invocation window without parent",
+                start + timedelta(seconds=14),
+                start + timedelta(seconds=15),
+                usage_attrs("timing-model", prompt=1, completion=1),
+                trace_id="trace-timing-window",
+                span_id="timing-window-call",
+            ),
+        ]
+        write_jsonl(self.otel_path(), records)
+
+        self.assertEqual(self.ingest(session_id, "ATTR-NO-HEURISTIC-1"), 0)
+        task = self.task("ATTR-NO-HEURISTIC-1")
+        summary = self.mod.summarize_attribution(task)
+        self.assertEqual(summary["attributed_calls"], 0)
+        self.assertEqual(summary["unknown_calls"], 2)
+        self.assertEqual(
+            summary["unknown"][self.mod.ATTRIBUTION_REASON_PARENT_NOT_AGENT],
+            {"calls": 1, "total_tokens": 2},
+        )
+        self.assertEqual(
+            summary["unknown"][self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK],
+            {"calls": 1, "total_tokens": 2},
+        )
+        self.assertTrue(summary["reconciled"])
+
+    def test_parent_absent_from_ingest_is_not_relinked_when_exported_later(self):
+        session_id = "sess-attribution-late-parent"
+        start = self.t0 + timedelta(minutes=1)
+        child = otel_span(
+            session_id,
+            "chat child-before-parent",
+            start,
+            start + timedelta(seconds=1),
+            usage_attrs("late-parent-model", prompt=6, completion=2),
+            trace_id="trace-late-parent",
+            span_id="late-child",
+            parent_span_id="late-agent",
+        )
+        write_jsonl(self.otel_path(), [child])
+
+        self.assertEqual(self.ingest(session_id, "ATTR-LATE-PARENT-1"), 0)
+        first = self.task("ATTR-LATE-PARENT-1")
+        reason = self.mod.ATTRIBUTION_REASON_PARENT_NOT_OBSERVED
+        self.assertEqual(first["attribution"]["unknown"][reason]["call_count"], 1)
+        self.assertEqual(self.mod.summarize_attribution(first)["attributed_calls"], 0)
+
+        agent_span = otel_span(
+            session_id,
+            "invoke_agent",
+            start + timedelta(seconds=2),
+            start + timedelta(seconds=4),
+            {
+                "gen_ai.operation.name": "invoke_agent",
+                "gen_ai.agent.name": "coder",
+            },
+            trace_id="trace-late-parent",
+            span_id="late-agent",
+        )
+        write_jsonl(self.otel_path(), [agent_span])
+        self.assertEqual(self.ingest(session_id, "ATTR-LATE-PARENT-1"), 0)
+        second = self.task("ATTR-LATE-PARENT-1")
+        summary = self.mod.summarize_attribution(second)
+        self.assertEqual(second["totals"]["call_count"], 1)
+        self.assertEqual(second["attribution"]["unknown"][reason]["call_count"], 1)
+        self.assertEqual(summary["attributed_calls"], 0)
+        self.assertEqual(summary["agents"]["coder"]["invocation_spans"], 1)
+        self.assertTrue(summary["reconciled"])
+
+    def test_v1_block_upgrades_losslessly_and_reconciles_with_attributed_calls(self):
+        task_id = "ATTR-V1-UPGRADE-1"
+        legacy = self.mod.blank_agg()
+        self.mod.add_agg(legacy, {
+            "prompt_tokens": 10, "completion_tokens": 2,
+            "reasoning_tokens": 0, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "total_tokens": 12,
+            "duration_ms": 100, "effort_key": "unknown",
+        })
+        old_unknown = self.mod.blank_agg()
+        for _ in range(2):
+            self.mod.add_agg(old_unknown, {
+                "prompt_tokens": 5, "completion_tokens": 2,
+                "reasoning_tokens": 0, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "total_tokens": 7,
+                "duration_ms": 200, "effort_key": "unknown",
+            })
+        totals = self.mod.blank_agg()
+        for key in self.mod.blank_agg():
+            totals[key] = legacy[key] + old_unknown[key]
+        totals["first_call_ts"] = self.t0.timestamp() - 30
+        totals["last_call_ts"] = self.t0.timestamp() - 10
+        v1_unknown = {
+            self.mod.ATTRIBUTION_REASON_V1_NO_LINK: copy.deepcopy(old_unknown)
+        }
+        v1_block = {
+            "schema_version": 1,
+            "since": "2025-12-01T00:00:00Z",
+            "legacy": copy.deepcopy(legacy),
+            "unknown": copy.deepcopy(v1_unknown),
+            "observed_invocations": {},
+            "provenance": {"model_calls": "schema v1"},
+        }
+        self.mod.atomic_write(
+            self.mod.task_path(self.mod.normalize_task_id(task_id)),
+            json.dumps({"task_id": task_id, "totals": totals, "attribution": v1_block}),
+        )
+
+        session_id = "sess-attribution-v1-upgrade"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id, "invoke_agent", start, start + timedelta(seconds=3),
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.agent.name": "tester",
+                },
+                trace_id="trace-v1-upgrade",
+                span_id="tester-span",
+            ),
+            otel_span(
+                session_id, "chat gpt-6.1-sol", start + timedelta(seconds=1),
+                start + timedelta(seconds=2),
+                usage_attrs("gpt-6.1-sol", prompt=8, completion=3),
+                trace_id="trace-v1-upgrade",
+                span_id="new-attributed-call",
+                parent_span_id="tester-span",
+            ),
+        ])
+
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+        task = self.task(task_id)
+        summary = self.mod.summarize_attribution(task)
+        self.assertEqual(task["attribution"]["schema_version"], 2)
+        self.assertEqual(task["attribution"]["upgraded_from_schema_version"], 1)
+        self.assertEqual(task["attribution"]["legacy"], legacy)
+        self.assertEqual(
+            task["attribution"]["unknown"][self.mod.ATTRIBUTION_REASON_V1_NO_LINK],
+            old_unknown,
+        )
+        self.assertEqual(summary["v1_unknown_calls"], 2)
+        self.assertEqual(summary["attributed_calls"], 1)
+        self.assertEqual(summary["total_calls"], 4)
+        self.assertEqual(summary["total_tokens"], 37)
+        self.assertTrue(summary["reconciled"])
+        upgraded_attribution = copy.deepcopy(task["attribution"])
+        self.assertTrue(upgraded_attribution["attributed_since"])
+        self.assertNotEqual(
+            upgraded_attribution["attributed_since"],
+            upgraded_attribution["since"],
+        )
+        self.assertEqual(
+            summary["attributed_since"],
+            upgraded_attribution["attributed_since"],
+        )
+        self.assertEqual(
+            summary["legacy_calls"] + summary["unknown_calls"] + summary["attributed_calls"],
+            summary["total_calls"],
+        )
+        self.assertEqual(
+            summary["legacy_tokens"] + summary["unknown_tokens"] + summary["attributed_tokens"],
+            summary["total_tokens"],
+        )
+        self.assertEqual(self.ingest(session_id, task_id), 0)
+        replayed = self.task(task_id)
+        replayed_summary = self.mod.summarize_attribution(replayed)
+        self.assertEqual(replayed["attribution"], upgraded_attribution)
+        self.assertEqual(replayed["attribution"]["legacy"], legacy)
+        self.assertEqual(
+            replayed["attribution"]["unknown"],
+            {self.mod.ATTRIBUTION_REASON_V1_NO_LINK: old_unknown},
+        )
+        self.assertEqual(replayed["totals"]["call_count"], 4)
+        self.assertEqual(replayed["totals"]["total_tokens"], 37)
+        self.assertEqual(replayed_summary["v1_unknown_calls"], 2)
+        self.assertEqual(replayed_summary["attributed_calls"], 1)
+        self.assertTrue(replayed_summary["reconciled"])
+
+    def test_agent_only_delta_is_persisted_and_replayed_once(self):
+        session_id = "sess-agent-span-only"
+        start = self.t0 + timedelta(minutes=1)
+        write_jsonl(self.otel_path(), [
+            otel_span(
+                session_id,
+                "invoke_agent",
+                start,
+                start + timedelta(seconds=2),
+                {
+                    "gen_ai.operation.name": "invoke_agent",
+                    "gen_ai.agent.name": "discovery",
+                    "github.copilot.agent.type": "custom",
+                },
+                trace_id="trace-agent-only",
+                span_id="discovery-span",
+            ),
+        ])
+
+        self.assertEqual(self.ingest(session_id, "ATTR-AGENT-ONLY-1"), 0)
+        task = self.task("ATTR-AGENT-ONLY-1")
+        agent = task["attribution"]["attributed"]["discovery"]
+        self.assertEqual(agent["invocation_spans"], 1)
+        self.assertEqual(agent["usage"]["call_count"], 0)
+        self.assertEqual(agent["official_cost"], {
+            "priced_calls": 0, "usd": 0.0, "unpriced_calls": 0,
+        })
+        with open(
+            self.mod.report_path(
+                self.mod.normalize_task_id("ATTR-AGENT-ONLY-1")
+            ),
+            encoding="utf-8",
+        ) as f:
+            report = f.read()
+        self.assertIn(
+            "1 agent(s) have observed invocation spans but no attributed calls",
+            report,
+        )
+
+        before = copy.deepcopy(task["attribution"])
+        self.assertEqual(self.ingest(session_id, "ATTR-AGENT-ONLY-1"), 0)
+        replayed = self.task("ATTR-AGENT-ONLY-1")
+        self.assertEqual(replayed["attribution"], before)
+
     def test_calls_inside_overlapping_agent_windows_remain_unknown(self):
         session_id = "sess-attribution-overlap"
         agent_start = self.t0 + timedelta(minutes=1)
@@ -1027,8 +1628,58 @@ class TestModelCallAttribution(BaseTestCase):
         self.assertEqual(final["totals"]["total_tokens"], 50)
         self.assertTrue(summary["reconciled"])
 
-    def test_old_delta_without_attribution_falls_back_to_unknown(self):
-        task = {"task_id": "ATTR-OLD-DELTA-1"}
+    def test_delta_without_attribution_uses_neutral_bucket_and_reconciles(self):
+        legacy_call = {
+            "prompt_tokens": 2, "completion_tokens": 1,
+            "reasoning_tokens": 0, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "total_tokens": 3,
+            "duration_ms": 10, "effort_key": "unknown",
+        }
+        legacy = self.mod.blank_agg()
+        self.mod.add_agg(legacy, legacy_call)
+        task = {
+            "task_id": "ATTR-OLD-DELTA-1",
+            "totals": dict(legacy),
+        }
+        attribution = self.mod.prepare_attribution_block(task)
+
+        existing_unknown = self.mod.blank_agg()
+        existing_unknown_call = {
+            "prompt_tokens": 3, "completion_tokens": 2,
+            "reasoning_tokens": 0, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "total_tokens": 5,
+            "duration_ms": 10, "effort_key": "unknown",
+        }
+        self.mod.add_agg(existing_unknown, existing_unknown_call)
+        attributed = self.mod.blank_agg()
+        attributed_call = {
+            "prompt_tokens": 4, "completion_tokens": 3,
+            "reasoning_tokens": 0, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "total_tokens": 7,
+            "duration_ms": 10, "effort_key": "unknown",
+        }
+        self.mod.add_agg(attributed, attributed_call)
+        self.mod.add_agg(task["totals"], existing_unknown_call)
+        self.mod.add_agg(task["totals"], attributed_call)
+        self.mod.merge_attribution_delta(
+            attribution,
+            {
+                "unknown": {
+                    self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK: existing_unknown,
+                },
+                "attributed": {
+                    "coder": {
+                        "agent_type": "custom",
+                        "usage": attributed,
+                        "models": {"attributed-model": 1},
+                        "invocation_spans": 1,
+                    },
+                },
+                "invocation_events": [],
+            },
+            "session-existing",
+        )
+
         call_agg = self.mod.blank_agg()
         self.mod.add_agg(call_agg, {
             "prompt_tokens": 4, "completion_tokens": 6,
@@ -1049,9 +1700,22 @@ class TestModelCallAttribution(BaseTestCase):
 
         self.mod.merge_delta_into_task(task, old_delta, "session-old-delta", task["task_id"])
         summary = self.mod.summarize_attribution(task)
-        reason = self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK
-        self.assertEqual(summary["unknown"][reason], {"calls": 1, "total_tokens": 10})
-        self.assertEqual(summary["attributed_calls"], 0)
+        delta_reason = self.mod.ATTRIBUTION_REASON_DELTA_WITHOUT_ATTRIBUTION
+        span_reason = self.mod.ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+        self.assertEqual(summary["unknown"][delta_reason], {"calls": 1, "total_tokens": 10})
+        self.assertEqual(summary["unknown"][span_reason], {"calls": 1, "total_tokens": 5})
+        self.assertEqual(summary["legacy_calls"], 1)
+        self.assertEqual(summary["unknown_calls"], 2)
+        self.assertEqual(summary["attributed_calls"], 1)
+        self.assertEqual(summary["total_calls"], 4)
+        self.assertEqual(
+            summary["legacy_calls"] + summary["unknown_calls"] + summary["attributed_calls"],
+            summary["total_calls"],
+        )
+        self.assertEqual(
+            summary["legacy_tokens"] + summary["unknown_tokens"] + summary["attributed_tokens"],
+            summary["total_tokens"],
+        )
         self.assertTrue(summary["reconciled"])
 
     def test_malformed_attribution_is_preserved_while_new_usage_is_counted(self):
@@ -1741,6 +2405,33 @@ class TestReportRendering(BaseTestCase):
         self.assertIn("$0.0100", md)
         self.assertNotIn("Total company fixed charge", md)
         self.assertIn("(report file:", err_buf.getvalue())
+
+    def test_unstarted_attribution_uses_neutral_legacy_fallback_label(self):
+        totals = self.mod.blank_agg()
+        self.mod.add_agg(totals, {
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+            "reasoning_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 3,
+            "duration_ms": 10,
+            "effort_key": "unknown",
+        })
+        rendered = "\n".join(
+            self.mod.render_attribution_section(
+                {"task_id": "REPORT-LEGACY-FALLBACK", "totals": totals}
+            )
+        )
+
+        self.assertIn(
+            "| Legacy — recorded before attribution tracking (starts at the next ingest) | 1 |",
+            rendered,
+        )
+        self.assertIn(
+            "Attribution tracking has not started for this task; all 1 recorded call(s) are legacy",
+            rendered,
+        )
 
 
 class TestUnassignedAndInvalidTaskFallback(BaseTestCase):

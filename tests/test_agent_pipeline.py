@@ -58,7 +58,7 @@ EXPECTED_AGENTS = {
         "tools": ["read", "search", "web"],
     },
     "coder": {
-        "model": "gpt-6-luna",
+        "model": "gpt-6.1-sol",
         "reasoningEffort": "xhigh",
         "tools": ["*"],
     },
@@ -73,12 +73,12 @@ EXPECTED_AGENTS = {
         "tools": ["read", "search", "execute"],
     },
     "tester": {
-        "model": "gpt-6-luna",
+        "model": "gpt-6.1-sol",
         "reasoningEffort": "xhigh",
         "tools": ["*"],
     },
     "test-reviewer": {
-        "model": "claude-opus-5.5",
+        "model": "claude-sonnet-5.5",
         "reasoningEffort": "high",
         "tools": ["read", "search", "execute"],
     },
@@ -100,7 +100,7 @@ EXPECTED_ROUTING = {
         },
         "coder": {
             "role": "Routine Implementation Engineer",
-            "model": "gpt-6-luna",
+            "model": "gpt-6.1-sol",
             "reasoning_effort": "xhigh",
             "context_tier": "default",
         },
@@ -118,13 +118,13 @@ EXPECTED_ROUTING = {
         },
         "tester": {
             "role": "Test Engineer",
-            "model": "gpt-6-luna",
+            "model": "gpt-6.1-sol",
             "reasoning_effort": "xhigh",
             "context_tier": "default",
         },
         "test-reviewer": {
             "role": "Test Coverage Reviewer",
-            "model": "claude-opus-5.5",
+            "model": "claude-sonnet-5.5",
             "reasoning_effort": "high",
             "context_tier": "long_context",
         },
@@ -491,6 +491,87 @@ class TestAgentInventory(unittest.TestCase):
                     routing["agents"][name]["reasoning_effort"],
                     expected["reasoningEffort"],
                 )
+
+    def test_documented_agent_routing_matches_config_and_keeps_small_casual_luna(self):
+        routing = parse_agent_routing(ROUTING_CONFIG)
+        with open(os.path.join(REPO_ROOT, "README.md"), "r", encoding="utf-8") as f:
+            readme_lines = f.read().splitlines()
+        agent_rows = {
+            name: next(
+                (line for line in readme_lines if line.startswith(f"| `{name}` |")),
+                None,
+            )
+            for name in EXPECTED_AGENTS
+        }
+
+        instructions_path = ORCHESTRATOR_INSTRUCTIONS
+        with open(instructions_path, "r", encoding="utf-8") as f:
+            instructions_lines = f.read().splitlines()
+        table_header = "| Agent | Model | Reasoning effort | Context tier |"
+        table_start = instructions_lines.index(table_header)
+        instruction_rows = {}
+        for line in instructions_lines[table_start + 2:]:
+            if not line.startswith("|"):
+                break
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) != 4:
+                continue
+            match = re.fullmatch(
+                r"`([^`]+)`(?: (default|stronger override))?",
+                cells[0],
+            )
+            if not match:
+                continue
+            name, variant = match.groups()
+            if name not in EXPECTED_AGENTS:
+                continue
+            if name == "reviewer" and variant != "default":
+                continue
+            instruction_rows[name] = tuple(cells[1:])
+
+        for name, row in agent_rows.items():
+            with self.subTest(agent=name):
+                self.assertIsNotNone(row, f"README routing table is missing {name}")
+                cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+                self.assertEqual(len(cells), 3, f"unexpected README routing row for {name}")
+                model_and_effort = re.match(
+                    r"`([^`]+)` \(effort: `([^`]+)`",
+                    cells[2],
+                )
+                self.assertIsNotNone(
+                    model_and_effort,
+                    f"README routing row for {name} should render model and effort",
+                )
+                self.assertEqual(
+                    model_and_effort.groups(),
+                    (
+                        routing["agents"][name]["model"],
+                        routing["agents"][name]["reasoning_effort"],
+                    ),
+                )
+
+                expected_instruction_row = (
+                    f"`{routing['agents'][name]['model']}`",
+                    f"`{routing['agents'][name]['reasoning_effort']}`",
+                    f"`{routing['agents'][name]['context_tier']}`",
+                )
+                self.assertEqual(
+                    instruction_rows.get(name),
+                    expected_instruction_row,
+                    "instructions hard-routing row should match config model, effort, and context",
+                )
+
+        small_casual = routing["task_routing"]["small_casual_implementation"]
+        self.assertEqual(small_casual["model"], "gpt-6-luna")
+        self.assertEqual(small_casual["reasoning_effort"], "low")
+        self.assertTrue(
+            any(
+                "| `coder` |" in line
+                and "small/casual route: `gpt-6-luna`, `low`" in line
+                for line in readme_lines
+            ),
+            "README should distinguish the small/casual Luna route from the default coder model",
+        )
 
     def test_code_review_routing_is_mandatory_with_conditional_model_override(self):
         policy = parse_agent_routing(ROUTING_CONFIG)["task_routing"]["code_review"]

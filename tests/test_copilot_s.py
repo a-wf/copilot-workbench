@@ -80,6 +80,7 @@ class TestHelpAndVersionAreSafe(BaseHomeTestCase):
         self.assertIn("copilot-s", result.stdout)
         self.assertIn("Usage:", result.stdout)
         self.assertIn("--report", result.stdout)
+        self.assertIn("Copilot launches use Auto with the Balance tier", result.stdout)
 
     def test_short_help_flag_behaves_the_same(self):
         result = run([COPILOT_S, "-h"], env=self.env(), stdin=subprocess.DEVNULL)
@@ -748,7 +749,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "--another-option=value",
                 "positional-argument",
                 "--model", "auto",
-                "--auto-tier", "efficiency",
+                "--auto-tier", "balance",
             ],
         )
 
@@ -992,7 +993,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "--another-option=value",
                 "positional-argument",
                 "--model", "auto",
-                "--auto-tier", "efficiency",
+                "--auto-tier", "balance",
             ],
         )
 

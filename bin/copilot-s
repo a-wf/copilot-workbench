@@ -727,7 +727,7 @@ run_copilot() {
   local session_id="${1:-}"
   shift 2>/dev/null || true
 
-  # copilot-s always uses Copilot's automatic efficiency tier. Remove caller-
+  # copilot-s always uses Copilot's automatic balance tier. Remove caller-
   # supplied model and auto-tier options in either supported spelling before
   # appending the forced values, so caller arguments cannot override them.
   local -a copilot_args=()
@@ -746,7 +746,7 @@ run_copilot() {
         ;;
     esac
   done
-  copilot_args+=(--model auto --auto-tier efficiency)
+  copilot_args+=(--model auto --auto-tier balance)
 
   # Ask for a name only when starting a genuinely new session. An empty
   # response keeps the existing automatic name resolution as the fallback.
@@ -1025,7 +1025,7 @@ ${BOLD}Usage:${RESET}
   copilot-s --version | -v      Show the version and exit
 
 ${BOLD}Features:${RESET}
-  - Copilot launches use Auto with the Efficiency tier; organization model
+  - Copilot launches use Auto with the Balance tier; organization model
     policies may still restrict routing
   - Resume, rename, or delete sessions (single/range/multi-select)
   - Prompts to keep/rename/delete a session when \`copilot\` exits

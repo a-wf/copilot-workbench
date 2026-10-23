@@ -6,6 +6,32 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — model routing defaults, Auto Balance, per-agent attribution
+
+- `copilot-s` now launches Copilot with `--model auto --auto-tier balance`
+  (was the Efficiency tier); caller `--model`/`--auto-tier` options are
+  still stripped so they cannot override it.
+- Role defaults: `coder` and `tester` move to `gpt-6.1-sol` (`xhigh`,
+  default context) for correctness-bearing work; `test-reviewer` moves to
+  `claude-sonnet-5.5` (`high`, long context) so Opus 5.5 stays reserved for
+  `senior-coder` and the stronger reviewer override. `discovery`, the
+  built-in `task` route, and the small/casual `coder` route stay on
+  `gpt-6-luna` (`low`). Synchronized across `config/agent-routing.yaml`,
+  agent frontmatter, instructions, and README.
+- Task reports now attribute model calls to agents through explicit OTEL
+  trace context only: a `chat` span's own `parentSpanId` naming an
+  `invoke_agent` span (same trace, same ingest) whose `gen_ai.agent.name`
+  identifies the agent. A new *By Agent* table shows invocation spans,
+  calls, tokens, time, models, and the sum of per-call official USD
+  estimates recorded at ingestion. Calls without that link stay unknown
+  with a specific reason (no trace parent / parent not observed in the
+  batch / parent not an agent span) and are never re-linked; nothing is
+  inferred from timestamps, models, session membership, or review
+  outcomes. An *Attribution data quality* list adds coverage percentages
+  and per-reason hints. The attribution block moves to schema v2; a v1
+  block is upgraded in place by adding an empty `attributed` bucket, and
+  its earlier unknown rows are kept and labeled as pre-join history.
+
 ### Changed — visible signals for blocking user requests
 
 - Require the preceding user-facing message to start with

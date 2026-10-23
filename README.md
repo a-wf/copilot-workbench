@@ -344,17 +344,27 @@ than hidden. No per-task summary is generated.
   section with exclusive buckets that add up to the Summary totals:
   **legacy** (usage already on the task when attribution tracking started
   for it — frozen, never re-derived or repriced), **unknown** (with an
-  explicit reason), and **attributed** (always 0 today). No supported
-  telemetry identifier links an OTEL model call to a custom-agent
-  invocation, so every new call is unknown; calls are never attributed from
-  timestamps, models, or agent time windows. *Unknown does not mean the
-  main session.* No per-agent cost is measured, and the official USD
-  estimate is unchanged.
+  explicit reason), and **attributed**. A call is attributed only through
+  explicit OTEL trace context: its own `parentSpanId` names an
+  `invoke_agent` span (same `traceId`, read in the same ingest) whose
+  `gen_ai.agent.name` identifies the agent; the session's top-level agent
+  loop appears as its own row. A *By Agent* table then shows per-agent
+  invocation spans, calls, tokens, model-call time, models used, and the
+  sum of the per-call official USD estimates recorded at ingestion (spend,
+  not effectiveness). Calls are never attributed from timestamps, models,
+  session membership, or agent time windows; a call whose span has no
+  trace parent, whose parent was not exported yet when ingest ran, or whose
+  direct parent is not an agent span stays unknown with that reason and is
+  never re-linked. *Unknown does not mean the main session.* An
+  *Attribution data quality* list shows coverage percentages and an
+  actionable hint per unknown reason. Usage recorded before this join
+  existed (attribution schema v1) stays unknown and is labeled as such.
 - **Observed invocations.** An informational registry lists agent
   invocations seen as `subagent.started`/`subagent.completed` events
   (keyed by session id + the event's `agentId`), including started-only or
-  completed-only ones. Being listed does not attribute any call or cost.
-  The self-reported *By Custom Agent* table is unchanged and separate.
+  completed-only ones. Being listed does not attribute any call or cost,
+  and the registry is not joined to the OTEL attribution. The self-reported
+  *By Custom Agent* table is unchanged and separate.
 - **Recorded reviews.** The orchestrator records each reviewer /
   test-reviewer round explicitly:
 
@@ -442,9 +452,9 @@ than hidden. No per-task summary is generated.
   `~/Desktop/CopilotTaskReports` location).
 - Copilot-internal nano-AIU/premium-request figures are opaque accounting
   units reported by Copilot itself, kept separate from the USD estimate.
-- Model calls are not attributed to custom agents (no supported telemetry
-  link exists); existing task reports show their earlier usage as legacy
-  once re-ingested. Review records are only as accurate as the orchestrator
+- Model calls are attributed to agents only via the explicit OTEL trace
+  parent described above; calls ingested before that (or without the link)
+  stay legacy/unknown and are never backfilled. Review records are only as accurate as the orchestrator
   that supplies them, budgets are enforced per `cycle_id` (a new cycle id
   cannot be verified as a genuinely new work item), and a task with no
   records — including all work before this feature — is not evidence of a
@@ -476,11 +486,11 @@ documented tradeoffs.
 |---|---|---|
 | `discovery` | Read-only mapping of broad/unfamiliar codebase areas before planning or coding starts | `gpt-6-luna` (effort: `low`) |
 | `planner` | Turns an ambiguous/design-heavy task into an ordered implementation plan, consuming discovery's output instead of re-exploring | `gpt-6.1-sol` (effort: `medium`) |
-| `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `gpt-6-luna` (effort: `xhigh`) |
+| `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `gpt-6.1-sol` (effort: `xhigh`; small/casual route: `gpt-6-luna`, `low`) |
 | `senior-coder` | Complex implementation and targeted fixes: multi-file architecture, async state, schema/data-model changes, deep structural bugs, new services | `claude-opus-5.5` (effort: `high`) |
 | `reviewer` | One comprehensive review, then up to 3 bounded focused-verification rounds on prior findings/regressions only; never rewrites | `claude-sonnet-5.5` (effort: `high`; Opus for stronger override) |
-| `tester` | Writes and runs tests, only when behavior merits it; bounded test/fix loop (max 3 rounds) | `gpt-6-luna` (effort: `xhigh`) |
-| `test-reviewer` | Complex/high-risk-only quality gate on test coverage/trust, same bounded verification discipline as `reviewer` | `claude-opus-5.5` (effort: `high`) |
+| `tester` | Writes and runs tests, only when behavior merits it; bounded test/fix loop (max 3 rounds) | `gpt-6.1-sol` (effort: `xhigh`) |
+| `test-reviewer` | Complex/high-risk-only quality gate on test coverage/trust, same bounded verification discipline as `reviewer` | `claude-sonnet-5.5` (effort: `high`) |
 
 Routine mechanical shell/git operations use a separate built-in route:
 
@@ -517,13 +527,19 @@ Routine shell/mechanical work remains routed to the built-in `task`.
 
 Model choices follow a provisional cost/capability tiering (start cheap for routine
 work, step up for design/routing and higher-scrutiny review):
-`gpt-6-luna` is the cheapest/fastest tier for well-scoped implementation,
-test-writing, and bounded mechanical task execution; `gpt-6.1-sol` is a
-mid tier for planning/routing decisions, and `claude-opus-5.5` is reserved
-for complex implementation and the stronger reviewer override. Routine
-coder/GPT-6 Luna code changes use `claude-sonnet-5.5` at high effort and
-long context for review; senior-coder-authored, complex/high-risk, or
-unknown-implementation-model changes use Opus at high/long-context.
+`gpt-6-luna` is the cheapest/fastest tier for read-only discovery, bounded
+mechanical task execution, and the explicitly inexpensive small/casual
+`coder` route; `gpt-6.1-sol` is a mid tier for planning and for the
+correctness-bearing default `coder` and `tester` work; `claude-sonnet-5.5`
+handles routine review and the `test-reviewer` coverage gate; and
+`claude-opus-5.5` is reserved for `senior-coder` implementation and the
+stronger reviewer override. Routine coder code changes use
+`claude-sonnet-5.5` at high effort and long context for review;
+senior-coder-authored, complex/high-risk, or unknown-implementation-model
+changes use Opus at high/long-context. `test-reviewer` judges test
+coverage/trust rather than implementation correctness, so it uses Sonnet
+5.5 to keep Opus reserved for high-risk implementation and correctness
+review.
 This recommendation is not a code-review benchmark or evidence of
 superior defect detection. The reviewer role links to the dated Artificial
 Analysis model pages and GitHub's official per-token pricing; actual cost

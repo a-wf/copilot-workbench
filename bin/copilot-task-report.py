@@ -132,16 +132,21 @@ for the user-facing summary):
 - Failed model calls ARE accounted for when their OTEL span exposes usage
   attributes (some providers report partial usage even on an error/timeout)
   — we do not filter spans by status code, only by presence of usage data.
-- Attribution (task["attribution"], versioned): model calls are NOT linked
-  to agent invocations, because no supported identifier joins an OTEL chat
-  span to a subagent invocation. Every new call is booked as "unknown" with
-  an explicit reason; usage aggregated before the block existed on a task is
-  frozen as "legacy". Calls are never attributed from timestamps, models or
-  agent time windows, and no per-agent cost is computed (the official cost
-  estimate is unchanged). The block also keeps an informational registry of
+- Attribution (task["attribution"], schema v2): a model call is linked to
+  an agent ONLY through explicit OTEL trace context — the chat span's own
+  `parentSpanId` (same `traceId`) naming an `invoke_agent` span read in the
+  same ingest batch, whose `gen_ai.agent.name`/`github.copilot.agent.type`
+  identify the agent. Linked calls go to a per-agent "attributed" bucket
+  (OTEL usage, models, invocation-span count, and the sum of the per-call
+  official estimates recorded at ingestion). Every other call is booked as
+  "unknown" with the specific reason the join failed and is never re-linked;
+  usage aggregated before the block existed on a task is frozen as
+  "legacy". Calls are never attributed from timestamps, models, session
+  membership or agent time windows. A v1 block (no attributed bucket) is
+  upgraded losslessly. The block also keeps an informational registry of
   invocations observed in events.jsonl (session id + agentId); registry
-  presence is not ownership. The "By Custom Agent" self-report table is
-  unchanged and separate.
+  presence is not ownership and is not joined to OTEL attribution. The
+  "By Custom Agent" self-report table is unchanged and separate.
 - `record-review --input <file>` stores explicit, orchestrator-supplied
   reviewer/test-reviewer round records (task["reviews"]) after strict
   validation against the bounded review policy. They are not telemetry,
@@ -229,29 +234,72 @@ MAX_EFFORT_TIMELINE = 2000
 #
 # task["attribution"] (schema ATTRIBUTION_SCHEMA_VERSION) records, for every
 # model call ingested after the block was started on a task, WHY it is or is
-# not linked to an agent invocation. Today no supported link exists: the
-# OTEL chat spans this tool reads carry the session's conversation id but no
-# observed agent/invocation identifier, and calls are deliberately NEVER
-# attributed from timestamps, models or "the only open interval" guesses.
-# Every new call is therefore recorded as unknown with an explicit reason.
+# not linked to an agent invocation.
+#
+# The ONLY supported link is explicit OTEL trace context: a "chat *" span's
+# own `parentSpanId` (within the same `traceId`) naming an `invoke_agent`
+# span that was read in the SAME ingest batch. That parent span carries the
+# agent identity (`gen_ai.agent.name`, `github.copilot.agent.type`). Calls
+# are deliberately NEVER attributed from timestamps, models, session
+# membership, events.jsonl agent windows or "the only open interval"
+# guesses; only the call's DIRECT parent is consulted (no ancestor walk).
+# A call without that link is booked as unknown with the specific reason the
+# join failed (no trace parent on the span / parent not observed in the batch
+# / parent is not an invoke_agent span). Calls are never re-linked later.
 #
 # Calls already aggregated on a task when the block is started are frozen as
 # "legacy" (a snapshot of the task totals at that moment) — never re-derived,
 # repriced or backfilled. The attribution buckets are exclusive and must
-# reconcile with task["totals"]: legacy + unknown (+ attributed, currently
-# always 0) == totals.
+# reconcile with task["totals"]: legacy + unknown + attributed == totals.
+#
+# Schema history: v1 had no "attributed" bucket (every call unknown under
+# ATTRIBUTION_REASON_V1_NO_LINK). A valid v1 block is upgraded in place to v2
+# by adding an empty "attributed" bucket — lossless, since v1 never linked a
+# call — and its v1 unknown rows are kept verbatim (never re-derived).
 #
 # The same block also holds an informational registry of agent invocations
 # OBSERVED in events.jsonl (`subagent.started`/`subagent.completed`, keyed by
 # session id + the event's own `agentId`). Registry presence is not ownership
-# of any model call or cost.
-ATTRIBUTION_SCHEMA_VERSION = 1
-ATTRIBUTION_REASON_NO_SUPPORTED_LINK = (
+# of any model call or cost; it is NOT joined to the OTEL attribution (no
+# shared identifier is used).
+ATTRIBUTION_SCHEMA_VERSION = 2
+ATTRIBUTION_SUPPORTED_SCHEMA_VERSIONS = (1, 2)
+# Reason recorded by schema v1 for every call (kept so historical rows are
+# recognized and labeled; never assigned to newly ingested calls).
+ATTRIBUTION_REASON_V1_NO_LINK = (
     "no supported link: OTEL chat spans carry no observed agent/invocation identifier "
     "(timestamps, models and agent intervals are never used to attribute calls)"
 )
+ATTRIBUTION_REASON_NO_SUPPORTED_LINK = (
+    "no trace parent: the chat span has no traceId/parentSpanId, so it cannot be joined to an "
+    "invoke_agent span (timestamps, models and agent intervals are never used to attribute calls)"
+)
+# Reason for calls merged from an ingest delta that carries no attribution
+# data at all (older code path). Nothing is known about those calls' span
+# linkage, so this reason deliberately makes no claim about trace context.
+ATTRIBUTION_REASON_DELTA_WITHOUT_ATTRIBUTION = (
+    "no attribution data: the ingest delta carried no attribution block (older code path), so these "
+    "calls were never evaluated for an agent link (timestamps, models and agent intervals are never "
+    "used to attribute calls)"
+)
+ATTRIBUTION_REASON_PARENT_NOT_OBSERVED = (
+    "parent span not observed: the chat span's parentSpanId did not match any span read in the same "
+    "ingest batch (parent not yet exported at ingestion, e.g. a still-running or abnormally ended "
+    "agent turn, or exported to an unread file); never re-linked later"
+)
+ATTRIBUTION_REASON_PARENT_NOT_AGENT = (
+    "parent is not an agent span: the chat span's direct parent span is not an invoke_agent span "
+    "(ancestors are never walked)"
+)
+# Agent keys for invoke_agent spans without a gen_ai.agent.name.
+ATTRIBUTION_ROOT_AGENT_KEY = "(main session: top-level invoke_agent span without agent name)"
+ATTRIBUTION_UNNAMED_AGENT_KEY = "(unnamed nested invoke_agent span)"
+ATTRIBUTION_MAX_AGENT_KEY_LEN = 200
 ATTRIBUTION_PROVENANCE = {
     "model_calls": "OTEL 'chat *' spans matched by gen_ai.conversation.id == session id",
+    "attributed": ("chat span parentSpanId == spanId of an invoke_agent span with the same traceId, read in "
+                   "the same ingest batch; agent identity from that span's gen_ai.agent.name / "
+                   "github.copilot.agent.type"),
     "observed_invocations": "events.jsonl subagent.started / subagent.completed events keyed by session id + agentId",
 }
 
@@ -1662,7 +1710,10 @@ def process_otel_span(attrs, start_ts, end_ts, sess_state):
 
 def scan_otel_files(session_id, sess_state, install_epoch):
     """Scan all OTEL files for new 'chat *' spans belonging to this
-    session's conversation id, returning a list of model-call dicts.
+    session's conversation id. Returns (calls, min_ts, max_ts, agent_spans):
+    model-call dicts (each with its explicit trace-context resolution under
+    mc["attribution"], see resolve_call_attribution) and the agent identity
+    of each of this session's new `invoke_agent` spans.
     Tracks per-file offsets/sizes in sess_state['otel_files'] so repeated
     ingests only process new bytes, and safely resyncs on truncation.
 
@@ -1682,6 +1733,12 @@ def scan_otel_files(session_id, sess_state, install_epoch):
     calls = []
     min_ts = None
     max_ts = None
+    # Explicit trace-context join (see attribution notes at the top): every
+    # span read in THIS batch, keyed by (traceId, spanId), so each chat call
+    # can be resolved against its direct parent once all new bytes are read.
+    # Only identifiers actually present on the spans are used.
+    span_index = {}
+    agent_spans = []
 
     existing_paths = sorted(glob.glob(os.path.join(OTEL_DIR, "*.jsonl")))
     for path in existing_paths:
@@ -1700,12 +1757,18 @@ def scan_otel_files(session_id, sess_state, install_epoch):
                 e = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if e.get("type") != "span":
+            if not isinstance(e, dict) or e.get("type") != "span":
                 continue
             name = e.get("name") or ""
-            if not name.startswith("chat"):
-                continue
+            if not isinstance(name, str):
+                name = ""
             attrs = e.get("attributes") or {}
+            if not isinstance(attrs, dict):
+                attrs = {}
+            span_key = _trace_span_key(e.get("traceId"), e.get("spanId"))
+            agent_info = _invoke_agent_info(name, attrs, e.get("parentSpanId"))
+            if span_key is not None and span_key not in span_index:
+                span_index[span_key] = agent_info
             if attrs.get("gen_ai.conversation.id") != session_id:
                 continue
             start_ts = otel_ts(e.get("startTime"))
@@ -1714,9 +1777,18 @@ def scan_otel_files(session_id, sess_state, install_epoch):
                 # Defensive backstop: never count a pre-install call even
                 # if it slipped past the byte-offset seed above.
                 continue
+            if agent_info is not None:
+                # Observed invocation span of this session (counted once:
+                # each byte range is read exactly once per session).
+                agent_spans.append(agent_info)
+                continue
+            if not name.startswith("chat"):
+                continue
             mc = process_otel_span(attrs, start_ts, end_ts, sess_state)
             if mc is None:
                 continue
+            mc["trace_id"] = e.get("traceId")
+            mc["parent_span_id"] = e.get("parentSpanId")
             calls.append(mc)
             for t in (start_ts, end_ts):
                 if t is None:
@@ -1732,19 +1804,76 @@ def scan_otel_files(session_id, sess_state, install_epoch):
         if path not in existing_paths and not os.path.exists(path):
             del otel_state[path]
 
-    return calls, min_ts, max_ts
+    for mc in calls:
+        mc["attribution"] = resolve_call_attribution(mc, span_index)
+
+    return calls, min_ts, max_ts, agent_spans
+
+
+def _trace_span_key(trace_id, span_id):
+    """(traceId, spanId) lookup key, or None unless both are non-empty strings."""
+    if isinstance(trace_id, str) and trace_id and isinstance(span_id, str) and span_id:
+        return (trace_id, span_id)
+    return None
+
+
+def _invoke_agent_info(name, attrs, parent_span_id):
+    """Agent identity carried by an `invoke_agent` span, or None for any
+    other span. Identity comes only from the span's own attributes."""
+    operation = attrs.get("gen_ai.operation.name")
+    if operation != "invoke_agent" and not (name == "invoke_agent" or name.startswith("invoke_agent ")):
+        return None
+    agent_name = attrs.get("gen_ai.agent.name")
+    agent_type = attrs.get("github.copilot.agent.type")
+    agent_type = agent_type if isinstance(agent_type, str) and agent_type else None
+    if isinstance(agent_name, str) and agent_name.strip():
+        key = agent_name.strip()[:ATTRIBUTION_MAX_AGENT_KEY_LEN]
+    elif isinstance(parent_span_id, str) and parent_span_id:
+        key = ATTRIBUTION_UNNAMED_AGENT_KEY
+    else:
+        key = ATTRIBUTION_ROOT_AGENT_KEY
+    return {"agent_key": key, "agent_type": agent_type}
+
+
+def resolve_call_attribution(mc, span_index):
+    """Resolve model call `mc` to an agent via explicit trace context only.
+
+    Returns {"agent_key": ..., "agent_type": ...} when the call's DIRECT
+    parent (same traceId, its own parentSpanId) is an invoke_agent span read
+    in the same ingest batch, else {"reason": <fixed unknown reason>}.
+    Timestamps, models, session membership and events.jsonl windows are
+    never consulted, and ancestors beyond the direct parent are not walked."""
+    parent_key = _trace_span_key(mc.get("trace_id"), mc.get("parent_span_id"))
+    if parent_key is None:
+        return {"reason": ATTRIBUTION_REASON_NO_SUPPORTED_LINK}
+    if parent_key not in span_index:
+        return {"reason": ATTRIBUTION_REASON_PARENT_NOT_OBSERVED}
+    agent_info = span_index[parent_key]
+    if agent_info is None:
+        return {"reason": ATTRIBUTION_REASON_PARENT_NOT_AGENT}
+    return {"agent_key": agent_info["agent_key"], "agent_type": agent_info["agent_type"]}
 
 
 def attribution_reason_for_call(mc):
-    """Why model call `mc` is (not) linked to an agent invocation.
+    """Unknown-bucket reason for model call `mc`, or None when it is linked
+    to an agent by explicit trace context (see resolve_call_attribution).
+    A call never resolved (e.g. built by an older code path) has no trace
+    link and returns the "no trace parent" reason."""
+    resolved = mc.get("attribution")
+    if not isinstance(resolved, dict):
+        resolved = resolve_call_attribution(mc, {})
+    return resolved.get("reason")
 
-    The only acceptable future link is an explicit invocation identifier
-    actually present on the call's own telemetry record; none is observed on
-    the OTEL chat spans read today, so every call returns the fixed
-    "no supported link" reason. Timestamps, models and agent intervals are
-    deliberately NOT used. Supporting an evidenced join later must add a
-    separate attributed bucket under a new ATTRIBUTION_SCHEMA_VERSION."""
-    return ATTRIBUTION_REASON_NO_SUPPORTED_LINK
+
+def blank_attributed_agent():
+    """Per-agent attributed bucket (schema v2)."""
+    return {
+        "agent_type": None,
+        "usage": blank_agg(),
+        "models": {},
+        "invocation_spans": 0,
+        "official_cost": {"priced_calls": 0, "usd": 0.0, "unpriced_calls": 0},
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1774,10 +1903,11 @@ def build_delta(session_id, sess_state, events_path, pricing_ctx=None):
         "model_calls": 0,
         "nano_aiu_delta": 0,
         "premium_requests_delta": 0,
-        # Attribution delta: per-reason aggregates for calls that could not
-        # be linked to an invocation (exclusive; every call lands in exactly
-        # one reason) and observed invocation-registry events.
-        "attribution": {"unknown": {}, "invocation_events": []},
+        # Attribution delta: per-agent aggregates for calls linked by
+        # explicit trace context, per-reason aggregates for calls that could
+        # not be linked (exclusive; every call lands in exactly one agent or
+        # reason) and observed invocation-registry events.
+        "attribution": {"unknown": {}, "attributed": {}, "invocation_events": []},
     }
 
     # 1) events.jsonl: configured-effort timeline, checkpoint deltas, agent
@@ -1818,7 +1948,7 @@ def build_delta(session_id, sess_state, events_path, pricing_ctx=None):
 
     # 2) OTEL: primary token/model/time source — independently ingestible,
     #    gated to install_epoch regardless of events.jsonl's state.
-    calls, min_ts, max_ts = scan_otel_files(session_id, sess_state, install_epoch)
+    calls, min_ts, max_ts, agent_spans = scan_otel_files(session_id, sess_state, install_epoch)
     # Per-call official cost estimate, computed NOW (at ingestion) with the
     # snapshot in effect for this command and recorded additively — a later
     # price refresh can never reprice these calls.
@@ -1834,15 +1964,44 @@ def build_delta(session_id, sess_state, events_path, pricing_ctx=None):
         joint.setdefault(effort_key, blank_agg())
         add_agg(joint[effort_key], mc)
         reason = attribution_reason_for_call(mc)
-        delta["attribution"]["unknown"].setdefault(reason, blank_agg())
-        add_agg(delta["attribution"]["unknown"][reason], mc)
+        if reason is not None:
+            delta["attribution"]["unknown"].setdefault(reason, blank_agg())
+            add_agg(delta["attribution"]["unknown"][reason], mc)
+        else:
+            resolved = mc["attribution"]
+            dst = _attributed_agent_entry(delta["attribution"]["attributed"], resolved)
+            add_agg(dst["usage"], mc)
+            dst["models"][model] = dst["models"].get(model, 0) + 1
+            # Per-call official estimate recorded by build_official_cost_delta
+            # above (same snapshot, same call) — summed, never re-priced.
+            usd = mc.get("official_usd")
+            if isinstance(usd, (int, float)) and not isinstance(usd, bool):
+                dst["official_cost"]["priced_calls"] += 1
+                dst["official_cost"]["usd"] += float(usd)
+            else:
+                dst["official_cost"]["unpriced_calls"] += 1
         delta["model_calls"] += 1
+    for info in agent_spans:
+        _attributed_agent_entry(delta["attribution"]["attributed"], info)["invocation_spans"] += 1
 
     delta["min_ts"] = min_ts
     delta["max_ts"] = max_ts
 
     delta["repositories"] = sorted(delta["repositories"])
     return delta
+
+
+def _attributed_agent_entry(attributed, info):
+    """Get/create the per-agent bucket for `info` ({agent_key, agent_type}).
+    A differing agent type for the same key is recorded as "mixed"."""
+    dst = attributed.setdefault(info["agent_key"], blank_attributed_agent())
+    agent_type = info.get("agent_type")
+    if agent_type:
+        if dst.get("agent_type") is None:
+            dst["agent_type"] = agent_type
+        elif dst["agent_type"] != agent_type:
+            dst["agent_type"] = "mixed"
+    return dst
 
 
 def merge_delta_into_task(task, delta, session_id, task_id):
@@ -1936,25 +2095,43 @@ def merge_delta_into_task(task, delta, session_id, task_id):
     merge_official_cost_delta(task, delta.get("official_cost"))
     att_delta = delta.get("attribution")
     if att_delta is None:
-        # Delta from an older code path without attribution data: no call
-        # can have a supported link, so book its calls under the same fixed
-        # reason (keeps the buckets reconciled with the totals above).
+        # Delta from an older code path without attribution data: its calls
+        # were never evaluated for an agent link, so book them as unknown
+        # under a neutral reason that makes no claim about their trace
+        # context (keeps the buckets reconciled with the totals above).
         fallback = blank_agg()
         for agg in delta["by_model"].values():
             for k in blank_agg():
                 fallback[k] += agg.get(k, 0)
-        att_delta = {"unknown": {ATTRIBUTION_REASON_NO_SUPPORTED_LINK: fallback} if fallback["call_count"] else {},
-                     "invocation_events": []}
+        att_delta = {"unknown": {ATTRIBUTION_REASON_DELTA_WITHOUT_ATTRIBUTION: fallback}
+                     if fallback["call_count"] else {},
+                     "attributed": {}, "invocation_events": []}
     merge_attribution_delta(attribution, att_delta, session_id)
     return task
 
 
+def _attribution_block_shape_ok(att):
+    """True for a structurally valid v1 or v2 attribution block."""
+    if not (isinstance(att, dict)
+            and att.get("schema_version") in ATTRIBUTION_SUPPORTED_SCHEMA_VERSIONS
+            and isinstance(att.get("legacy"), dict)
+            and isinstance(att.get("unknown"), dict)
+            and isinstance(att.get("observed_invocations"), dict)):
+        return False
+    if att["schema_version"] >= 2:
+        return isinstance(att.get("attributed"), dict)
+    return True
+
+
 def prepare_attribution_block(task):
-    """Return the task's v1 attribution block, starting it if absent.
+    """Return the task's current-version attribution block, starting it if
+    absent.
 
     A newly started block freezes the task's CURRENT totals as "legacy" (all
-    zero for a task with no recorded usage yet). An existing block of an
-    unsupported shape/version is left untouched (never rewritten or
+    zero for a task with no recorded usage yet). A valid v1 block is upgraded
+    in place to v2 by adding an empty "attributed" bucket (lossless: v1 never
+    linked a call; its unknown rows are kept verbatim). An existing block of
+    an unsupported shape/version is left untouched (never rewritten or
     "upgraded" by guessing) and None is returned, with a warning; the report
     then shows attribution as unreadable instead of a fabricated split."""
     att = task.get("attribution")
@@ -1964,22 +2141,29 @@ def prepare_attribution_block(task):
         for k in blank_agg():
             value = prior.get(k, 0)
             legacy[k] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+        since = now_iso()
         att = task["attribution"] = {
             "schema_version": ATTRIBUTION_SCHEMA_VERSION,
-            "since": now_iso(),
+            "since": since,
+            "attributed_since": since,
             "legacy": legacy,
             "unknown": {},
+            "attributed": {},
             "observed_invocations": {},
             "provenance": dict(ATTRIBUTION_PROVENANCE),
         }
         return att
-    if (
-        isinstance(att, dict)
-        and att.get("schema_version") == ATTRIBUTION_SCHEMA_VERSION
-        and isinstance(att.get("legacy"), dict)
-        and isinstance(att.get("unknown"), dict)
-        and isinstance(att.get("observed_invocations"), dict)
-    ):
+    if _attribution_block_shape_ok(att):
+        if att["schema_version"] == 1:
+            att["schema_version"] = ATTRIBUTION_SCHEMA_VERSION
+            att["upgraded_from_schema_version"] = 1
+            att["attributed_since"] = now_iso()
+            att["attributed"] = {}
+            provenance = att.get("provenance")
+            if isinstance(provenance, dict):
+                provenance.setdefault("attributed", ATTRIBUTION_PROVENANCE["attributed"])
+            else:
+                att["provenance"] = dict(ATTRIBUTION_PROVENANCE)
         return att
     print("Warning: task '%s' has an unsupported/malformed attribution block; leaving it unchanged "
           "(new calls are still counted in the task totals)." % task.get("task_id", "?"), file=sys.stderr)
@@ -1987,10 +2171,10 @@ def prepare_attribution_block(task):
 
 
 def merge_attribution_delta(att, att_delta, session_id):
-    """Merge one ingest's attribution delta into a v1 block (or do nothing if
-    `att` is None — see prepare_attribution_block).
+    """Merge one ingest's attribution delta into the current-version block
+    (or do nothing if `att` is None — see prepare_attribution_block).
 
-    Unknown-reason aggregates are additive. Registry merging is idempotent
+    Unknown-reason and per-agent attributed aggregates are additive. Registry merging is idempotent
     per (session id, agentId, event kind): replaying an identical observation
     is a no-op; a different timestamp/model for an already-recorded event
     keeps the first value and increments `conflicting_observations` instead
@@ -2002,6 +2186,34 @@ def merge_attribution_delta(att, att_delta, session_id):
         dst = unknown.setdefault(reason, blank_agg())
         for k in blank_agg():
             dst[k] = dst.get(k, 0) + agg.get(k, 0)
+
+    attributed = att.get("attributed")
+    for key, src in (att_delta.get("attributed") or {}).items():
+        if not isinstance(attributed, dict) or not isinstance(src, dict):
+            continue
+        dst = attributed.get(key)
+        if not isinstance(dst, dict):
+            dst = attributed[key] = blank_attributed_agent()
+        src_type = src.get("agent_type")
+        if src_type:
+            if dst.get("agent_type") is None:
+                dst["agent_type"] = src_type
+            elif dst["agent_type"] != src_type:
+                dst["agent_type"] = "mixed"
+        usage = dst.setdefault("usage", blank_agg())
+        for k in blank_agg():
+            usage[k] = _int_or_zero(usage.get(k)) + _int_or_zero((src.get("usage") or {}).get(k))
+        models = dst.setdefault("models", {})
+        for model, n in (src.get("models") or {}).items():
+            models[model] = _int_or_zero(models.get(model)) + _int_or_zero(n)
+        dst["invocation_spans"] = _int_or_zero(dst.get("invocation_spans")) + _int_or_zero(
+            src.get("invocation_spans"))
+        cost = dst.setdefault("official_cost", {"priced_calls": 0, "usd": 0.0, "unpriced_calls": 0})
+        src_cost = src.get("official_cost") or {}
+        cost["priced_calls"] = _int_or_zero(cost.get("priced_calls")) + _int_or_zero(src_cost.get("priced_calls"))
+        cost["unpriced_calls"] = _int_or_zero(cost.get("unpriced_calls")) + _int_or_zero(
+            src_cost.get("unpriced_calls"))
+        cost["usd"] = _float_or_zero(cost.get("usd")) + _float_or_zero(src_cost.get("usd"))
 
     events = att_delta.get("invocation_events") or []
     if not events:
@@ -2046,12 +2258,22 @@ def _int_or_zero(value):
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
+def _float_or_zero(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    value = float(value)
+    return value if math.isfinite(value) else 0.0
+
+
 def summarize_attribution(task):
     """Read-only summary of the attribution block for rendering.
 
-    status: "active" (v1 block), "not_started" (task predates attribution
-    tracking and has not been re-ingested: everything is shown as legacy),
-    or "unreadable" (unsupported/malformed block; nothing is inferred)."""
+    status: "active" (v1 or v2 block; a v1 block not yet upgraded by an
+    ingest simply has no attributed bucket), "not_started" (task predates
+    attribution tracking and has not been re-ingested: everything is shown
+    as legacy), or "unreadable" (unsupported/malformed block; nothing is
+    inferred). Per-agent rows only ever come from the recorded explicit
+    trace-context join; nothing is derived here."""
     totals = task.get("totals") if isinstance(task.get("totals"), dict) else {}
     total_calls = _int_or_zero(totals.get("call_count"))
     total_tokens = _int_or_zero(totals.get("total_tokens"))
@@ -2068,6 +2290,15 @@ def summarize_attribution(task):
         "unknown_tokens": 0,
         "attributed_calls": 0,
         "attributed_tokens": 0,
+        "schema_version": None,
+        "attributed_since": None,
+        "agents": {},
+        "attributed_priced_calls": 0,
+        "attributed_unpriced_calls": 0,
+        "attributed_usd": 0.0,
+        "invocation_spans": 0,
+        "agents_without_attributed_calls": 0,
+        "v1_unknown_calls": 0,
         "reconciled": True,
         "registry": {},
         "registry_sessions": 0,
@@ -2079,13 +2310,13 @@ def summarize_attribution(task):
         out["legacy_calls"] = total_calls
         out["legacy_tokens"] = total_tokens
         return out
-    if not (isinstance(att, dict) and att.get("schema_version") == ATTRIBUTION_SCHEMA_VERSION
-            and isinstance(att.get("legacy"), dict) and isinstance(att.get("unknown"), dict)
-            and isinstance(att.get("observed_invocations"), dict)):
+    if not _attribution_block_shape_ok(att):
         out["status"] = "unreadable"
         out["reconciled"] = False
         return out
     out["since"] = att.get("since")
+    out["schema_version"] = att["schema_version"]
+    out["attributed_since"] = att.get("attributed_since") if att["schema_version"] >= 2 else None
     out["legacy_calls"] = _int_or_zero(att["legacy"].get("call_count"))
     out["legacy_tokens"] = _int_or_zero(att["legacy"].get("total_tokens"))
     for reason, agg in att["unknown"].items():
@@ -2096,6 +2327,37 @@ def summarize_attribution(task):
         out["unknown"][reason] = {"calls": calls, "total_tokens": tokens}
         out["unknown_calls"] += calls
         out["unknown_tokens"] += tokens
+        if reason == ATTRIBUTION_REASON_V1_NO_LINK:
+            out["v1_unknown_calls"] += calls
+    for key, entry in (att.get("attributed") or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+        cost = entry.get("official_cost") if isinstance(entry.get("official_cost"), dict) else {}
+        models = entry.get("models") if isinstance(entry.get("models"), dict) else {}
+        row = {
+            "agent_type": entry.get("agent_type") if isinstance(entry.get("agent_type"), str) else None,
+            "calls": _int_or_zero(usage.get("call_count")),
+            "prompt_tokens": _int_or_zero(usage.get("prompt_tokens")),
+            "completion_tokens": _int_or_zero(usage.get("completion_tokens")),
+            "reasoning_tokens": _int_or_zero(usage.get("reasoning_tokens")),
+            "total_tokens": _int_or_zero(usage.get("total_tokens")),
+            "duration_ms": _int_or_zero(usage.get("duration_ms")),
+            "models": {m: _int_or_zero(n) for m, n in models.items() if _int_or_zero(n)},
+            "invocation_spans": _int_or_zero(entry.get("invocation_spans")),
+            "priced_calls": _int_or_zero(cost.get("priced_calls")),
+            "unpriced_calls": _int_or_zero(cost.get("unpriced_calls")),
+            "usd": _float_or_zero(cost.get("usd")),
+        }
+        out["agents"][key] = row
+        out["attributed_calls"] += row["calls"]
+        out["attributed_tokens"] += row["total_tokens"]
+        out["attributed_priced_calls"] += row["priced_calls"]
+        out["attributed_unpriced_calls"] += row["unpriced_calls"]
+        out["attributed_usd"] += row["usd"]
+        out["invocation_spans"] += row["invocation_spans"]
+        if row["invocation_spans"] and not row["calls"]:
+            out["agents_without_attributed_calls"] += 1
     out["reconciled"] = (
         out["legacy_calls"] + out["unknown_calls"] + out["attributed_calls"] == total_calls
         and out["legacy_tokens"] + out["unknown_tokens"] + out["attributed_tokens"] == total_tokens
@@ -3232,6 +3494,9 @@ def build_official_cost_delta(calls, pricing_ctx):
             u["calls"] += 1
             u["total_tokens"] += int(mc.get("total_tokens") or 0)
             continue
+        # Per-call estimate kept on the call record (not persisted on its
+        # own) so attribution can sum exactly what was recorded here.
+        mc["official_usd"] = result["usd"]
         bucket = rec["priced"].setdefault(snapshot["snapshot_id"], _blank_official_bucket())
         bucket["calls"] += 1
         bucket["usd"] += result["usd"]
@@ -4165,9 +4430,12 @@ def render_markdown(task):
                   "config file and recorded model+effort data are preserved but unused.")
     lines.append("- If an OTEL file is truncated/rewound (rare), the gap is skipped with a "
                   "warning rather than being silently lost forever or risking a double count.")
-    lines.append("- Model calls are not attributed to agents: no supported telemetry link exists, so "
-                  "calls are shown as unknown (or legacy) in Attribution Coverage — unknown does not "
-                  "mean the main session made them. No per-agent cost is measured.")
+    lines.append("- Model calls are attributed to agents only via explicit OTEL trace context (a chat "
+                  "span's direct parent `invoke_agent` span, read in the same ingest). Calls without that "
+                  "link stay unknown (with a reason) and legacy usage is never re-derived — unknown does not "
+                  "mean the main session made them. Per-agent USD sums per-call estimates recorded at "
+                  "ingestion; it is spend, not effectiveness, and review outcomes are never used to infer "
+                  "rework or causality.")
     lines.append("- Recorded reviews are orchestrator-supplied records added with `record-review`, "
                   "not native telemetry, and recording them does not regenerate this report. A task "
                   "with no recorded reviews (including any work done before recording existed) is not "
@@ -4184,6 +4452,42 @@ def _md_cell(value):
     return " ".join(text.split()).replace("\\", "\\\\").replace("|", "\\|")
 
 
+ATTRIBUTION_REASON_LABELS = {
+    ATTRIBUTION_REASON_V1_NO_LINK: ("recorded by attribution schema v1, before trace-parent joins were read "
+                                    "(kept verbatim, never re-derived)"),
+}
+ATTRIBUTION_REASON_HINTS = {
+    ATTRIBUTION_REASON_V1_NO_LINK: ("these calls were ingested before this tool read OTEL trace context; "
+                                    "they stay unknown permanently (no backfill)."),
+    ATTRIBUTION_REASON_NO_SUPPORTED_LINK: ("the chat spans carried no `traceId`/`parentSpanId`. The required "
+                                           "join key is the chat span's `parentSpanId` equal to the `spanId` "
+                                           "of an `invoke_agent` span in the same trace; check the Copilot CLI "
+                                           "version/OTEL exporter."),
+    ATTRIBUTION_REASON_DELTA_WITHOUT_ATTRIBUTION: ("these calls came from an ingest path that recorded no "
+                                                   "attribution data; their span linkage is unknown and "
+                                                   "they stay unknown permanently (no backfill)."),
+    ATTRIBUTION_REASON_PARENT_NOT_OBSERVED: ("the parent span was not in the same ingest batch — typically an "
+                                             "ingest while the agent turn was still running, or a session that "
+                                             "ended before the agent span was exported. These calls are not "
+                                             "re-linked later; ingest after the session exits to avoid this."),
+    ATTRIBUTION_REASON_PARENT_NOT_AGENT: ("the direct parent was another span kind; ancestors are deliberately "
+                                          "not walked, so these calls stay unknown."),
+}
+
+
+def _pct(part, whole):
+    return "%.1f%%" % (100.0 * part / whole) if whole else "—"
+
+
+def _format_agent_cost(row):
+    if row["priced_calls"] == 0:
+        return "not priced" if row["calls"] else "—"
+    text = "$%.4f" % row["usd"]
+    if row["unpriced_calls"]:
+        text += " (partial: %d of %d calls)" % (row["priced_calls"], row["calls"])
+    return text
+
+
 def render_attribution_section(task):
     s = summarize_attribution(task)
     lines = ["## Attribution Coverage (model calls → agent invocations)", ""]
@@ -4192,28 +4496,104 @@ def render_attribution_section(task):
                      "unchanged and not interpreted. Totals above are unaffected._")
         lines.append("")
         return lines
-    lines.append("_Exclusive buckets that must add up to the Summary totals. **Unknown is not the "
-                 "main session**: it means no supported link to an agent invocation exists. Calls are "
-                 "never attributed from timestamps, models or agent time windows. No per-agent cost is "
-                 "measured; the estimated USD cost above is unchanged and is not split by agent._")
+    lines.append("_Exclusive buckets that must add up to the Summary totals. A call is **attributed** only "
+                 "through explicit OTEL trace context: its own `parentSpanId` names an `invoke_agent` span "
+                 "(same `traceId`) read in the same ingest, whose `gen_ai.agent.name` identifies the agent. "
+                 "Calls are never attributed from timestamps, models, session membership or agent time "
+                 "windows. **Unknown is not the main session**: it means that join was not available for the "
+                 "call (reason shown). Legacy usage predates attribution tracking for this task._")
     lines.append("")
-    lines.append("| Bucket | Calls | Total Tokens |")
-    lines.append("|---|---|---|")
+    lines.append("| Bucket | Calls | % of calls | Total Tokens | % of tokens |")
+    lines.append("|---|---|---|---|---|")
+    total_calls, total_tokens = s["total_calls"], s["total_tokens"]
     if s["status"] == "not_started":
         legacy_label = "Legacy — recorded before attribution tracking (starts at the next ingest)"
     else:
         legacy_label = "Legacy — recorded before attribution tracking started (%s)" % (s["since"] or "unknown")
-    lines.append("| %s | %d | %d |" % (legacy_label, s["legacy_calls"], s["legacy_tokens"]))
+    lines.append("| %s | %d | %s | %d | %s |" % (
+        legacy_label, s["legacy_calls"], _pct(s["legacy_calls"], total_calls),
+        s["legacy_tokens"], _pct(s["legacy_tokens"], total_tokens)))
     for reason, row in sorted(s["unknown"].items()):
-        lines.append("| Unknown — %s | %d | %d |" % (_md_cell(reason), row["calls"], row["total_tokens"]))
-    lines.append("| Attributed to an observed agent invocation | %d | %d |"
-                 % (s["attributed_calls"], s["attributed_tokens"]))
-    lines.append("| **Total (Summary)** | %d | %d |" % (s["total_calls"], s["total_tokens"]))
+        label = ATTRIBUTION_REASON_LABELS.get(reason, reason)
+        lines.append("| Unknown — %s | %d | %s | %d | %s |" % (
+            _md_cell(label), row["calls"], _pct(row["calls"], total_calls),
+            row["total_tokens"], _pct(row["total_tokens"], total_tokens)))
+    lines.append("| Attributed — explicit OTEL trace parent (see By Agent below) | %d | %s | %d | %s |" % (
+        s["attributed_calls"], _pct(s["attributed_calls"], total_calls),
+        s["attributed_tokens"], _pct(s["attributed_tokens"], total_tokens)))
+    lines.append("| **Total (Summary)** | %d | | %d | |" % (total_calls, total_tokens))
     lines.append("")
     if not s["reconciled"]:
         lines.append("> ⚠️ Attribution buckets do not reconcile with the Summary totals (legacy + unknown "
                      "+ attributed ≠ totals); treat this section as incomplete for this task.")
         lines.append("")
+
+    if s["agents"]:
+        official_total = summarize_official_cost(task)["totals"]
+        lines.append("### By Agent (OTEL-measured via explicit trace parent)")
+        lines.append("")
+        lines.append("_Usage of the attributed calls only, summed from the same OTEL chat spans as the Summary "
+                     "(no double counting). Invocation spans are `invoke_agent` spans of this task's sessions "
+                     "read since attribution started. Est. USD sums the per-call official estimates already "
+                     "recorded at ingestion (never repriced); it is spend, not a measure of an agent's "
+                     "effectiveness or of rework. Self-reported `subagent.completed` tokens stay in the "
+                     "separate By Custom Agent table and are not compared or mixed in here._")
+        lines.append("")
+        lines.append("| Agent | Type | Invocation spans | Calls | Prompt | Completion | Reasoning | Total Tokens "
+                     "| Model-call Time | Models (calls) | Est. USD (official) |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        for key, row in sorted(s["agents"].items(), key=lambda kv: (-kv[1]["total_tokens"], kv[0])):
+            models = ", ".join("%s (%d)" % (m, n) for m, n in sorted(row["models"].items(),
+                                                                    key=lambda kv: (-kv[1], kv[0])))
+            lines.append("| %s | %s | %d | %d | %d | %d | %d | %d | %s | %s | %s |" % (
+                _md_cell(key), _md_cell(row["agent_type"] or "—"), row["invocation_spans"], row["calls"],
+                row["prompt_tokens"], row["completion_tokens"], row["reasoning_tokens"], row["total_tokens"],
+                fmt_duration_ms(row["duration_ms"]), _md_cell(models or "—"), _format_agent_cost(row)))
+        lines.append("")
+        if s["attributed_priced_calls"]:
+            residual = max(0.0, official_total["usd"] - s["attributed_usd"])
+            lines.append("- Attributed estimate: $%.4f over %d priced call(s)%s. The remaining $%.4f of the "
+                         "task's recorded estimate belongs to legacy/unknown calls and is not split by agent." % (
+                             s["attributed_usd"], s["attributed_priced_calls"],
+                             (" (%d attributed call(s) unpriced — lower bound)" % s["attributed_unpriced_calls"]
+                              if s["attributed_unpriced_calls"] else ""),
+                             residual))
+            lines.append("")
+
+    lines.append("### Attribution data quality")
+    lines.append("")
+    diagnostics = []
+    if s["status"] == "not_started":
+        diagnostics.append("Attribution tracking has not started for this task; all %d recorded call(s) are "
+                           "legacy until the next ingest (they are never re-derived)." % total_calls)
+    else:
+        diagnostics.append("Coverage: %d of %d call(s) (%s) and %s of tokens attributed; %d unknown; %d legacy. "
+                           "Attribution schema v%s since %s%s." % (
+                               s["attributed_calls"], total_calls, _pct(s["attributed_calls"], total_calls),
+                               _pct(s["attributed_tokens"], total_tokens), s["unknown_calls"],
+                               s["legacy_calls"], s["schema_version"], s["since"] or "unknown",
+                               ("; trace-parent joins read since %s" % s["attributed_since"]
+                                if s["attributed_since"] and s["attributed_since"] != s["since"] else "")))
+        for reason, row in sorted(s["unknown"].items()):
+            if not row["calls"]:
+                continue
+            hint = ATTRIBUTION_REASON_HINTS.get(reason)
+            label = ATTRIBUTION_REASON_LABELS.get(reason, reason.split(":", 1)[0])
+            diagnostics.append("%d unknown call(s) — %s%s" % (
+                row["calls"], _md_cell(label), (": " + hint) if hint else "."))
+        if s["agents_without_attributed_calls"]:
+            diagnostics.append("%d agent(s) have observed invocation spans but no attributed calls (their calls "
+                               "were ingested in an earlier batch, before attribution started, or are unknown)."
+                               % s["agents_without_attributed_calls"])
+        if s["attributed_unpriced_calls"]:
+            diagnostics.append("%d attributed call(s) have no official price (see Estimated Cost Coverage for "
+                               "reasons); per-agent USD is a lower bound." % s["attributed_unpriced_calls"])
+    if s["registry_invocations"]:
+        diagnostics.append("The events.jsonl invocation registry below is not joined to OTEL attribution (no "
+                           "shared identifier is used); its counts may differ from invocation spans.")
+    for d in diagnostics:
+        lines.append("- " + d)
+    lines.append("")
 
     if s["registry_invocations"]:
         lines.append("### Observed Agent Invocations (events.jsonl registry — informational, not ownership)")
@@ -5103,12 +5483,14 @@ def cmd_ingest(args):
             and not delta["agent_summaries"]
             and not delta["repositories"]
             and not delta["attribution"]["invocation_events"]
+            and not delta["attribution"]["attributed"]
         ):
             # Still persist offsets/cursors so we don't rescan the same
             # bytes forever, but nothing to merge into the task. Every
             # mergeable delta field must be checked here — a premium-only,
             # repository-only or invocation-registry-only update (e.g. a
-            # bare subagent.started with no model calls yet) would
+            # bare subagent.started with no model calls yet, or an
+            # invoke_agent span whose child calls were read earlier) would
             # otherwise be silently dropped even though build_delta's
             # advanced offsets mean it can never be re-derived on a later
             # ingest.

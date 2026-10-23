@@ -203,16 +203,30 @@ aggregate as Markdown.
   resumes from the file's current end rather than stalling forever or
   risking a double-count reread.
 - **Attribution (versioned, additive)** — `merge_delta_into_task` starts a
-  `task["attribution"]` block (`schema_version` 1) the first time a task is
+  `task["attribution"]` block (`schema_version` 2) the first time a task is
   ingested by this version, freezing the task's existing totals as
-  `legacy`. Every new call is added to `unknown`, keyed by an explicit
-  reason: OTEL chat spans carry no observed agent/invocation identifier, and
-  calls are never attributed from timestamps, models, or agent intervals.
-  `legacy + unknown (+ attributed, always 0) == totals` is checked at render
-  time. A future evidenced join would add a separate bucket under a new
-  schema version. No per-agent cost is computed; `official_cost` is
-  untouched. An unsupported/malformed block is left unchanged and shown as
-  unreadable.
+  `legacy`. The only supported join is explicit OTEL trace context: a
+  `chat` span's own `parentSpanId` (same `traceId`) naming an
+  `invoke_agent` span read in the same ingest batch. That parent's
+  `gen_ai.agent.name` / `github.copilot.agent.type` key the call into
+  `attributed[<agent>]` (OTEL usage, per-model call counts, invocation-span
+  count, and the sum of per-call official USD estimates recorded at
+  ingestion — never repriced). An unnamed parent with no parent of its own
+  is the session's top-level agent loop; an unnamed nested one is kept
+  separate. Every other call goes to `unknown`, keyed by why the join
+  failed: no `traceId`/`parentSpanId` on the span, parent span not in the
+  same batch (e.g. ingest while the agent turn was still running — parent
+  spans are exported after their children), or a direct parent that is not
+  an `invoke_agent` span (ancestors are not walked). Unknown calls are never
+  re-linked later, and calls are never attributed from timestamps, models,
+  session membership, or agent intervals. `legacy + unknown + attributed ==
+  totals` is checked at render time, and the report adds coverage
+  percentages and per-reason data-quality diagnostics. A valid v1 block
+  (which had no `attributed` bucket) is upgraded in place by adding an empty
+  one; its v1 unknown rows are kept verbatim and labeled as pre-join
+  history. An unsupported/malformed block is left unchanged and shown as
+  unreadable. Per-agent USD is spend, not an effectiveness metric, and
+  review records are never used to infer rework or causality.
 - **Observed invocation registry** — `subagent.started`/`subagent.completed`
   events that carry an `agentId` are stored under
   `attribution.observed_invocations[<session id>][<agentId>]` (agent name,
@@ -221,7 +235,8 @@ aggregate as Markdown.
   no-ops; a differing value keeps the first and counts a conflict), the
   session-id key prevents cross-session collisions, and registry-only
   deltas (e.g. a lone `subagent.started`) are merged even without model
-  calls. Registry presence is informational, not ownership; the
+  calls. Registry presence is informational, not ownership, and it is not
+  joined to the OTEL attribution above (no shared identifier is used); the
   self-reported `by_agent` table is unchanged. The existing cursor,
   partial-line, truncation and install-epoch semantics apply unchanged,
   including the undercount-not-double-count crash behavior (not
