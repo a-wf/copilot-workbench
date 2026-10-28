@@ -11,12 +11,19 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 - `copilot-s` now launches Copilot with `--model auto --auto-tier balance`
   (was the Efficiency tier); caller `--model`/`--auto-tier` options are
   still stripped so they cannot override it.
-- Role defaults: `coder` and `tester` move to `gpt-6.1-sol` (`xhigh`,
-  default context) for correctness-bearing work; `test-reviewer` moves to
+- Routing cycle `sol-medium-20261028-c1`: `coder` uses
+  `gpt-6.1-sol`/`medium` (default context) for the quality-first default;
+  its small/casual override moves from Luna to
+  `gpt-6.1-terra`/`low` (default context). This is a conservative
+  recommendation, not a local benchmark result. Artificial Analysis task
+  cost figures are not Copilot bills or evidence of coding/review quality.
+  `tester` uses `gpt-6.1-sol`
+  (`xhigh`, default context); `test-reviewer` moves to
   `claude-sonnet-5.5` (`high`, long context) so Opus 5.5 stays reserved for
-  `senior-coder` and the stronger reviewer override. `discovery`, the
-  built-in `task` route, and the small/casual `coder` route stay on
-  `gpt-6-luna` (`low`). Synchronized across `config/agent-routing.yaml`,
+  `senior-coder` and the stronger reviewer override. `discovery` and the
+  built-in `task` route stay on `gpt-6-luna` (`low`). Other routes are
+  unchanged.
+  Synchronized across `config/agent-routing.yaml`,
   agent frontmatter, instructions, and README.
 - Task reports now attribute model calls to agents through explicit OTEL
   trace context only: a `chat` span's own `parentSpanId` naming an

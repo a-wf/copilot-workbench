@@ -214,7 +214,7 @@ CUSTOM_AGENT_EFFORT_MAP = {
     "reviewer": "high",
     "test-reviewer": "high",
     "senior-coder": "high",
-    "coder": "xhigh",
+    "coder": "medium",
     "fixer": "high",
     "tester": "xhigh",
 }
@@ -4357,11 +4357,13 @@ def render_markdown(task):
                   "at call time (real telemetry, but not call-specific). `inferred:*` is a "
                   "guess based on our custom-agent role mapping "
                   "(planner=medium, reviewer/test-reviewer/senior-coder=high, "
-                  "coder/tester=xhigh, discovery=low; legacy fixer=high, kept only "
+                  "coder=medium, tester=xhigh, discovery=low; legacy fixer=high, kept only "
                   "for historical sessions recorded before the fixer role was retired "
                   "and folded into coder/senior-coder), "
                   "applied only when the call falls inside a fully-completed subagent "
-                  "invocation window, and is **not** measured telemetry. `unknown` means no "
+                  "invocation window, and is **not** actual observed request effort or "
+                  "measured telemetry. This role-based inference cannot distinguish "
+                  "coder's low-effort small/casual route. `unknown` means no "
                   "effort information was available for that call._")
     lines.append("")
     lines.append("| Effort (source:level) | Calls | Total Tokens | Reasoning Tokens (measured) |")

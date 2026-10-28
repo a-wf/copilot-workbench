@@ -463,7 +463,7 @@ class TestEffortTimeline(BaseTestCase):
         """Priority order per the module docstring/spec is measured >
         configured > inferred > unknown. A call with no per-call measured
         level, whose timestamp falls inside a fully-closed 'coder' subagent
-        interval (which would map to "inferred:high" via
+        interval (which would map to "inferred:medium" via
         CUSTOM_AGENT_EFFORT_MAP), must still be labeled from the configured
         timeline ("configured:low") when a configured entry applies at that
         timestamp — configured must never be shadowed by inferred."""
@@ -3956,6 +3956,12 @@ class TestCacheAndReasoningCostMath(BaseTestCase):
 
 class TestEffortPrecedencePositiveInferred(BaseTestCase):
     """measured > configured > inferred > unknown."""
+
+    def test_coder_role_infers_default_medium_effort(self):
+        sess_state = {
+            "closed_intervals": [{"name": "coder", "start": 1, "end": 3}],
+        }
+        self.assertEqual(self.mod.effort_at(2, sess_state), "inferred:medium")
 
     def test_builtin_task_agent_type_infers_low_effort(self):
         session_id = "sess-inferred-task"

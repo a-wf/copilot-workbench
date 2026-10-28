@@ -486,7 +486,7 @@ documented tradeoffs.
 |---|---|---|
 | `discovery` | Read-only mapping of broad/unfamiliar codebase areas before planning or coding starts | `gpt-6-luna` (effort: `low`) |
 | `planner` | Turns an ambiguous/design-heavy task into an ordered implementation plan, consuming discovery's output instead of re-exploring | `gpt-6.1-sol` (effort: `medium`) |
-| `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `gpt-6.1-sol` (effort: `xhigh`; small/casual route: `gpt-6-luna`, `low`) |
+| `coder` | Routine implementation and targeted fixes: CRUD, UI, standard logic | `gpt-6.1-sol` (effort: `medium`; small/casual route: `gpt-6.1-terra`, `low`) |
 | `senior-coder` | Complex implementation and targeted fixes: multi-file architecture, async state, schema/data-model changes, deep structural bugs, new services | `claude-opus-5.5` (effort: `high`) |
 | `reviewer` | One comprehensive review, then up to 3 bounded focused-verification rounds on prior findings/regressions only; never rewrites | `claude-sonnet-5.5` (effort: `high`; Opus for stronger override) |
 | `tester` | Writes and runs tests, only when behavior merits it; bounded test/fix loop (max 3 rounds) | `gpt-6.1-sol` (effort: `xhigh`) |
@@ -516,9 +516,10 @@ session and explain why.
 
 Small or casual implementation/edit requests follow a separate mandatory
 route: use the `task` tool to invoke the named custom agent `coder` (not
-the built-in `task` shell executor), with `gpt-6-luna`, low reasoning
-effort, and default context. The main session scopes and coordinates the
-work and retains oversight. `coder` implements only and does not test or
+the built-in `task` shell executor), with `model: gpt-6.1-terra`,
+`reasoning_effort: low`, and `context_tier: default`. The main session
+scopes and coordinates the work and retains oversight. `coder` implements
+only and does not test or
 review its own changes; every code batch receives an independent reviewer
 pass, while tester remains conditional on behavior. Pure prose/docs and
 mechanical git-only changes are exempt. Answer simple informational
@@ -528,9 +529,10 @@ Routine shell/mechanical work remains routed to the built-in `task`.
 Model choices follow a provisional cost/capability tiering (start cheap for routine
 work, step up for design/routing and higher-scrutiny review):
 `gpt-6-luna` is the cheapest/fastest tier for read-only discovery, bounded
-mechanical task execution, and the explicitly inexpensive small/casual
-`coder` route; `gpt-6.1-sol` is a mid tier for planning and for the
-correctness-bearing default `coder` and `tester` work; `claude-sonnet-5.5`
+mechanical task execution; `gpt-6.1-sol` is the quality-first default for
+routine implementation at medium effort and remains on planning and
+testing; `gpt-6.1-terra` at low effort handles the small/casual coder
+route; `claude-sonnet-5.5`
 handles routine review and the `test-reviewer` coverage gate; and
 `claude-opus-5.5` is reserved for `senior-coder` implementation and the
 stronger reviewer override. Routine coder code changes use
@@ -540,10 +542,13 @@ changes use Opus at high/long-context. `test-reviewer` judges test
 coverage/trust rather than implementation correctness, so it uses Sonnet
 5.5 to keep Opus reserved for high-risk implementation and correctness
 review.
-This recommendation is not a code-review benchmark or evidence of
-superior defect detection. The reviewer role links to the dated Artificial
-Analysis model pages and GitHub's official per-token pricing; actual cost
-varies with tokens, cache use, and verbosity.
+These are conservative, quality-first routing recommendations; no local
+benchmark establishes coding or review quality. Artificial Analysis task
+cost figures, where cited, are illustrative comparisons—not Copilot bills
+and not proof of coding or review quality. Actual cost varies with tokens,
+cache use, and verbosity.
+The reviewer role links to the dated Artificial Analysis model pages and
+GitHub's official per-token pricing.
 `discovery` uses
 `gpt-6-luna` at low effort with long context for mapping broad codebases.
 Each `reasoningEffort` is a per-agent frontmatter default

@@ -32,7 +32,7 @@ Example of the initial routing update, followed by a separate approval
 request when the gate above applies:
 
 > Small pure-prose instruction change. Recommended route: coder
-> (`gpt-6-luna`, low, default). Skipping discovery/planner because the
+> (`gpt-6.1-terra`, low, default). Skipping discovery/planner because the
 > target and approach are explicit; skipping reviewer/tester/test-reviewer
 > because this is a pure-prose change (not code, tests, scripts, stories,
 > or behavior-affecting configuration).
@@ -160,7 +160,7 @@ for this task, follow the user's override and mention the deviation.
 |---|---|---|---|
 | `discovery` | `gpt-6-luna` | `low` | `long_context` |
 | `planner` | `gpt-6.1-sol` | `medium` | `long_context` |
-| `coder` | `gpt-6.1-sol` | `xhigh` | `default` |
+| `coder` | `gpt-6.1-sol` | `medium` | `default` |
 | `senior-coder` | `claude-opus-5.5` | `high` | `long_context` |
 | `reviewer` default | `claude-sonnet-5.5` | `high` | `long_context` |
 | `reviewer` stronger override | `claude-opus-5.5` | `high` | `long_context` |
@@ -186,7 +186,7 @@ do not skip it just because the change is simple.
 
 For small or casual implementation/edit requests, delegate implementation
 using the `task` tool to invoke the named custom agent `coder`, passing
-`model: gpt-6-luna`, `reasoning_effort: low`, and
+`model: gpt-6.1-terra`, `reasoning_effort: low`, and
 `context_tier: default`. This is a mandatory implementation delegation,
 not a route to the built-in `task` shell executor. The main session defines
 the scope, coordinates the work, and retains oversight of the result.
@@ -342,7 +342,7 @@ configuration. Review each coherent batch, not each individual edit.
 Pure prose/docs and mechanical git-only operations are normally exempt.
 Default to
 `claude-sonnet-5.5` at high effort and long context for routine coder work
-(GPT-6.1 Sol by default, or GPT-6 Luna on the small/casual route) and other
+(GPT-6.1 Sol at medium by default, or GPT-6.1 Terra at low effort on the small/casual route) and other
 known routine implementations. Use the stronger
 `claude-opus-5.5` high/long-context route for senior-coder-authored,
 complex/high-risk, or unknown implementation-model work. Apply this

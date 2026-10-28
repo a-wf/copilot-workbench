@@ -59,7 +59,7 @@ EXPECTED_AGENTS = {
     },
     "coder": {
         "model": "gpt-6.1-sol",
-        "reasoningEffort": "xhigh",
+        "reasoningEffort": "medium",
         "tools": ["*"],
     },
     "senior-coder": {
@@ -101,7 +101,7 @@ EXPECTED_ROUTING = {
         "coder": {
             "role": "Routine Implementation Engineer",
             "model": "gpt-6.1-sol",
-            "reasoning_effort": "xhigh",
+            "reasoning_effort": "medium",
             "context_tier": "default",
         },
         "senior-coder": {
@@ -140,7 +140,7 @@ EXPECTED_ROUTING = {
     "task_routing": {
         "small_casual_implementation": {
             "agent": "coder",
-            "model": "gpt-6-luna",
+            "model": "gpt-6.1-terra",
             "reasoning_effort": "low",
             "context_tier": "default",
         },
@@ -338,7 +338,7 @@ class TestAgentInventory(unittest.TestCase):
 
         required_phrases = (
             "for small or casual implementation/edit requests, delegate implementation using the `task` tool to invoke the named custom agent `coder`",
-            "model: gpt-6-luna`, `reasoning_effort: low`, and `context_tier: default`",
+            "model: gpt-6.1-terra`, `reasoning_effort: low`, and `context_tier: default`",
             "this is a mandatory implementation delegation, not a route to the built-in `task` shell executor",
             "the main session defines the scope, coordinates the work, and retains oversight of the result",
             "simple informational questions should be answered directly in the main session",
@@ -492,7 +492,7 @@ class TestAgentInventory(unittest.TestCase):
                     expected["reasoningEffort"],
                 )
 
-    def test_documented_agent_routing_matches_config_and_keeps_small_casual_luna(self):
+    def test_documented_agent_routing_matches_config_and_keeps_small_casual_terra(self):
         routing = parse_agent_routing(ROUTING_CONFIG)
         with open(os.path.join(REPO_ROOT, "README.md"), "r", encoding="utf-8") as f:
             readme_lines = f.read().splitlines()
@@ -562,15 +562,15 @@ class TestAgentInventory(unittest.TestCase):
                 )
 
         small_casual = routing["task_routing"]["small_casual_implementation"]
-        self.assertEqual(small_casual["model"], "gpt-6-luna")
+        self.assertEqual(small_casual["model"], "gpt-6.1-terra")
         self.assertEqual(small_casual["reasoning_effort"], "low")
         self.assertTrue(
             any(
                 "| `coder` |" in line
-                and "small/casual route: `gpt-6-luna`, `low`" in line
+                and "small/casual route: `gpt-6.1-terra`, `low`" in line
                 for line in readme_lines
             ),
-            "README should distinguish the small/casual Luna route from the default coder model",
+            "README should distinguish the small/casual Terra low route from the default coder medium route",
         )
 
     def test_code_review_routing_is_mandatory_with_conditional_model_override(self):
