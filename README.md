@@ -74,7 +74,13 @@ desired agent (for example, `/agent reviewer`) and verify delegated work with
 broad discovery or design planning at any tier—the orchestrator requests
 approval of the proposed routing before substantive work. Routine small
 implementation remains on its automatic coder route; simple questions stay
-direct.
+direct. When runtime autopilot is active, the orchestrator instead selects
+the best-supported recommended in-scope route without asking for routing
+approval, visibly announcing it before acting; other required permissions
+still apply. This applies only
+to active autopilot in sessions using the installed global instructions;
+normal modes are unchanged. Future launches load those instructions; existing
+sessions may need a reload or restart.
 
 ## Features
 
@@ -608,13 +614,27 @@ reviews](#attribution-coverage-and-recorded-reviews).
 
 For standard, complex, and high-risk tasks, and for broad discovery or
 design planning at any tier, the orchestrator asks the user to approve
-routing before substantive work. The proposal names configured stages and
+routing before substantive work unless runtime autopilot is active. The proposal names configured stages and
 their agent/model/effort/context, plus every skipped group and reason; the
 user can approve delegation, choose main-session handling, or give custom
 routing. Only minimal classification reads are allowed first. Declining or
 cancelling stops work, and routing approval does not itself approve a plan,
 implementation, tests, commits, or pushes. Significant route changes need
-renewed approval. For every blocking `ask_user` call, the first visible
+renewed approval outside active autopilot. In active autopilot, routine
+nonblocking choices and routing adjustments use the best-supported
+recommended in-scope decision, with route and skips announced. Before taking
+a recommended action, visibly announce the action, scope, and reason using a
+bold Markdown label such as **Recommended action:**, not hidden reasoning or
+a retrospective announcement. One announcement can cover a coherent batch;
+if the recommendation materially changes, announce the new recommendation
+before acting on it. This is informational, not an approval prompt for
+routine in-scope decisions. Significant
+ambiguity, scope expansion, destructive actions and separately required
+permissions still require input or approval. If there is no responsible
+default, work pauses. Required reviews, tests and budgets still apply.
+`Making best guess on autopilot` is a runtime UI label, not a quality
+guarantee; instructions guide decisions but do not change the label or
+enable autopilot. For every blocking `ask_user` call, the first visible
 line of the same assistant response, immediately before the tool call,
 starts with `🛑 **NEEDS YOUR APPROVAL**`; a blocking non-approval question
 uses `🛑 **NEEDS YOUR INPUT**`. The visible preamble and tool prompt are

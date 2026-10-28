@@ -52,13 +52,40 @@ sentence so the communication itself does not waste tokens.
 
 For **standard, complex, and high-risk** tasks, and for any task that
 would require **broad discovery or design planning regardless of tier**,
-obtain explicit user approval of the routing before substantive work.
+obtain explicit user approval of the routing before substantive work,
+except when runtime autopilot is active as described below.
 Preliminary minimal reads needed to classify the request are allowed; do
 not begin broad Jira/Figma imports, codebase exploration, implementation,
 or other substantive work before approval. Do not use this gate for simple
 questions or routine small/casual implementation work, which keeps its
 automatic `coder` route below.
 
+In every session using these global instructions, only when the runtime
+indicates autopilot is active, it authorizes the internal
+routing-only decision: select the best-supported recommended in-scope route
+and routine nonblocking decisions autonomously, not an arbitrary, cheapest,
+or easiest guess. Before taking a recommended action, visibly announce it
+with a bold Markdown label such as **Recommended action:** and a concise
+action, scope, and reason; do not rely on hidden reasoning or a retrospective
+announcement. One announcement may cover a coherent batch, but if the
+recommendation materially changes, announce the new recommendation before
+acting on it. This is informational, not an approval prompt for routine
+in-scope decisions. Announce the chosen route and skipped stages with reasons
+without calling `ask_user` for routing. Apply the same exception to
+necessary route adjustments, while communicating them. Do not claim
+autopilot is active without runtime evidence; enabling it is the user's
+decision.
+
+Autopilot does not authorize significant ambiguity or scope expansion,
+destructive actions, new external side effects requiring permission, or
+edits, commits, pushes, plans, or other actions requiring explicit user
+approval. Do not fabricate consent or skip required reviews, tests, or
+budgets. If no responsible default exists, pause honestly for input rather
+than repeatedly guessing. `Making best guess on autopilot` is a runtime UI
+label, not proof of decision quality; these instructions guide selection
+and do not customize that label.
+
+Outside active autopilot:
 Present a concise proposed route and ask the user to choose using
 `ask_user`:
 
@@ -87,14 +114,16 @@ approval to implement. Do not start implementation until any required
 plan approval is also given.
 
 If a significant change to stage ownership, routing, or model tier becomes
-necessary, stop and obtain renewed routing approval before that change.
+necessary, stop and obtain renewed routing approval before that change,
+except for the active-autopilot routing-only adjustment above.
 Routine file reads and bounded fixes/retests performed by already-approved
 roles do not require repeated approval. Honor a user's explicit
 authorization of the exact route without asking redundantly. Once approved,
 perform the approved discovery/planning as assigned; do not silently
 replace a delegated stage with main-session exploration. If an approved
 stage is genuinely unavailable, explain the limitation and request
-approval for an adjusted route before substituting.
+approval for an adjusted route before substituting, unless the
+active-autopilot routing-only exception applies.
 
 Do not turn this gate into an automatic heavy pipeline: use the tier
 matrix, conditional stages, and skip reasons to recommend only justified
@@ -250,8 +279,9 @@ stage already did:
 
 If an approved stage's agent is unavailable or fails to load, follow the
 pre-work routing-approval rule: explain the limitation and obtain approval
-for an adjusted route before substituting main-session work. Do not silently
-replace an approved delegation.
+for an adjusted route before substituting main-session work, unless active
+autopilot permits the routing-only adjustment above. Do not silently replace
+an approved delegation.
 
 ## Task tiers and stage-selection matrix
 
@@ -546,8 +576,8 @@ where the input file contains exactly:
   and include the compact final `Stages:` record.
 - Apply the mandatory pre-work routing-approval gate above to standard,
   complex, and high-risk work and to broad discovery/design planning at
-  any tier. Approval is for routing only, never a substitute for required
-  plan or action authorization.
+  any tier, subject to the active-autopilot routing exception. Routing
+  authorization is never a substitute for required plan or action approval.
 - Never let a stage duplicate work another stage already did: don't
   re-explore what `discovery` already mapped, don't re-plan what
   `planner` already decided, don't let `reviewer`/`test-reviewer` restart
