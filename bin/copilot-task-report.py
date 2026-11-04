@@ -2770,6 +2770,11 @@ _OFFICIAL_COLUMNS = {
     "output": "output",
 }
 _REQUIRED_COLUMNS = ("model", "input", "cached_input", "output")
+_IMAGE_GENERATION_HEADING = "image generation models"
+_IMAGE_GENERATION_COLUMNS = (
+    "model", "release status", "text input", "cached text input",
+    "image input", "cached image input", "image output",
+)
 
 
 def _split_table_row(line):
@@ -2843,8 +2848,9 @@ def _parse_tier_cell(cell, where):
 def parse_official_pricing_markdown(text):
     """Parse the official article body (Markdown) into
     {'models': {id: entry}, 'lookup': {loose_key: id}, 'providers': [...]}.
-    Raises OfficialPricingError on ANY inconsistency — the caller must then
-    keep the previous cache rather than store a partial result."""
+    Excludes the explicitly recognized, unsupported image-generation table.
+    Raises OfficialPricingError on any other inconsistency — the caller
+    must then keep the previous cache rather than store a partial result."""
     if not isinstance(text, str) or not text.strip():
         raise OfficialPricingError("empty pricing document")
     lines = text.splitlines()
@@ -2890,7 +2896,8 @@ def parse_official_pricing_markdown(text):
             provider = _clean_cell_text(line[4:])
             if not provider:
                 raise OfficialPricingError("empty provider heading")
-            providers.append(provider)
+            if provider.lower() != _IMAGE_GENERATION_HEADING:
+                providers.append(provider)
             i += 1
             continue
         if not line.lstrip().startswith("|"):
@@ -2911,6 +2918,12 @@ def parse_official_pricing_markdown(text):
         sep = _split_table_row(block[1])
         if len(sep) != len(header) or not all(_TABLE_SEPARATOR_CELL_RE.match(c) for c in sep):
             raise OfficialPricingError("%s: malformed header separator" % where_t)
+        # Image modalities cannot be priced with chat token usage. Match both
+        # the explicit section and its known schema, never merely a missing
+        # chat column: a broken supported table must still reject the refresh.
+        if (provider.lower() == _IMAGE_GENERATION_HEADING
+                and tuple(header) == _IMAGE_GENERATION_COLUMNS):
+            continue
         col_index = {}
         unknown_cols = []
         for idx, name in enumerate(header):

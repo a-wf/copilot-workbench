@@ -6,6 +6,14 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Fixed — official pricing image-table compatibility
+
+- Exclude the explicitly recognized non-chat `Image generation models`
+  table from official chat pricing snapshots; image generation remains
+  unsupported and unpriced. Malformed chat tables still reject the whole
+  refresh. TLS verification, secure curl fallback, cache expiry, and retry
+  policies are unchanged.
+
 ### Changed — model routing defaults, Auto Balance, per-agent attribution
 
 - `copilot-s` now launches Copilot with `--model auto --auto-tier balance`

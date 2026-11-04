@@ -166,6 +166,14 @@ Prices are in USD per 1 million tokens.
 | Mistral Large | GA | Chat | $1 | $0.1 | $4 |
 """
 
+# Known non-chat schema; rates are fixed test values, not live pricing.
+OFFICIAL_IMAGE_PRICING_MARKDOWN = """\
+### Image generation models
+| Model | Release status | Text input | Cached text input | Image input | Cached image input | Image output |
+|---|---|---|---|---|---|---|
+| GPT Image 2.5 Flare | Public preview | $8 | $2 | $8 | $2 | $30 |
+"""
+
 
 class BaseTestCase(unittest.TestCase):
     """Sets up an isolated fake ~/.copilot + support dir per test by
@@ -2576,6 +2584,122 @@ class TestOfficialPricingParsing(BaseTestCase):
             self.mod.CACHE_WRITE_NOT_LISTED,
         )
         self.assertEqual(snapshot["models"]["gemini-3.8-flash"]["provider"], "Google")
+
+    def test_known_image_table_is_excluded_without_changing_chat_pricing(self):
+        baseline = self.official_snapshot(fetched_epoch=10_000)
+        pages = [
+            OFFICIAL_PRICING_MARKDOWN.replace(
+                "### OpenAI", OFFICIAL_IMAGE_PRICING_MARKDOWN + "\n### OpenAI", 1,
+            ),
+            OFFICIAL_PRICING_MARKDOWN.replace(
+                "### Anthropic", OFFICIAL_IMAGE_PRICING_MARKDOWN + "\n### Anthropic", 1,
+            ),
+            OFFICIAL_PRICING_MARKDOWN + "\n" + OFFICIAL_IMAGE_PRICING_MARKDOWN,
+        ]
+        for position, page in zip(("first", "middle", "last"), pages):
+            with self.subTest(image_table_position=position):
+                snapshot = self.official_snapshot(fetched_epoch=10_000, markdown=page)
+                for key in ("models", "lookup", "providers"):
+                    self.assertEqual(snapshot[key], baseline[key])
+                self.assertNotIn("gpt-image-2.5-flare", snapshot["models"])
+                self.assertNotIn("gpt-image-2-5-flare", snapshot["lookup"])
+                self.assertNotIn("Image generation models", snapshot["providers"])
+
+                call = {
+                    "model": "gpt-6-luna", "prompt_tokens": 1000, "completion_tokens": 200,
+                    "usage_present": {"input": True, "output": True},
+                }
+                priced, reason = self.mod.price_call_official(call, snapshot)
+                self.assertIsNone(reason)
+                self.assertAlmostEqual(priced["usd"], 200 / 1_000_000)
+                for model in ("gpt-image-2.5-flare", "gpt-image-2-5-flare"):
+                    unpriced, reason = self.mod.price_call_official(dict(call, model=model), snapshot)
+                    self.assertIsNone(unpriced)
+                    self.assertEqual(reason, self.mod.UNPRICED_UNKNOWN_MODEL)
+
+    def test_known_image_table_does_not_hide_missing_required_chat_columns(self):
+        header = ["Model", "Input", "Cached input", "Output"]
+        row = ["Another Chat Model", "$1", "$0.1", "$4"]
+        prefix = OFFICIAL_PRICING_MARKDOWN + "\n" + OFFICIAL_IMAGE_PRICING_MARKDOWN
+        for index, required in enumerate(("model", "input", "cached_input", "output")):
+            with self.subTest(missing_column=required):
+                kept_header = header[:index] + header[index + 1:]
+                kept_row = row[:index] + row[index + 1:]
+                table = "\n### OpenAI\n| %s |\n| %s |\n| %s |\n" % (
+                    " | ".join(kept_header),
+                    " | ".join(["---"] * len(kept_header)),
+                    " | ".join(kept_row),
+                )
+                with self.assertRaisesRegex(
+                    self.mod.OfficialPricingError,
+                    "provider 'OpenAI' table: required column '%s' missing" % required,
+                ):
+                    self.official_snapshot(fetched_epoch=10_000, markdown=prefix + table)
+
+    def test_image_only_document_cannot_create_chat_pricing_snapshot(self):
+        page = (
+            "## Pricing tables\n\nPrices are in USD per 1 million tokens.\n\n"
+            + OFFICIAL_IMAGE_PRICING_MARKDOWN
+        )
+        with self.assertRaisesRegex(self.mod.OfficialPricingError, "no priced models found"):
+            self.official_snapshot(fetched_epoch=10_000, markdown=page)
+
+    def test_image_schema_requires_the_explicit_image_generation_heading(self):
+        for heading in ("OpenAI", "Image models"):
+            with self.subTest(heading=heading):
+                table = OFFICIAL_IMAGE_PRICING_MARKDOWN.replace(
+                    "### Image generation models", "### " + heading,
+                )
+                with self.assertRaisesRegex(
+                    self.mod.OfficialPricingError, "required column 'input' missing",
+                ):
+                    self.official_snapshot(
+                        fetched_epoch=10_000,
+                        markdown=OFFICIAL_PRICING_MARKDOWN + "\n" + table,
+                    )
+
+    def test_unknown_image_schema_is_not_silently_excluded(self):
+        tables = [
+            OFFICIAL_IMAGE_PRICING_MARKDOWN.replace("Image output", "Output"),
+            OFFICIAL_IMAGE_PRICING_MARKDOWN.replace(
+                "| Text input | Cached text input |", "| Cached text input | Text input |",
+            ),
+        ]
+        for table in tables:
+            with self.subTest(header=table.splitlines()[1]):
+                with self.assertRaisesRegex(
+                    self.mod.OfficialPricingError, "required column 'input' missing",
+                ):
+                    self.official_snapshot(
+                        fetched_epoch=10_000,
+                        markdown=OFFICIAL_PRICING_MARKDOWN + "\n" + table,
+                    )
+
+    def test_known_image_table_does_not_hide_unknown_or_malformed_chat_table(self):
+        table = (
+            "\n### OpenAI\n"
+            "| Model | Input | Cached input | Output |\n"
+            "|---|---|---|---|\n"
+            "| Another Chat Model | $1 | $0.1 | $4 |\n"
+        )
+        cases = [
+            (
+                "unknown price column",
+                table.replace("| Output |", "| Output | Image output |")
+                .replace("|---|---|---|---|", "|---|---|---|---|---|")
+                .replace("| $4 |", "| $4 | $30 |"),
+                "unrecognized price column 'image output'",
+            ),
+            ("bad separator", table.replace("|---|---|---|---|", "|---|---|---|--|"),
+             "malformed header separator"),
+            ("ragged row", table.replace("| $4 |", "|"), "row has 3 cells, header has 4"),
+            ("bad chat rate", table.replace("$1 |", "$bad |"), "expected a \\$ amount"),
+        ]
+        prefix = OFFICIAL_PRICING_MARKDOWN + "\n" + OFFICIAL_IMAGE_PRICING_MARKDOWN
+        for label, malformed, error in cases:
+            with self.subTest(case=label):
+                with self.assertRaisesRegex(self.mod.OfficialPricingError, error):
+                    self.official_snapshot(fetched_epoch=10_000, markdown=prefix + malformed)
 
     def test_malformed_markdown_rejects_entire_snapshot(self):
         malformed = [
