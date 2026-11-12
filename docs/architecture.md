@@ -63,6 +63,13 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
 - **Session index** — a flat file (`~/.copilot-sessions`, format
   `session_id|name|timestamp|cwd`) tracking every known session across all
   working directories, so you can list/resume/delete sessions from anywhere.
+- **New-session naming** — passes the normalized prompt response via native
+  `copilot --name`, letting Copilot persist and display the title from launch.
+  No post-exit ID guess is used to apply the requested title; the stop flow
+  reads Copilot's resulting metadata rather than reapplying a stale prompt
+  response over an in-session `/rename`. Explicit caller names and session
+  selectors bypass the naming prompt. Existing wrapper index aliases retain
+  their usual precedence.
 - **OTEL wiring** — before launching `copilot`, it sets
   `COPILOT_OTEL_ENABLED=true`, `COPILOT_OTEL_EXPORTER_TYPE=file`, and a
   fresh per-invocation `COPILOT_OTEL_FILE_EXPORTER_PATH` under

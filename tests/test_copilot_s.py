@@ -486,7 +486,7 @@ class TestInstallerPrefixArgValidation(BaseHomeTestCase):
 
 class TestContextMetricsSessionManager(BaseHomeTestCase):
     """Drive copilot-s through a PTY with a fake Copilot CLI and helper to
-    check conservative enrollment, list alignment, and stop-time handling."""
+    check native naming, conservative enrollment, and stop-time handling."""
 
     CONTEXT_SUMMARY = (
         "Context: 73.2% (732/1,000 tokens) last observed before compaction "
@@ -545,18 +545,62 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "import datetime, json, os, pathlib, sys\n"
                 "with open(os.environ['COPILOT_LOG'], 'w', encoding='utf-8') as log:\n"
                 "    json.dump(sys.argv[1:], log)\n"
+                "def option_value(long_flag, short_flag=None):\n"
+                "    args = iter(sys.argv[1:])\n"
+                "    for arg in args:\n"
+                "        if arg == '--':\n"
+                "            break\n"
+                "        if arg == long_flag or (short_flag and arg == short_flag):\n"
+                "            value = next(args, None)\n"
+                "            if value is not None and not value.startswith('-'):\n"
+                "                return value\n"
+                "            if value == '--':\n"
+                "                break\n"
+                "        elif arg.startswith(long_flag + '='):\n"
+                "            return arg.split('=', 1)[1]\n"
+                "        elif short_flag and arg.startswith(short_flag) and arg != short_flag:\n"
+                "            return arg[len(short_flag):]\n"
+                "        # Only the required-value options exercised by these fixtures.\n"
+                "        elif arg in ('-p', '--prompt', '-i', '--interactive', '--agent',\n"
+                "                     '--model', '--auto-tier', '-n', '--name', '--session-id'):\n"
+                "            if next(args, None) == '--':\n"
+                "                break\n"
+                "    return None\n"
+                "name = option_value('--name', '-n')\n"
                 "root = pathlib.Path(os.environ['HOME']) / '.copilot' / 'session-state'\n"
                 "mode = os.environ.get('FAKE_COPILOT_MODE', 'idle')\n"
+                "launched_directory = None\n"
                 "if mode in ('new', 'multiple'):\n"
                 "    session_ids = os.environ.get('FAKE_SESSION_IDS', 'fresh-session').split(',')\n"
-                "    for session_id in session_ids:\n"
+                "    for index, session_id in enumerate(session_ids):\n"
                 "        directory = root / session_id\n"
                 "        directory.mkdir(parents=True, exist_ok=True)\n"
                 "        created = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')\n"
                 "        cwd = os.environ.get('FAKE_SESSION_CWD', os.getcwd())\n"
+                "        title = (name if name is not None else 'Fake session') if index == 0 else 'Concurrent session'\n"
                 "        (directory / 'workspace.yaml').write_text(\n"
-                "            'created_at: ' + created + '\\n' + 'cwd: ' + cwd + '\\n' + 'name: Fake session\\n',\n"
+                "            'created_at: ' + created + '\\n' + 'cwd: ' + cwd + '\\n' + 'name: ' + title + '\\n',\n"
                 "            encoding='utf-8')\n"
+                "        if index == 0:\n"
+                "            launched_directory = directory\n"
+                "else:\n"
+                "    session_id = (os.environ.get('FAKE_RESUMED_SESSION') or\n"
+                "                  option_value('--resume', '-r') or option_value('--session-id'))\n"
+                "    if session_id:\n"
+                "        launched_directory = root / session_id\n"
+                "def set_title(directory, title):\n"
+                "    workspace = directory / 'workspace.yaml'\n"
+                "    lines = [line for line in workspace.read_text(encoding='utf-8').splitlines()\n"
+                "             if not line.startswith('name:')]\n"
+                "    workspace.write_text('\\n'.join(lines) + '\\nname: ' + title + '\\n', encoding='utf-8')\n"
+                "if launched_directory is not None:\n"
+                "    if name is not None:\n"
+                "        set_title(launched_directory, name)\n"
+                "    title = next(line[6:] for line in (launched_directory / 'workspace.yaml').read_text(\n"
+                "        encoding='utf-8').splitlines() if line.startswith('name: '))\n"
+                "    print('FAKE_COPILOT_TITLE: ' + json.dumps(title), flush=True)\n"
+                "    if 'FAKE_RENAME_TO' in os.environ:\n"
+                "        set_title(launched_directory, os.environ['FAKE_RENAME_TO'])\n"
                 % sys.executable
             )
         os.chmod(copilot, os.stat(copilot).st_mode | stat.S_IEXEC)
@@ -668,7 +712,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         with open(self.helper_log, encoding="utf-8") as f:
             return [json.loads(line) for line in f if line.strip()]
 
-    def _session(self, session_id, *, sidecar=False, name=None):
+    def _session(self, session_id, *, sidecar=False, name=None, cwd=None):
         directory = os.path.join(self.state_dir, session_id)
         os.makedirs(directory, exist_ok=True)
         with open(os.path.join(directory, "workspace.yaml"), "w", encoding="utf-8") as f:
@@ -677,7 +721,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "cwd: %s\n"
                 "branch: ABC-123\n"
                 "name: %s\n"
-                % (self.cwd, name or session_id)
+                % (cwd or self.cwd, name or session_id)
             )
         if sidecar:
             with open(os.path.join(directory, "copilot-s-context.json"), "w", encoding="utf-8") as f:
@@ -686,6 +730,21 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
 
     def _commands(self, name):
         return [call for call in self._helper_calls() if call["command"] == name]
+
+    def _copilot_args(self):
+        with open(self.copilot_log, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _native_name(self, session_id):
+        with open(
+            os.path.join(self.state_dir, session_id, "workspace.yaml"),
+            encoding="utf-8",
+        ) as f:
+            return next(line[6:].rstrip("\n") for line in f if line.startswith("name: "))
+
+    def _session_rows(self):
+        with open(self.sessions_file, encoding="utf-8") as f:
+            return [line.rstrip("\n").split("|") for line in f if line.strip()]
 
     def test_fresh_session_enrolls_exact_id_and_prints_metrics_before_keep_prompt(self):
         status, output, actions = self._run_tty(
@@ -753,7 +812,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
             ],
         )
 
-    def test_new_session_prompts_before_launch_and_persists_chosen_name(self):
+    def test_new_session_passes_prompted_name_at_launch_and_persists_native_title(self):
         status, output, actions = self._run_tty(
             self._env({
                 "FAKE_COPILOT_MODE": "new",
@@ -771,11 +830,197 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
             output.index("Starting copilot..."),
             "the name must be requested before Copilot launches",
         )
+        copilot_args = self._copilot_args()
+        self.assertEqual(
+            copilot_args,
+            ["--model", "auto", "--auto-tier", "balance", "--name=Planning notes"],
+        )
+        self.assertIn('FAKE_COPILOT_TITLE: "Planning notes"', output)
+        self.assertEqual(self._native_name("named-session"), "Planning notes")
         with open(self.sessions_file, encoding="utf-8") as f:
             rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
         named_rows = [row for row in rows if row[0] == "named-session"]
         self.assertEqual(len(named_rows), 1)
         self.assertEqual(named_rows[0][1], "Planning notes")
+
+    def test_dash_leading_prompted_name_is_one_native_name_argument(self):
+        title = "-n native --continue --model"
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "dash-named-session",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", title + "\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertEqual(
+            self._copilot_args(),
+            ["--model", "auto", "--auto-tier", "balance", "--name=" + title],
+        )
+        self.assertIn("FAKE_COPILOT_TITLE: " + json.dumps(title), output)
+        self.assertEqual(self._native_name("dash-named-session"), title)
+        self.assertEqual(self._session_rows()[0][1], title)
+
+    def test_native_value_operands_are_not_names_selectors_or_model_options(self):
+        cases = [
+            ["-p", "-n foo"],
+            ["--prompt", "--continue"],
+            ["-i", "--model"],
+        ]
+        title = "Prompted native title"
+        for index, caller_args in enumerate(cases):
+            with self.subTest(args=caller_args):
+                session_id = "native-operand-%s" % index
+                actions = [
+                    ("Session name (Enter for automatic):", title + "\n"),
+                    ("[K/r/d]:", "k\n"),
+                ]
+                if index:
+                    actions.insert(0, ("Select session to resume", "n\n"))
+                status, output, answered = self._run_tty(
+                    self._env({
+                        "FAKE_COPILOT_MODE": "new",
+                        "FAKE_SESSION_IDS": session_id,
+                    }),
+                    actions=actions,
+                    copilot_s_args=caller_args,
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(answered, len(actions), output)
+                self.assertEqual(
+                    self._copilot_args(),
+                    caller_args + [
+                        "--model", "auto", "--auto-tier", "balance", "--name=" + title,
+                    ],
+                )
+                self.assertIn("FAKE_COPILOT_TITLE: " + json.dumps(title), output)
+                self.assertEqual(self._native_name(session_id), title)
+
+    def test_wrapper_flags_as_native_operands_do_not_trigger_wrapper_actions(self):
+        self._session("local-session", name="Visible local session")
+        self._session(
+            "foreign-session",
+            name="Foreign session must remain hidden",
+            cwd=os.path.join(self.home, "another-worktree"),
+        )
+        cases = [
+            ["-p", "--report"],
+            ["--prompt", "--task=ABC-999"],
+            ["-i", "--all"],
+            ["--interactive", "-a"],
+            ["--agent", "--help"],
+            ["--agent", "--version"],
+        ]
+        title = "Operand-safe title"
+        for index, caller_args in enumerate(cases):
+            with self.subTest(args=caller_args):
+                session_id = "wrapper-operand-%s" % index
+                status, output, actions = self._run_tty(
+                    self._env({
+                        "FAKE_COPILOT_MODE": "new",
+                        "FAKE_SESSION_IDS": session_id,
+                    }),
+                    actions=[
+                        ("Select session to resume", "n\n"),
+                        ("Session name (Enter for automatic):", title + "\n"),
+                        ("[K/r/d]:", "k\n"),
+                    ],
+                    copilot_s_args=caller_args,
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(actions, 3, output)
+                self.assertIn("Visible local session", output)
+                self.assertNotIn("Foreign session must remain hidden", output)
+                self.assertNotIn("Usage:", output)
+                self.assertEqual(self._commands("report"), [])
+                self.assertEqual(
+                    self._copilot_args(),
+                    caller_args + [
+                        "--model", "auto", "--auto-tier", "balance", "--name=" + title,
+                    ],
+                )
+                self.assertIn("FAKE_COPILOT_TITLE: " + json.dumps(title), output)
+                self.assertEqual(self._native_name(session_id), title)
+
+    def test_double_dash_remainder_is_exact_and_forced_options_precede_it(self):
+        self._session("local-session", name="Visible local session")
+        self._session(
+            "foreign-session",
+            name="Foreign session must remain hidden",
+            cwd=os.path.join(self.home, "another-worktree"),
+        )
+        remainder = [
+            "--",
+            "--name", "Remainder title", "--name=Other remainder title", "-nattached",
+            "--resume", "not-a-session", "-rattached", "--continue",
+            "--session-id=remainder-id", "--connect=unreachable",
+            "--model", "remainder-model", "--auto-tier=remainder-tier",
+            "--report", "ABC-999", "--task=ABC-999",
+            "--all", "-a", "--help", "-h", "--version", "-v",
+            "", "  spaced remainder  ", "first line\nsecond line", "--",
+        ]
+        for index, title in enumerate(("Before-boundary title", "")):
+            with self.subTest(prompted_title=title):
+                session_id = "boundary-session-%s" % index
+                status, output, actions = self._run_tty(
+                    self._env({
+                        "FAKE_COPILOT_MODE": "new",
+                        "FAKE_SESSION_IDS": session_id,
+                    }),
+                    actions=[
+                        ("Select session to resume", "n\n"),
+                        ("Session name (Enter for automatic):", title + "\n"),
+                        ("[K/r/d]:", "k\n"),
+                    ],
+                    copilot_s_args=[
+                        "--model", "caller-model", "--auto-tier=caller-tier",
+                        "--prompt", "Prompt before boundary", *remainder,
+                    ],
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(actions, 3, output)
+                expected_prefix = [
+                    "--prompt", "Prompt before boundary",
+                    "--model", "auto", "--auto-tier", "balance",
+                ]
+                if title:
+                    expected_prefix.append("--name=" + title)
+                self.assertEqual(self._copilot_args(), expected_prefix + remainder)
+                self.assertNotIn("Foreign session must remain hidden", output)
+                self.assertNotIn("Usage:", output)
+                self.assertEqual(self._commands("report"), [])
+                native_title = title or "Fake session"
+                self.assertIn("FAKE_COPILOT_TITLE: " + json.dumps(native_title), output)
+                self.assertEqual(self._native_name(session_id), native_title)
+                row = next(row for row in self._session_rows() if row[0] == session_id)
+                self.assertEqual(row[1], native_title)
+
+    def test_missing_native_operand_does_not_consume_double_dash(self):
+        # Assert forwarding only. The native CLI, not this fake or wrapper,
+        # is responsible for rejecting these incomplete required options.
+        remainder = ["--", "--report", "ABC-999", "--name=Positional title", ""]
+        for option in ("--prompt", "--name", "--session-id"):
+            with self.subTest(option=option):
+                actions = (
+                    [("Session name (Enter for automatic):", "\n")]
+                    if option == "--prompt" else []
+                )
+                status, output, answered = self._run_tty(
+                    self._env({"FAKE_COPILOT_MODE": "idle"}),
+                    actions=actions,
+                    copilot_s_args=[option, *remainder],
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(answered, len(actions), output)
+                self.assertEqual(
+                    self._copilot_args(),
+                    [option, "--model", "auto", "--auto-tier", "balance"] + remainder,
+                )
+                self.assertEqual(self._commands("report"), [])
 
     def test_blank_new_session_name_uses_automatic_name(self):
         status, output, actions = self._run_tty(
@@ -790,6 +1035,11 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         )
         self.assertEqual(status, 0, output)
         self.assertEqual(actions, 2, output)
+        self.assertEqual(
+            self._copilot_args(), ["--model", "auto", "--auto-tier", "balance"]
+        )
+        self.assertIn('FAKE_COPILOT_TITLE: "Fake session"', output)
+        self.assertEqual(self._native_name("automatic-session"), "Fake session")
         with open(self.sessions_file, encoding="utf-8") as f:
             rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
         automatic_rows = [row for row in rows if row[0] == "automatic-session"]
@@ -809,18 +1059,25 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         )
         self.assertEqual(status, 0, output)
         self.assertEqual(actions, 2, output)
+        self.assertEqual(
+            self._copilot_args(), ["--model", "auto", "--auto-tier", "balance"]
+        )
+        self.assertEqual(self._native_name("whitespace-session"), "Fake session")
         with open(self.sessions_file, encoding="utf-8") as f:
             rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
         whitespace_rows = [row for row in rows if row[0] == "whitespace-session"]
         self.assertEqual(len(whitespace_rows), 1)
         self.assertEqual(whitespace_rows[0][1], "Fake session")
 
-    def test_ambiguous_new_sessions_do_not_receive_typed_name(self):
-        chosen_name = "Do not attach"
+    def test_concurrent_session_cannot_receive_another_launches_prompted_name(self):
+        chosen_name = "Owned launch title"
         status, output, actions = self._run_tty(
             self._env({
                 "FAKE_COPILOT_MODE": "multiple",
-                "FAKE_SESSION_IDS": "ambiguous-one,ambiguous-two",
+                # The permissive post-session detector finds the unrelated
+                # directory first. Native naming must still affect only the
+                # fake CLI's own session (the first ID in this list).
+                "FAKE_SESSION_IDS": "z-owned-session,a-concurrent-session",
             }),
             actions=[
                 ("Session name (Enter for automatic):", chosen_name + "\n"),
@@ -829,18 +1086,132 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         )
         self.assertEqual(status, 0, output)
         self.assertEqual(actions, 2, output)
-        with open(self.sessions_file, encoding="utf-8") as f:
-            rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
-        self.assertFalse(
-            any(row[1] == chosen_name for row in rows),
-            "an ambiguous run must not associate the typed name with any session",
+        copilot_args = self._copilot_args()
+        self.assertEqual(
+            copilot_args,
+            ["--model", "auto", "--auto-tier", "balance", "--name=" + chosen_name],
         )
-        for session_id in ("ambiguous-one", "ambiguous-two"):
-            with open(
-                os.path.join(self.state_dir, session_id, "workspace.yaml"),
-                encoding="utf-8",
-            ) as f:
-                self.assertNotIn("name: " + chosen_name, f.read())
+        self.assertIn("FAKE_COPILOT_TITLE: " + json.dumps(chosen_name), output)
+        self.assertEqual(self._native_name("z-owned-session"), chosen_name)
+        self.assertEqual(self._native_name("a-concurrent-session"), "Concurrent session")
+        concurrent_rows = [
+            row for row in self._session_rows() if row[0] == "a-concurrent-session"
+        ]
+        self.assertEqual(len(concurrent_rows), 1)
+        self.assertEqual(concurrent_rows[0][1], "Concurrent session")
+        self.assertIn("could not unambiguously identify", output)
+        self.assertEqual(self._commands("context-update"), [])
+
+    def test_caller_name_spellings_skip_prompt_and_pass_through_unchanged(self):
+        title = "  Caller|native title  "
+        spellings = [
+            ["--name", title],
+            ["--name=" + title],
+            ["-n", title],
+            ["-n" + title],
+        ]
+        for index, name_args in enumerate(spellings):
+            with self.subTest(args=name_args):
+                session_id = "caller-named-%s" % index
+                actions = [("[K/r/d]:", "k\n")]
+                if index:
+                    actions.insert(0, ("Select session to resume", "n\n"))
+                caller_args = ["--custom-option", "kept", *name_args, "positional"]
+                status, output, answered = self._run_tty(
+                    self._env({
+                        "FAKE_COPILOT_MODE": "new",
+                        "FAKE_SESSION_IDS": session_id,
+                    }),
+                    actions=actions,
+                    copilot_s_args=caller_args,
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(answered, len(actions), output)
+                self.assertNotIn("Session name (Enter for automatic):", output)
+                self.assertEqual(
+                    self._copilot_args(),
+                    caller_args + ["--model", "auto", "--auto-tier", "balance"],
+                )
+                self.assertIn("FAKE_COPILOT_TITLE: " + json.dumps(title), output)
+                self.assertEqual(self._native_name(session_id), title)
+
+    def test_caller_session_selectors_skip_prompt_without_clobbering_title(self):
+        directory = self._session("selected-session", name="Existing native title")
+        workspace = os.path.join(directory, "workspace.yaml")
+        with open(workspace, "rb") as f:
+            original_workspace = f.read()
+        selectors = [
+            ["--resume", "selected-session"],
+            ["--resume=selected-session"],
+            ["--resume"],
+            ["-r", "selected-session"],
+            ["-rselected-session"],
+            ["-r"],
+            ["--continue"],
+            ["--session-id", "selected-session"],
+            ["--session-id=selected-session"],
+            ["--connect", "https://example.invalid/session"],
+            ["--connect=https://example.invalid/session"],
+        ]
+        for selector in selectors:
+            with self.subTest(args=selector):
+                status, output, actions = self._run_tty(
+                    self._env({
+                        "FAKE_COPILOT_MODE": "idle",
+                        "FAKE_RESUMED_SESSION": "selected-session",
+                    }),
+                    # Exercise caller selection with no wrapper-selected ID.
+                    actions=[("Select session to resume", "n\n")],
+                    copilot_s_args=selector,
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(actions, 1, output)
+                self.assertNotIn("Session name (Enter for automatic):", output)
+                self.assertEqual(
+                    self._copilot_args(),
+                    selector + ["--model", "auto", "--auto-tier", "balance"],
+                )
+                self.assertIn('FAKE_COPILOT_TITLE: "Existing native title"', output)
+                with open(workspace, "rb") as f:
+                    self.assertEqual(f.read(), original_workspace)
+                self.assertEqual(self._session_rows()[0][1], "Existing native title")
+
+    def test_in_session_rename_is_not_replaced_by_prompted_name_after_exit(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "renamed-session",
+                "FAKE_RENAME_TO": "Renamed during session",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", "Initial title\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertIn('FAKE_COPILOT_TITLE: "Initial title"', output)
+        self.assertEqual(self._native_name("renamed-session"), "Renamed during session")
+        self.assertEqual(self._session_rows()[0][1], "Renamed during session")
+        self.assertIn("Session kept:", output)
+        self.assertNotIn("Session kept:\x1b[0m Initial title", output)
+
+    def test_exit_menu_rename_remains_wrapper_alias_only(self):
+        status, output, actions = self._run_tty(
+            self._env({
+                "FAKE_COPILOT_MODE": "new",
+                "FAKE_SESSION_IDS": "aliased-session",
+            }),
+            actions=[
+                ("Session name (Enter for automatic):", "Native title\n"),
+                ("[K/r/d]:", "r\n"),
+                ("New name:", "Wrapper alias\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 3, output)
+        self.assertEqual(self._native_name("aliased-session"), "Native title")
+        self.assertEqual(self._session_rows()[0][1], "Wrapper alias")
 
     def test_pipe_in_new_session_name_does_not_corrupt_session_fields(self):
         status, output, actions = self._run_tty(
@@ -849,12 +1220,19 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "FAKE_SESSION_IDS": "pipe-session",
             }),
             actions=[
-                ("Session name (Enter for automatic):", "Planning|notes\n"),
+                ("Session name (Enter for automatic):", " \t Planning|notes \t \n"),
                 ("[K/r/d]:", "k\n"),
             ],
         )
         self.assertEqual(status, 0, output)
         self.assertEqual(actions, 2, output)
+        copilot_args = self._copilot_args()
+        self.assertEqual(
+            copilot_args,
+            ["--model", "auto", "--auto-tier", "balance", "--name=Planning notes"],
+        )
+        self.assertIn('FAKE_COPILOT_TITLE: "Planning notes"', output)
+        self.assertEqual(self._native_name("pipe-session"), "Planning notes")
         with open(self.sessions_file, encoding="utf-8") as f:
             rows = [line.rstrip("\n").split("|") for line in f if line.strip()]
         pipe_rows = [row for row in rows if row[0] == "pipe-session"]
@@ -941,7 +1319,12 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
             )))
 
     def test_legacy_resume_does_not_call_context_helper_or_create_sidecar(self):
-        self._session("legacy-session")
+        directory = self._session("legacy-session", name="Existing native title")
+        workspace = os.path.join(directory, "workspace.yaml")
+        with open(workspace, "rb") as f:
+            original_workspace = f.read()
+        with open(self.sessions_file, "w", encoding="utf-8") as f:
+            f.write("legacy-session|Wrapper alias|2026-10-13T10:00:00Z|%s\n" % self.cwd)
         status, output, actions = self._run_tty(
             self._env({"FAKE_COPILOT_MODE": "idle"}),
             actions=[
@@ -955,6 +1338,13 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         with open(self.copilot_log, encoding="utf-8") as f:
             copilot_args = json.load(f)
         self.assertIn("--resume=legacy-session", copilot_args)
+        self.assertEqual(
+            copilot_args,
+            ["--resume=legacy-session", "--model", "auto", "--auto-tier", "balance"],
+        )
+        self.assertEqual(self._session_rows()[0][1], "Wrapper alias")
+        with open(workspace, "rb") as f:
+            self.assertEqual(f.read(), original_workspace)
         commands = [call["command"] for call in self._helper_calls()]
         self.assertIn("ingest", commands)
         self.assertNotIn("context-list", commands)
@@ -996,6 +1386,38 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                 "--auto-tier", "balance",
             ],
         )
+
+    def test_resumed_launch_keeps_native_title_and_exact_double_dash_remainder(self):
+        directory = self._session("boundary-resume", name="Existing native title")
+        workspace = os.path.join(directory, "workspace.yaml")
+        with open(workspace, "rb") as f:
+            original_workspace = f.read()
+        remainder = [
+            "--", "--name=Positional title", "--continue", "--model", "positional-model",
+            "--auto-tier=positional-tier", "--report", "ABC-999", "--all", "--help",
+            "", "  spaced remainder  ", "first line\nsecond line",
+        ]
+        status, output, actions = self._run_tty(
+            self._env({"FAKE_COPILOT_MODE": "idle"}),
+            actions=[
+                ("Select session to resume", "1\n"),
+                ("[K/r/d]:", "k\n"),
+            ],
+            copilot_s_args=["--model=caller-model", "--auto-tier", "caller-tier", *remainder],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertNotIn("Session name (Enter for automatic):", output)
+        self.assertEqual(
+            self._copilot_args(),
+            ["--resume=boundary-resume", "--model", "auto", "--auto-tier", "balance"]
+            + remainder,
+        )
+        self.assertIn('FAKE_COPILOT_TITLE: "Existing native title"', output)
+        self.assertEqual(self._commands("report"), [])
+        with open(workspace, "rb") as f:
+            self.assertEqual(f.read(), original_workspace)
+        self.assertEqual(self._session_rows()[0][1], "Existing native title")
 
     def test_enrolled_resume_refreshes_without_enrolling_again(self):
         self._session("enrolled-session", sidecar=True)

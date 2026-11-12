@@ -721,6 +721,23 @@ post_session() {
   esac
 }
 
+# Required single-value options from Copilot CLI 1.0.109 --help. Protect
+# their separate operands from wrapper flag/name/selector detection. Optional
+# and variadic options only take non-option operands, so need no skipping.
+copilot_option_takes_value() {
+  case "$1" in
+    --add-dir|--add-github-mcp-tool|--add-github-mcp-toolset|\
+    --additional-mcp-config|--agent|--attachment|--auto-tier|-C|--context|\
+    --disable-mcp-server|--dynamic-retrieval|--enable-mcp-server|\
+    --extension-sdk-path|-i|--interactive|--log-dir|--log-level|\
+    --max-ai-credits|--max-autopilot-continues|--mcp-github-auth|--mode|\
+    --model|-n|--name|--output-format|--plugin-dir|-p|--prompt|\
+    --reasoning-effort|--session-id|--stream|--usage-output-file)
+      return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- Launch copilot ---
 run_copilot() {
   local session_id="${1:-}"
@@ -728,32 +745,86 @@ run_copilot() {
 
   # copilot-s always uses Copilot's automatic balance tier. Remove caller-
   # supplied model and auto-tier options in either supported spelling before
-  # appending the forced values, so caller arguments cannot override them.
-  local -a copilot_args=()
+  # appending the forced values before --, so caller options cannot override
+  # them. Keep the end marker and its positional remainder untouched.
+  local -a copilot_args=() positional_args=()
+  local caller_names_session=false caller_selects_session=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --)
+        positional_args=("$@")
+        break
+        ;;
       --model|--auto-tier)
         shift
-        [[ $# -gt 0 ]] && shift
+        if [[ $# -gt 0 && "$1" != "--" ]]; then
+          shift
+        fi
         ;;
       --model=*|--auto-tier=*)
         shift
         ;;
-      *)
+      --name|-n)
+        caller_names_session=true
         copilot_args+=("$1")
         shift
+        if [[ $# -gt 0 && "$1" != "--" ]]; then
+          copilot_args+=("$1")
+          shift
+        fi
+        ;;
+      --name=*|-n?*)
+        caller_names_session=true
+        copilot_args+=("$1")
+        shift
+        ;;
+      --resume|-r|--resume=*|-r?*|--continue|--session-id|--session-id=*|--connect|--connect=*)
+        # These can select an existing session. Leave them untouched and
+        # never add a prompted new-session name to a caller-selected session.
+        caller_selects_session=true
+        if [[ "$1" == "--session-id" ]]; then
+          copilot_args+=("$1")
+          shift
+          if [[ $# -gt 0 && "$1" != "--" ]]; then
+            copilot_args+=("$1")
+            shift
+          fi
+          continue
+        fi
+        copilot_args+=("$1")
+        shift
+        ;;
+      *)
+        local takes_value=false
+        if copilot_option_takes_value "$1"; then
+          takes_value=true
+        fi
+        copilot_args+=("$1")
+        shift
+        if [[ "$takes_value" == "true" && $# -gt 0 && "$1" != "--" ]]; then
+          copilot_args+=("$1")
+          shift
+        fi
         ;;
     esac
   done
   copilot_args+=(--model auto --auto-tier balance)
 
-  # Ask for a name only when starting a genuinely new session. An empty
-  # response keeps the existing automatic name resolution as the fallback.
+  # Use Copilot's native name-on-launch option, not a wrapper-only alias
+  # written after exit. Copilot owns persistence and any later /rename.
+  # Explicit caller names/selectors take precedence over this prompt.
   local session_name=""
-  if [[ -z "$session_id" ]]; then
+  if [[ -z "$session_id" && "$caller_names_session" == "false" && "$caller_selects_session" == "false" ]]; then
     echo -ne "${YELLOW}Session name (Enter for automatic): ${RESET}" >&2
     prompt_read session_name
+    session_name="${session_name//|/ }"
+    session_name="${session_name#"${session_name%%[![:space:]]*}"}"
+    session_name="${session_name%"${session_name##*[![:space:]]}"}"
+    if [[ -n "$session_name" ]]; then
+      copilot_args+=("--name=$session_name")
+    fi
   fi
+  copilot_args+=("${positional_args[@]}")
 
   # Resolve which task this run's usage should be attributed to,
   # before copilot starts (prompts once only for a brand-new session with no
@@ -786,29 +857,11 @@ run_copilot() {
   local detected_id
   detected_id=$(detect_new_session "$before_file") || true
 
-  # Strict detection is also the authority for associating a typed name.
-  # The permissive detector remains in place for existing post-session
-  # behavior, but must not attach names when attribution is ambiguous.
+  # Strict detection remains the authority for context-metrics enrollment.
+  # Naming is handled by Copilot itself at launch, without guessing an ID.
   local enroll_id="" enroll_rc=0
   if [[ -z "$session_id" ]]; then
     enroll_id=$(detect_enrollable_new_session "$before_file") || enroll_rc=$?
-  fi
-
-  # Persist the requested name as soon as the newly created session has
-  # been identified unambiguously, so it is available to listings and the
-  # post-session flow. Empty/whitespace input retains automatic naming.
-  if [[ -z "$session_id" && -n "$detected_id" && $enroll_rc -eq 0 && "$enroll_id" == "$detected_id" ]]; then
-    local session_dir="$SESSION_STATE_DIR/$detected_id"
-    local created_at cwd
-    created_at=$(grep '^created_at:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^created_at: *//' || true)
-    cwd=$(grep '^cwd:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^cwd: *//' || true)
-    session_name="${session_name//|/ }"
-    session_name="${session_name#"${session_name%%[![:space:]]*}"}"
-    session_name="${session_name%"${session_name##*[![:space:]]}"}"
-    if [[ -z "$session_name" ]]; then
-      session_name=$(get_session_name "$session_dir")
-    fi
-    save_session "$detected_id" "$session_name" "$created_at" "$cwd"
   fi
 
   # Context-metrics enrollment is decided independently and conservatively:
@@ -1061,15 +1114,23 @@ show_task_report() {
 
 # --- Entry point ---
 main() {
-  # --help/--version: handle first, anywhere in argv, and exit immediately.
+  # --help/--version: handle first, except inside an option operand or after --.
   # Never prompts, never touches session/marker state, never launches
   # `copilot`.
-  local arg
+  local arg skip_operand=false
   for arg in "$@"; do
+    if [[ "$skip_operand" == "true" ]]; then
+      skip_operand=false
+      [[ "$arg" != "--" ]] && continue
+    fi
     case "$arg" in
+      --) break ;;
       --help|-h) show_help; exit 0 ;;
       --version|-v) echo "copilot-s ${COPILOT_S_VERSION}"; exit 0 ;;
     esac
+    if copilot_option_takes_value "$arg"; then
+      skip_operand=true
+    fi
   done
 
   # Past informational-argument handling: this is a real session-manager
@@ -1084,9 +1145,8 @@ main() {
 
   # --report TASK_ID / --task TASK_ID: regenerate/print a task usage report
   # and exit immediately, bypassing the session manager entirely. Scan the
-  # full argument list (not just $1) so these flags work regardless of
-  # position, and strip both the flag and its value from what would
-  # otherwise be passed through — neither flag must ever reach `copilot`.
+  # options before -- (not just $1), respecting native value operands.
+  # Neither wrapper flag must ever reach `copilot` as an option.
   local report_task_id="" found_report=false
   local remaining=()
   local n=$#
@@ -1094,6 +1154,21 @@ main() {
   while [[ $idx -lt $n ]]; do
     idx=$((idx + 1))
     local arg="${!idx}"
+    if [[ "$arg" == "--" ]]; then
+      while [[ $idx -le $n ]]; do
+        remaining+=("${!idx}")
+        idx=$((idx + 1))
+      done
+      break
+    elif copilot_option_takes_value "$arg"; then
+      remaining+=("$arg")
+      local operand_idx=$((idx + 1))
+      if [[ $operand_idx -le $n && "${!operand_idx}" != "--" ]]; then
+        remaining+=("${!operand_idx}")
+        idx=$operand_idx
+      fi
+      continue
+    fi
     if [[ "$arg" == "--report" || "$arg" == "--task" ]]; then
       found_report=true
       local next_idx=$((idx + 1))
@@ -1118,6 +1193,9 @@ main() {
       found_report=true
       report_task_id="${arg#--task=}"
       continue
+    elif [[ "$arg" == "--all" || "$arg" == "-a" ]]; then
+      SHOW_ALL=true
+      continue
     fi
     remaining+=("$arg")
   done
@@ -1128,17 +1206,6 @@ main() {
   fi
 
   set -- "${remaining[@]+"${remaining[@]}"}"
-
-  # Parse flags
-  local i=0
-  local passthrough=()
-  for arg in "$@"; do
-    case "$arg" in
-      --all|-a) SHOW_ALL=true ;;
-      *) passthrough[i]="$arg"; i=$((i + 1)) ;;
-    esac
-  done
-  set -- "${passthrough[@]+"${passthrough[@]}"}"
 
   echo -e "${BOLD}${CYAN}┌──────────────────────────────┐${RESET}"
   echo -e "${BOLD}${CYAN}│  Copilot Session Manager     │${RESET}"

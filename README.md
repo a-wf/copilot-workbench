@@ -223,6 +223,17 @@ From the session list you can resume, rename, or delete sessions
 (single/range/multi-select). On exiting a `copilot` session you'll be
 prompted to keep, rename, or delete it.
 
+New sessions prompt for a name and pass it to Copilot's native `--name`
+option, so it applies during the session, not just after exit. Blank input
+keeps automatic naming; prompted names are trimmed and pipes become spaces
+in both the launched native name and the wrapper's index. Caller
+`--name`/`-n` or session-selection options skip this prompt. This requires a
+Copilot CLI version supporting `--name`
+(verified with 1.0.109). Exit-menu renaming remains a wrapper index alias.
+Wrapper options are recognized only before `--` and outside known native
+value operands. The `--` marker and everything after it pass through
+unchanged; enforced model options and any prompted name go before it.
+
 ### Context metrics (new copilot-s sessions only)
 
 For sessions **created by `copilot-s` from this version on** (`n`, or the

@@ -6,6 +6,13 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Fixed — new-session names (session-name-20261112-c1)
+
+- Pass prompted names through Copilot's native `--name` option at launch
+  (verified on CLI 1.0.109), instead of saving only a wrapper index alias
+  after exit. Preserve explicit caller naming/session-selection options
+  and do not reapply the prompted name over a later in-session rename.
+
 ### Fixed — official pricing image-table compatibility
 
 - Exclude the explicitly recognized non-chat `Image generation models`
