@@ -1469,7 +1469,15 @@ class TestEmptyScaffoldEligibility(CleanupHomeTestCase):
                 path.chmod(mode ^ stat.S_IWGRP)
                 current = self.preview()[1][sid]
                 self.assertNotEqual(current, candidates[sid])
-                self.assertEqual((directory / "workspace.yaml").stat(), workspace_stat)
+                current_workspace_stat = (directory / "workspace.yaml").stat()
+                # Preview reads may update atime; all other identity fields must stay unchanged.
+                for field in (
+                    "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid",
+                    "st_size", "st_mtime_ns", "st_ctime_ns",
+                ):
+                    self.assertEqual(
+                        getattr(current_workspace_stat, field), getattr(workspace_stat, field), field
+                    )
                 self.assertEqual(directory.stat().st_mtime_ns, original_directory_stat.st_mtime_ns)
                 self.assertEqual(directory.stat().st_ctime_ns, original_directory_stat.st_ctime_ns)
                 path.chmod(mode)
