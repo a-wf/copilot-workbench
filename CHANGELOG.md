@@ -6,6 +6,20 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Added — recoverable empty-session cleanup (cleanup-empty-sessions-20261113-c1)
+
+- New `copilot-s` menu option `c) Clean up empty sessions (recoverable)`
+  backed by the new stdlib helper `bin/copilot-session-cleanup.py`
+  (installed next to `copilot-s`). It previews never-used sessions in the
+  listed scope (only an unnamed `workspace.yaml`, older than 24h, not open
+  per `lsof`, no session-list alias), asks for an exact `yes`, re-validates
+  each previewed session, and moves it to `~/.copilot-s-quarantine/<batch>/`
+  with a durable manifest. Nothing is deleted; `restore --batch <batch>`
+  moves sessions back. Copilot's native session index is not modified.
+- `~/.copilot-sessions` rewrites by `copilot-s` and the helper now take a
+  shared `flock` on `~/.copilot-sessions.lock`; if it is busy the index is
+  left unchanged (a delete is cancelled) instead of rewritten unlocked.
+
 ### Fixed — new-session names (session-name-20261112-c1)
 
 - Pass prompted names through Copilot's native `--name` option at launch

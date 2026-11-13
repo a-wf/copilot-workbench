@@ -105,6 +105,22 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
   logs. These commands skip task-report migrations and never touch
   reports, pricing, or ingest state. Legacy sessions are never enrolled.
 
+- **Empty-session cleanup** — menu `c` shells out to
+  `copilot-session-cleanup.py` (`preview`, then `apply` with exactly the
+  previewed `id`+fingerprint pairs after a typed `yes`). The helper
+  re-validates each session (only `workspace.yaml`, `user_named: false`, no
+  name/summary/alias, ≥24h old, not open per `lsof`, unchanged fingerprint)
+  and renames it into `~/.copilot-s-quarantine/<batch>/sessions/` with an
+  atomic no-replace rename (`renameatx_np`/`renameat2`) relative to
+  directories opened without following symlinks (same filesystem only),
+  recording each transition — and the exact session-list rows, before they
+  are removed — in the batch `manifest.json` so `restore --batch` can
+  reconcile interrupted runs. Index rewrites by both scripts take an
+  `flock` on `~/.copilot-sessions.lock`; a busy lock means the index is not
+  modified. The cleanup holds it from the final alias re-check of each
+  session through that session's row removal.
+  Copilot's native session index is never touched.
+
 `copilot-s` is intentionally the *only* place that knows about git branches,
 terminal prompts, and the session index; it treats the reporter as an
 external, swappable helper it shells out to.

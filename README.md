@@ -86,7 +86,7 @@ sessions may need a reload or restart.
 
 - **Global session manager** (`copilot-s`) — list, resume, rename, and
   delete Copilot CLI sessions across every directory, not just the one
-  you're in.
+  you're in, plus a recoverable cleanup of empty, never-used sessions.
 - **Automatic per-task usage reports** — every session exit appends
   token counts, model-call time, reasoning-effort intent, and an estimated
   USD cost to a cumulative Markdown report for the task associated with
@@ -184,7 +184,7 @@ This installs:
 
 | What | Installed to | Method |
 |---|---|---|
-| `copilot-s`, `copilot-task-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
+| `copilot-s`, `copilot-task-report.py`, `copilot-session-cleanup.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
 | 7 agent definitions | `~/.copilot/agents/` | symlink (or copy with `--copy`) |
 | Orchestrator instructions | `~/.copilot/copilot-instructions.md` | symlink (or copy with `--copy`) |
 | Legacy pricing table (inactive) | `~/.copilot/task-reports/model-pricing.json` | **copied once, only if absent** — your edits are never overwritten; no longer used by the report |
@@ -233,6 +233,51 @@ Copilot CLI version supporting `--name`
 Wrapper options are recognized only before `--` and outside known native
 value operands. The `--` marker and everything after it pass through
 unchanged; enforced model options and any prompted name go before it.
+
+### Cleaning up empty sessions (recoverable)
+
+Menu option `c) Clean up empty sessions (recoverable)` previews, then — only
+after you type exactly `yes` (anything else, Enter, or EOF cancels) — moves
+empty sessions into a private quarantine batch,
+`~/.copilot-s-quarantine/<batch>/sessions/<id>/`. Nothing is deleted or
+copied: each directory is moved with an atomic no-replace rename on the same
+filesystem (a different filesystem, or a system without macOS
+`renameatx_np`/Linux `renameat2`, is refused), and `manifest.json` in the
+batch records every step, including the session-list rows before they are
+removed.
+
+- **Scope:** the current directory's exact cwd, or every directory when the
+  list is showing all sessions (`--all`/`a`).
+- **Eligible only if all hold:** the directory is an exact UUID and contains
+  only a regular `workspace.yaml` (any `events.jsonl`, even empty, or other
+  file excludes it); the metadata is plain scalars with `user_named: false`,
+  no native name/summary, and `updated_at` within 1s of `created_at`; it
+  was created, and last modified on disk, more than 24h ago; it has no
+  custom name in `~/.copilot-sessions`; its ID is not in the current
+  environment; and `lsof` (macOS/Linux) positively reports it is not open.
+  If any check is unavailable or fails, the session is kept.
+- The preview lists each candidate with counts of kept sessions by reason.
+  Before each move the session is re-validated and compared with the
+  preview; changed sessions are skipped and nothing beyond the preview is
+  ever moved. Only moved IDs are removed from `~/.copilot-sessions`.
+- `copilot-s` and the cleanup share a lock on `~/.copilot-sessions.lock`;
+  while another process holds it, the session list is left unchanged (and a
+  delete is cancelled) rather than rewritten without the lock.
+
+Restore a batch (asks for `yes`; refuses ID collisions and changed
+quarantined contents; re-adds a recorded session-list row only if missing):
+
+```bash
+copilot-session-cleanup.py list
+copilot-session-cleanup.py restore --batch 20261113-184600-1a2b3c4d
+```
+
+Limitations: Copilot's own session history/index (for example
+`session-store.db`) is never read or modified, so native history views may
+still list quarantined sessions; the activity check narrows but cannot
+eliminate a race with a Copilot process starting at the same moment.
+Quarantine is never purged automatically — remove old batches yourself once
+you are sure you do not need them.
 
 ### Context metrics (new copilot-s sessions only)
 
@@ -708,8 +753,8 @@ scripts/update.sh                        # git pull --ff-only, then re-run the i
 ```
 
 Uninstalling never touches usage reports, task/session ingest state,
-your pricing configs/cache, or Copilot session state — only the symlinks/copies
-this toolkit created.
+your pricing configs/cache, Copilot session state, or quarantined sessions
+(`~/.copilot-s-quarantine`) — only the symlinks/copies this toolkit created.
 
 ## Roadmap
 

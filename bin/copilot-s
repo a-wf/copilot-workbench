@@ -60,6 +60,81 @@ elif [[ -f "$SCRIPT_DIR/copilot-task-report.py" ]]; then
 else
   TASK_REPORT_HELPER="$HOME/.local/bin/copilot-task-report.py"
 fi
+# --- Empty-session cleanup helper (menu option c) ---
+# Same resolution order as the task report helper above.
+if [[ -n "${COPILOT_SESSION_CLEANUP_HELPER:-}" ]]; then
+  SESSION_CLEANUP_HELPER="$COPILOT_SESSION_CLEANUP_HELPER"
+elif [[ -f "$SCRIPT_DIR/copilot-session-cleanup.py" ]]; then
+  SESSION_CLEANUP_HELPER="$SCRIPT_DIR/copilot-session-cleanup.py"
+else
+  SESSION_CLEANUP_HELPER="$HOME/.local/bin/copilot-session-cleanup.py"
+fi
+SESSION_QUARANTINE_DIR="$HOME/.copilot-s-quarantine"
+
+# --- Short cross-process lock for ~/.copilot-sessions rewrites ---
+# Exclusive flock(2) on "$SESSIONS_FILE.lock" (a persistent regular file),
+# shared with copilot-session-cleanup.py. Held only around one
+# read-modify-write of the index — never across prompts or while `copilot`
+# runs. The lock belongs to fd 9 of this shell: a short python3 child takes
+# it on the inherited descriptor, so it stays held until registry_unlock
+# closes fd 9, and the kernel releases it automatically if this script dies
+# (no stale-lock stealing, no removal of anyone else's lock). If the lock
+# cannot be acquired, registry_lock returns 1 and callers must NOT modify
+# the index.
+REGISTRY_LOCK_FILE="$SESSIONS_FILE.lock"
+REGISTRY_LOCK_HELD=false
+REGISTRY_FLOCK_PY='
+import fcntl, os, stat, sys, time
+st = os.fstat(9)
+if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+    sys.exit(3)
+deadline = time.monotonic() + 10
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        sys.exit(0)
+    except BlockingIOError:
+        pass
+    except OSError:
+        sys.exit(2)
+    if time.monotonic() >= deadline:
+        sys.exit(1)
+    time.sleep(0.05)
+'
+
+registry_lock() {
+  if [[ "$REGISTRY_LOCK_HELD" == "true" ]]; then
+    return 0
+  fi
+  if [[ -L "$REGISTRY_LOCK_FILE" ]] || { [[ -e "$REGISTRY_LOCK_FILE" ]] && [[ ! -f "$REGISTRY_LOCK_FILE" ]]; }; then
+    echo -e "${YELLOW}Warning: session-list lock $REGISTRY_LOCK_FILE is not a regular file — session list left unchanged.${RESET}" >&2
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${YELLOW}Warning: python3 not found — cannot lock the session list; left unchanged.${RESET}" >&2
+    return 1
+  fi
+  if ! { exec 9>>"$REGISTRY_LOCK_FILE"; } 2>/dev/null; then
+    echo -e "${YELLOW}Warning: cannot open session-list lock $REGISTRY_LOCK_FILE — session list left unchanged.${RESET}" >&2
+    return 1
+  fi
+  if python3 -c "$REGISTRY_FLOCK_PY" 2>/dev/null; then
+    REGISTRY_LOCK_HELD=true
+    return 0
+  fi
+  exec 9>&-
+  echo -e "${YELLOW}Warning: session list is busy (another copilot-s or cleanup holds $REGISTRY_LOCK_FILE) — left unchanged.${RESET}" >&2
+  return 1
+}
+
+registry_unlock() {
+  if [[ "$REGISTRY_LOCK_HELD" == "true" ]]; then
+    exec 9>&-
+    REGISTRY_LOCK_HELD=false
+  fi
+  return 0
+}
+
 TASK_KEY_REGEX='[A-Z][A-Z0-9]+-[0-9]+'
 # Must match MAX_TASK_ID_LEN in copilot-task-report.py's normalize_task_id
 # (defense-in-depth: this bash-side fast path is a convenience/no-python
@@ -90,6 +165,7 @@ RED='\033[31m'
 RESET='\033[0m'
 
 cleanup() {
+  registry_unlock
   if [[ -n "${FILTERED_FILE:-}" ]] && [[ -f "$FILTERED_FILE" ]]; then
     rm -f "$FILTERED_FILE"
   fi
@@ -341,7 +417,20 @@ with open(sys.argv[1]) as f:
 }
 
 # --- Save / update a session entry ---
+# Returns non-zero if the index was not updated (session-list lock busy/
+# unavailable — warning already shown — or a temp-file write/rename failed);
+# in every such case the index file itself was not replaced. Callers must
+# check it with `if`, so a failed save never aborts the launcher under
+# `set -e` or reports success.
 save_session() {
+  registry_lock || return 1
+  local rc=0
+  save_session_unlocked "$@" || rc=$?
+  registry_unlock
+  return $rc
+}
+
+save_session_unlocked() {
   local session_id="$1" name="$2" timestamp="$3" cwd="$4"
   local force="${5:-false}"
   # Names occupy one pipe-delimited field. Keep the serialized value safe and
@@ -350,10 +439,18 @@ save_session() {
   name="${name#"${name%%[![:space:]]*}"}"
   name="${name%"${name##*[![:space:]]}"}"
 
+  # Every step that affects the index is checked explicitly (this runs
+  # under `if`, where errexit is off). The index is only ever replaced by a
+  # single same-directory rename of a fully written temp file we created, so
+  # any failure (non-zero return) leaves the original index unchanged; once
+  # that rename succeeds the function returns 0. On failure only our own
+  # temp file is removed.
+  local tmp="" write_ok=true
+
   # Update existing entry
   if [[ -f "$SESSIONS_FILE" ]] && grep -q "^${session_id}|" "$SESSIONS_FILE" 2>/dev/null; then
     local existing_name
-    existing_name=$(grep "^${session_id}|" "$SESSIONS_FILE" | head -1 | cut -d'|' -f2)
+    existing_name=$(grep -m 1 "^${session_id}|" "$SESSIONS_FILE" | cut -d'|' -f2) || return 1
     local should_update=false
     if [[ "$force" == "true" ]]; then
       should_update=true
@@ -361,23 +458,39 @@ save_session() {
       should_update=true
     fi
     if [[ "$should_update" == "true" ]]; then
-      local tmp
-      tmp=$(mktemp)
-      while IFS='|' read -r eid ename ets ecwd; do
+      tmp=$(mktemp "$SESSIONS_FILE.XXXXXX") || return 1
+      [[ -n "$tmp" ]] || return 1
+      if ! while IFS='|' read -r eid ename ets ecwd; do
         [[ -z "$eid" ]] && continue
         if [[ "$eid" == "$session_id" ]]; then
-          echo "${session_id}|${name}|${timestamp}|${cwd}"
+          echo "${session_id}|${name}|${timestamp}|${cwd}" || write_ok=false
         else
-          echo "${eid}|${ename}|${ets}|${ecwd}"
+          echo "${eid}|${ename}|${ets}|${ecwd}" || write_ok=false
         fi
-      done < "$SESSIONS_FILE" > "$tmp"
-      mv "$tmp" "$SESSIONS_FILE"
+      done < "$SESSIONS_FILE" > "$tmp"; then
+        write_ok=false
+      fi
+      if [[ "$write_ok" != "true" ]] || ! mv -f "$tmp" "$SESSIONS_FILE"; then
+        rm -f "$tmp"
+        return 1
+      fi
     fi
-    return
+    return 0
   fi
 
-  # New entry
-  echo "${session_id}|${name}|${timestamp}|${cwd}" >> "$SESSIONS_FILE"
+  # New entry: copy the current index plus the new row into our temp file,
+  # then rename it into place (same transaction rules as above).
+  tmp=$(mktemp "$SESSIONS_FILE.XXXXXX") || return 1
+  [[ -n "$tmp" ]] || return 1
+  if [[ -f "$SESSIONS_FILE" ]] && ! cat "$SESSIONS_FILE" > "$tmp"; then
+    write_ok=false
+  fi
+  if [[ "$write_ok" != "true" ]] || ! echo "${session_id}|${name}|${timestamp}|${cwd}" >> "$tmp" \
+      || ! mv -f "$tmp" "$SESSIONS_FILE"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
 }
 
 # --- Refresh stale names in the sessions file ---
@@ -564,13 +677,19 @@ sync_sessions() {
 
 # --- Display session list ---
 list_sessions() {
-  sync_sessions
+  # Import/refresh the index only while holding the lock; if it is busy,
+  # list the index as it is without modifying it.
+  if registry_lock; then
+    sync_sessions
+    if [[ -f "$SESSIONS_FILE" ]] && [[ -s "$SESSIONS_FILE" ]]; then
+      refresh_session_names
+    fi
+    registry_unlock
+  fi
 
   if [[ ! -f "$SESSIONS_FILE" ]] || [[ ! -s "$SESSIONS_FILE" ]]; then
     return 1
   fi
-
-  refresh_session_names
 
   # Clean up previous filtered file if any
   if [[ -n "${FILTERED_FILE:-}" ]] && [[ -f "$FILTERED_FILE" ]]; then
@@ -639,6 +758,7 @@ list_sessions() {
   fi
   echo -e "  ${BOLD}${GREEN}n)${RESET} New session"
   echo -e "  ${BOLD}${YELLOW}d)${RESET} Delete a session"
+  echo -e "  ${BOLD}${YELLOW}c)${RESET} Clean up empty sessions (recoverable)"
   echo -e "  ${BOLD}q)${RESET} Quit"
   echo ""
   return 0
@@ -684,6 +804,10 @@ post_session() {
 
   case "${action:-}" in
     d|D)
+      if [[ -f "$SESSIONS_FILE" ]] && ! registry_lock; then
+        echo -e "${YELLOW}Session not deleted (session list busy). Delete it later from the menu.${RESET}"
+        return 0
+      fi
       # Remove from sessions file
       if [[ -f "$SESSIONS_FILE" ]]; then
         local tmp
@@ -695,6 +819,7 @@ post_session() {
           fi
         done < "$SESSIONS_FILE" > "$tmp"
         mv "$tmp" "$SESSIONS_FILE"
+        registry_unlock
       fi
       # Remove from disk
       rm -rf "$session_dir"
@@ -710,13 +835,19 @@ post_session() {
       if [[ -n "$new_name" ]]; then
         display_name="$new_name"
       fi
-      save_session "$session_id" "$display_name" "$created_at" "$cwd" "true"
-      echo -e "${GREEN}Session saved:${RESET} ${display_name} ${DIM}[${session_id:0:8}…]${RESET}"
+      if save_session "$session_id" "$display_name" "$created_at" "$cwd" "true"; then
+        echo -e "${GREEN}Session saved:${RESET} ${display_name} ${DIM}[${session_id:0:8}…]${RESET}"
+      else
+        echo -e "${YELLOW}Session kept, but the new name was NOT saved (the session list file was not replaced). Rename it later from the menu.${RESET} ${DIM}[${session_id:0:8}…]${RESET}"
+      fi
       ;;
     *)
       # Keep with current name (default)
-      save_session "$session_id" "$display_name" "$created_at" "$cwd"
-      echo -e "${GREEN}Session kept:${RESET} ${display_name} ${DIM}[${session_id:0:8}…]${RESET}"
+      if save_session "$session_id" "$display_name" "$created_at" "$cwd"; then
+        echo -e "${GREEN}Session kept:${RESET} ${display_name} ${DIM}[${session_id:0:8}…]${RESET}"
+      else
+        echo -e "${YELLOW}Session kept, but its session-list entry was NOT updated (it is re-imported on a later listing).${RESET} ${DIM}[${session_id:0:8}…]${RESET}"
+      fi
       ;;
   esac
 }
@@ -968,7 +1099,12 @@ delete_session() {
       del_lookup="${del_lookup}${did}:"
     done
 
-    # Rewrite sessions file excluding deleted IDs
+    # Rewrite sessions file excluding deleted IDs (nothing is deleted if the
+    # session list is busy).
+    if ! registry_lock; then
+      echo "Cancelled — session list busy. Nothing was deleted."
+      return
+    fi
     local tmp
     tmp=$(mktemp)
     while IFS='|' read -r eid ename ets ecwd; do
@@ -978,6 +1114,7 @@ delete_session() {
       fi
     done < "$SESSIONS_FILE" > "$tmp"
     mv "$tmp" "$SESSIONS_FILE"
+    registry_unlock
 
     # Remove session state directories from disk — but ingest any pending
     # usage into the Task report FIRST for each one, so bulk-deleting
@@ -995,6 +1132,56 @@ delete_session() {
   else
     echo "Cancelled."
   fi
+}
+
+# --- Recoverable cleanup of empty sessions (menu option c) ---
+# Scope follows what the list is showing: the exact current directory, or
+# every directory when the list shows all sessions. The helper's preview is
+# read-only; only the exact previewed candidates are passed to `apply`, which
+# re-validates each one and moves it into ~/.copilot-s-quarantine (never
+# deletes). Any helper failure is shown and leaves the session list usable.
+cleanup_empty_sessions() {
+  if [[ ! -f "$SESSION_CLEANUP_HELPER" ]]; then
+    echo -e "${RED}Session cleanup helper not found at $SESSION_CLEANUP_HELPER — nothing was changed. Set COPILOT_SESSION_CLEANUP_HELPER or re-run the installer.${RESET}" >&2
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo -e "${RED}python3 not found — nothing was changed.${RESET}" >&2; return 0; }
+
+  local -a path_args=(--session-state-dir "$SESSION_STATE_DIR" --sessions-file "$SESSIONS_FILE" --quarantine-dir "$SESSION_QUARANTINE_DIR")
+  local -a scope_args=(--cwd "$PWD")
+  [[ "$SHOW_ALL" == "true" ]] && scope_args=(--all)
+
+  local out="" rc=0 line tab=$'\t'
+  local -a candidates=()
+  out=$(python3 "$SESSION_CLEANUP_HELPER" "${path_args[@]}" preview "${scope_args[@]}") || rc=$?
+  echo ""
+  while IFS= read -r line; do
+    if [[ "$line" == "CANDIDATE${tab}"* ]]; then
+      candidates+=("${line#"CANDIDATE${tab}"}")
+    else
+      echo "$line"
+    fi
+  done <<< "$out"
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${RED}Cleanup preview failed (exit $rc) — nothing was changed.${RESET}" >&2
+    return 0
+  fi
+  [[ ${#candidates[@]} -eq 0 ]] && return 0
+
+  echo -ne "${YELLOW}Type 'yes' to move ${#candidates[@]} session(s) to quarantine (anything else cancels): ${RESET}"
+  local confirm=""
+  prompt_read confirm
+  if [[ "$confirm" != "yes" ]]; then
+    echo "Cancelled. Nothing was changed."
+    return 0
+  fi
+
+  rc=0
+  printf '%s\n' "${candidates[@]}" | python3 "$SESSION_CLEANUP_HELPER" "${path_args[@]}" apply "${scope_args[@]}" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${YELLOW}Warning: cleanup finished with problems (exit $rc) — see above. Nothing was deleted.${RESET}" >&2
+  fi
+  return 0
 }
 
 # --- Interactive menu ---
@@ -1025,6 +1212,23 @@ select_session() {
       else
         echo -e "\n${DIM}No sessions left. Starting a new one...${RESET}\n"
         run_copilot "" "$@"
+      fi
+      ;;
+    c|C)
+      cleanup_empty_sessions
+      # Never auto-launch a new session after cleanup.
+      if list_sessions; then
+        select_session "$@"
+      elif [[ "$SHOW_ALL" != "true" ]]; then
+        SHOW_ALL=true
+        if list_sessions; then
+          echo -e "${DIM}  No sessions left for current directory. Showing all.${RESET}\n"
+          select_session "$@"
+        else
+          echo -e "\n${DIM}No sessions left. Run copilot-s again to start a new one.${RESET}"
+        fi
+      else
+        echo -e "\n${DIM}No sessions left. Run copilot-s again to start a new one.${RESET}"
       fi
       ;;
     *)
@@ -1080,6 +1284,11 @@ ${BOLD}Features:${RESET}
   - Copilot launches use Auto with the Balance tier; organization model
     policies may still restrict routing
   - Resume, rename, or delete sessions (single/range/multi-select)
+  - Clean up empty sessions (menu \`c\`): previews never-used, unnamed
+    sessions older than 24h in the listed scope and, after you type
+    \`yes\`, moves them to ~/.copilot-s-quarantine (recoverable, never
+    deleted). Restore with:
+    copilot-session-cleanup.py restore --batch <batch>
   - Prompts to keep/rename/delete a session when \`copilot\` exits
   - For sessions created by copilot-s from now on: shows the context fill
     last observed before a compaction and the successful compaction count
@@ -1091,6 +1300,7 @@ ${BOLD}Features:${RESET}
 ${BOLD}Environment:${RESET}
   COPILOT_TASK_REPORTS_DIR       Override where task usage reports are written
   COPILOT_TASK_REPORT_HELPER     Override the path to copilot-task-report.py
+  COPILOT_SESSION_CLEANUP_HELPER Override the path to copilot-session-cleanup.py
 
 Verify install with: copilot-s --help
 EOF

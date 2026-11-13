@@ -20,6 +20,7 @@ tests. Self-contained: stdlib-only (unittest), no network, no writes
 outside per-test temp directories.
 """
 
+import fcntl
 import json
 import os
 import pty
@@ -36,6 +37,7 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COPILOT_S = os.path.join(REPO_ROOT, "bin", "copilot-s")
 TASK_HELPER = os.path.join(REPO_ROOT, "bin", "copilot-task-report.py")
+CLEANUP_HELPER = os.path.join(REPO_ROOT, "bin", "copilot-session-cleanup.py")
 INSTALL_SH = os.path.join(REPO_ROOT, "scripts", "install.sh")
 UNINSTALL_SH = os.path.join(REPO_ROOT, "scripts", "uninstall.sh")
 
@@ -59,6 +61,11 @@ class BaseHomeTestCase(unittest.TestCase):
     def env(self, extra=None):
         e = dict(os.environ)
         e["HOME"] = self.home
+        for key in (
+            "COPILOT_TASK_REPORTS_DIR", "COPILOT_TASK_REPORT_HELPER",
+            "COPILOT_SESSION_CLEANUP_HELPER",
+        ):
+            e.pop(key, None)
         # Any real task-report helper reached by a shell subprocess must
         # remain network-free, even if the ambient environment enables
         # automatic official-price refreshes.
@@ -193,7 +200,7 @@ class TestHelperResolution(BaseHomeTestCase):
     resolved location, regardless of symlink vs --copy install mode or
     --prefix, with an env override taking priority."""
 
-    def _resolved_helper_path(self, copilot_s_path, extra_env=None):
+    def _resolved_helper_path(self, copilot_s_path, extra_env=None, variable="TASK_REPORT_HELPER"):
         # `--version` exits before any task-report work, so use `bash -x`
         # to observe the TASK_REPORT_HELPER assignment without needing a
         # tty or a real `copilot` binary on PATH.
@@ -205,9 +212,9 @@ class TestHelperResolution(BaseHomeTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for line in result.stderr.splitlines():
             line = line.strip()
-            if line.startswith("+ TASK_REPORT_HELPER="):
+            if line.startswith("+ " + variable + "="):
                 return line.split("=", 1)[1]
-        self.fail(f"TASK_REPORT_HELPER assignment not observed in:\n{result.stderr}")
+        self.fail(f"{variable} assignment not observed in:\n{result.stderr}")
 
     def test_symlink_install_resolves_helper_next_to_repo(self):
         run([INSTALL_SH], env=self.env(), check=True)
@@ -264,6 +271,58 @@ class TestHelperResolution(BaseHomeTestCase):
 
         resolved = self._resolved_helper_path(standalone_copilot_s)
         self.assertEqual(resolved, fallback_helper)
+
+
+class TestCleanupHelperDistribution(BaseHomeTestCase):
+    _resolved_helper_path = TestHelperResolution._resolved_helper_path
+
+    def test_cleanup_helper_install_modes_and_uninstall_preserve_quarantine(self):
+        quarantine = os.path.join(self.home, ".copilot-s-quarantine")
+        os.makedirs(quarantine, mode=0o700)
+        sentinel = os.path.join(quarantine, "recoverable-session")
+        with open(sentinel, "wb") as handle:
+            handle.write(b"recoverable data")
+        registry = os.path.join(self.home, ".copilot-sessions")
+        with open(registry, "w", encoding="utf-8") as handle:
+            handle.write("existing|Preserve me|timestamp|/worktree\n")
+        for copy_mode, custom in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(copy=copy_mode, custom_prefix=custom):
+                prefix = os.path.join(self.home, "custom", "bin") if custom else os.path.join(
+                    self.home, ".local", "bin"
+                )
+                arguments = ["--copy"] if copy_mode else []
+                if custom:
+                    arguments += ["--prefix", prefix]
+                result = run([INSTALL_SH, *arguments], env=self.env())
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                installed = os.path.join(prefix, "copilot-session-cleanup.py")
+                launcher = os.path.join(prefix, "copilot-s")
+                self.assertEqual(os.path.islink(installed), not copy_mode)
+                self.assertTrue(os.access(installed, os.X_OK))
+                resolved = self._resolved_helper_path(
+                    launcher, variable="SESSION_CLEANUP_HELPER"
+                )
+                expected = installed if copy_mode else CLEANUP_HELPER
+                self.assertEqual(os.path.realpath(resolved), os.path.realpath(expected))
+                override = os.path.join(self.home, "override-cleanup.py")
+                self.assertEqual(
+                    self._resolved_helper_path(
+                        launcher, {"COPILOT_SESSION_CLEANUP_HELPER": override},
+                        variable="SESSION_CLEANUP_HELPER",
+                    ), override,
+                )
+                smoke = run([sys.executable, installed, "list"], env=self.env())
+                self.assertEqual(smoke.returncode, 0, smoke.stdout + smoke.stderr)
+                manifest = os.path.join(self.home, ".copilot-cli-toolkit", "install-manifest.txt")
+                with open(manifest, encoding="utf-8") as handle:
+                    self.assertIn(installed, handle.read().splitlines())
+                removed = run([UNINSTALL_SH], env=self.env())
+                self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+                self.assertFalse(os.path.lexists(installed))
+                with open(sentinel, "rb") as handle:
+                    self.assertEqual(handle.read(), b"recoverable data")
+                with open(registry, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "existing|Preserve me|timestamp|/worktree\n")
 
 
 class TestMissingHelperIsVisibleNotSilent(BaseHomeTestCase):
@@ -410,7 +469,7 @@ class TestSessionNameEventsPathIsSafe(BaseHomeTestCase):
         self.assertFalse(os.path.exists("pwned"))
 
 
-class TestInstallerHelpNotTruncated(unittest.TestCase):
+class TestInstallerHelpNotTruncated(BaseHomeTestCase):
     """install.sh/uninstall.sh --help must print the *entire* header
     comment block, not a brittle fixed line range that silently truncates
     when the header grows."""
@@ -427,7 +486,7 @@ class TestInstallerHelpNotTruncated(unittest.TestCase):
         return lines
 
     def test_install_help_prints_full_header(self):
-        result = run([INSTALL_SH, "--help"], env=dict(os.environ))
+        result = run([INSTALL_SH, "--help"], env=self.env())
         self.assertEqual(result.returncode, 0, result.stderr)
         header_lines = self._header_comment_lines(INSTALL_SH)
         # Every non-trivial line of the header comment must appear in the
@@ -438,7 +497,7 @@ class TestInstallerHelpNotTruncated(unittest.TestCase):
                 self.assertIn(text, result.stdout, f"missing header line: {text!r}")
 
     def test_uninstall_help_prints_full_header(self):
-        result = run([UNINSTALL_SH, "--help"], env=dict(os.environ))
+        result = run([UNINSTALL_SH, "--help"], env=self.env())
         self.assertEqual(result.returncode, 0, result.stderr)
         header_lines = self._header_comment_lines(UNINSTALL_SH)
         for line in header_lines:
@@ -627,6 +686,8 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
 
         ``input_burst`` is a (prompt marker, text) pair used to simulate
         multiple lines pasted together while the first prompt is displayed.
+        An action response may be a callable returning text, for changes
+        synchronized with a real prompt (such as acquiring a test flock).
         """
         pid, master = pty.fork()
         if pid == 0:
@@ -676,6 +737,8 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                         marker, response = actions[action_index]
                         if marker.encode() not in output:
                             break
+                        if callable(response):
+                            response = response()
                         os.write(master, response.encode())
                         action_index += 1
                 if status is None:
@@ -745,6 +808,121 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
     def _session_rows(self):
         with open(self.sessions_file, encoding="utf-8") as f:
             return [line.rstrip("\n").split("|") for line in f if line.strip()]
+
+    def _cleanup_fixture(self, number, cwd=None):
+        session_id = "12345678-1234-1234-abcd-%012x" % number
+        directory = os.path.join(self.state_dir, session_id)
+        os.makedirs(directory)
+        with open(os.path.join(directory, "workspace.yaml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                "id: %s\ncwd: %s\nuser_named: false\n"
+                "created_at: 2020-01-01T00:00:00Z\nupdated_at: 2020-01-01T00:00:00Z\n"
+                % (session_id, cwd or self.cwd)
+            )
+        os.utime(os.path.join(directory, "workspace.yaml"), (1577836800, 1577836800))
+        os.utime(directory, (1577836800, 1577836800))
+        return session_id, directory
+
+    def _cleanup_env(self):
+        # The launcher invokes the real helper through a test-only import
+        # wrapper patching time, never eligibility or the activity probe.
+        wrapper = os.path.join(self.home, "cleanup-clock-fixture.py")
+        with open(wrapper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import importlib.util, sys, time\n"
+                "from unittest import mock\n"
+                "spec = importlib.util.spec_from_file_location('cleanup', %r)\n"
+                "cleanup = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(cleanup)\n"
+                "with mock.patch.object(cleanup, 'now_epoch', return_value=time.time() + 172800):\n"
+                "    sys.exit(cleanup.main())\n" % CLEANUP_HELPER
+            )
+        lsof = os.path.join(self.fake_bin, "lsof")
+        with open(lsof, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 1\n")
+        os.chmod(lsof, 0o755)
+        return self._env({"COPILOT_SESSION_CLEANUP_HELPER": wrapper})
+
+    def test_cleanup_current_scope_leaves_foreign_and_named_sessions_usable(self):
+        local, local_dir = self._cleanup_fixture(1)
+        foreign, foreign_dir = self._cleanup_fixture(2, cwd=os.path.join(self.home, "other"))
+        kept_dir = self._session("named-kept", name="Keep this named session")
+        status, output, actions = self._run_tty(
+            self._cleanup_env(),
+            actions=[
+                ("Select session to resume", "c\n"),
+                ("Type 'yes' to move 1 session(s)", "yes\n"),
+                ("Moved: 1", "q\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 3, output)
+        self.assertFalse(os.path.exists(local_dir), output)
+        self.assertTrue(os.path.isdir(foreign_dir))
+        self.assertTrue(os.path.isdir(kept_dir))
+        self.assertNotIn(local, [row[0] for row in self._session_rows()])
+        self.assertIn(foreign, [row[0] for row in self._session_rows()])
+        self.assertFalse(os.path.exists(self.copilot_log), output)
+        self.assertIn("Bye!", output)
+
+    def test_cleanup_all_final_empty_list_never_auto_launches_copilot(self):
+        _, first_dir = self._cleanup_fixture(1)
+        _, second_dir = self._cleanup_fixture(2, cwd=os.path.join(self.home, "other"))
+        status, output, actions = self._run_tty(
+            self._cleanup_env(), copilot_s_args=["--all"],
+            actions=[
+                ("Select session to resume", "c\n"),
+                ("Type 'yes' to move 2 session(s)", "yes\n"),
+            ],
+        )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertIn("Moved: 2", output)
+        self.assertIn("No sessions left. Run copilot-s again", output)
+        self.assertFalse(os.path.exists(first_dir))
+        self.assertFalse(os.path.exists(second_dir))
+        self.assertFalse(os.path.exists(self.copilot_log), output)
+        quarantine = os.path.join(self.home, ".copilot-s-quarantine")
+        self.assertEqual(len(os.listdir(quarantine)), 1)
+
+    def test_cleanup_confirmation_cancels_padded_yes_enter_and_terminal_eof(self):
+        _, directory = self._cleanup_fixture(1)
+        environment = self._cleanup_env()
+        for answer in ("Yes\n", " yes\n", "yes \n", "\n", "\x04"):
+            with self.subTest(answer=answer):
+                status, output, actions = self._run_tty(
+                    environment,
+                    actions=[
+                        ("Select session to resume", "c\n"),
+                        ("Type 'yes' to move 1 session(s)", answer),
+                        ("Cancelled. Nothing was changed.", "q\n"),
+                    ],
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(actions, 3, output)
+                self.assertTrue(os.path.isdir(directory))
+                self.assertFalse(os.path.exists(os.path.join(self.home, ".copilot-s-quarantine")))
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_missing_cleanup_helper_and_preview_error_leave_normal_menu_usable(self):
+        self._session("cleanup-visible", name="Still usable")
+        failing = os.path.join(self.home, "failing-cleanup.py")
+        with open(failing, "w", encoding="utf-8") as handle:
+            handle.write("import sys\nprint('fixture preview error', file=sys.stderr)\nsys.exit(7)\n")
+        for helper, marker in (
+            (os.path.join(self.home, "missing.py"), "Session cleanup helper not found"),
+            (failing, "Cleanup preview failed (exit 7)"),
+        ):
+            with self.subTest(helper=helper):
+                status, output, actions = self._run_tty(
+                    self._env({"COPILOT_SESSION_CLEANUP_HELPER": helper}),
+                    actions=[("Select session to resume", "c\n"), (marker, "q\n")],
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(actions, 2, output)
+                self.assertIn("Still usable", output)
+                self.assertIn("Bye!", output)
+                self.assertFalse(os.path.exists(self.copilot_log))
 
     def test_fresh_session_enrolls_exact_id_and_prints_metrics_before_keep_prompt(self):
         status, output, actions = self._run_tty(
@@ -1213,6 +1391,46 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertEqual(self._native_name("aliased-session"), "Native title")
         self.assertEqual(self._session_rows()[0][1], "Wrapper alias")
 
+    def _assert_post_session_save_is_honest_under_held_flock(self, rename):
+        session_id = "busy-save-session"
+        directory = self._session(session_id, name="Native title")
+        original = "%s|Original wrapper alias|2026-10-13T10:00:00Z|%s\n" % (
+            session_id, self.cwd,
+        )
+        with open(self.sessions_file, "w", encoding="utf-8") as handle:
+            handle.write(original)
+        lock_path = self.sessions_file + ".lock"
+        with open(lock_path, "a", encoding="utf-8") as holder:
+            def hold_at_prompt():
+                # Initial listing must finish normally before contention.
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return "r\n" if rename else "k\n"
+            actions = [
+                ("Select session to resume", "1\n"),
+                ("[K/r/d]:", hold_at_prompt),
+            ]
+            if rename:
+                actions.append(("New name:", "Unsaved new alias\n"))
+            status, output, answered = self._run_tty(
+                self._env({"FAKE_COPILOT_MODE": "idle"}), actions=actions,
+            )
+        self.assertEqual(status, 0, output)
+        self.assertEqual(answered, len(actions), output)
+        self.assertIn("NOT saved" if rename else "NOT updated", output)
+        self.assertIn("session list is busy", output)
+        self.assertNotIn("Session saved:", output)
+        self.assertNotIn("Session kept:", output)
+        with open(self.sessions_file, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), original)
+        self.assertTrue(os.path.isdir(directory))
+        self.assertEqual(self._native_name(session_id), "Native title")
+
+    def test_exit_menu_rename_under_held_flock_does_not_claim_save(self):
+        self._assert_post_session_save_is_honest_under_held_flock(rename=True)
+
+    def test_exit_menu_keep_under_held_flock_does_not_claim_update(self):
+        self._assert_post_session_save_is_honest_under_held_flock(rename=False)
+
     def test_pipe_in_new_session_name_does_not_corrupt_session_fields(self):
         status, output, actions = self._run_tty(
             self._env({
@@ -1532,6 +1750,148 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertIn("Bye!", output)
         self.assertFalse(os.path.exists(self.copilot_log))
         self.assertEqual(self._commands("context-update"), [])
+
+
+class TestRegistryLockSafety(BaseHomeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.registry = os.path.join(self.home, ".copilot-sessions")
+        self.original = "lock-fixture|Original alias|timestamp|/worktree\n"
+        with open(self.registry, "w", encoding="utf-8") as handle:
+            handle.write(self.original)
+        self.sourceable = os.path.join(self.home, "launcher-sourceable")
+        with open(COPILOT_S, encoding="utf-8") as handle:
+            lines = handle.readlines()
+        self.assertEqual(lines[-1].strip(), 'main "$@"')
+        with open(self.sourceable, "w", encoding="utf-8") as handle:
+            handle.writelines(lines[:-1])
+
+    def _save(self, extra_env=None, session_id="lock-fixture"):
+        environment = {
+            "PATH": os.path.dirname(sys.executable) + ":/usr/bin:/bin",
+        }
+        environment.update(extra_env or {})
+        return run(
+            ["bash", "-c",
+             'source "$1"; save_session "$2" "Changed alias" "timestamp" "/worktree" true',
+             "_", self.sourceable, session_id],
+            env=self.env(environment), timeout=15,
+        )
+
+    def test_busy_registry_lock_never_allows_an_unlocked_rewrite(self):
+        os.mkdir(self.registry + ".lock")
+        result = self._save()
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        with open(self.registry, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), self.original, result.stderr)
+        self.assertTrue(os.path.isdir(self.registry + ".lock"))
+
+    def test_real_held_flock_blocks_mutation_then_release_allows_save(self):
+        lock_path = self.registry + ".lock"
+        with open(lock_path, "a", encoding="utf-8") as holder:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            inode = os.stat(lock_path).st_ino
+            result = self._save()  # Real production ten-second lock timeout.
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("busy", result.stderr)
+            self.assertIn("left unchanged", result.stderr)
+            with open(self.registry, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), self.original)
+            self.assertEqual(os.stat(lock_path).st_ino, inode)
+            with open(lock_path, "a", encoding="utf-8") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = self._save()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(self.registry, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), self.original.replace("Original alias", "Changed alias"))
+        self.assertEqual(os.stat(lock_path).st_ino, inode, "lock file must persist")
+
+    def test_launcher_inherited_flock_is_held_during_actual_registry_rewrite(self):
+        fake_bin = os.path.join(self.home, "fake-bin")
+        os.mkdir(fake_bin)
+        probe = os.path.join(fake_bin, "mv")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write(
+                "#!%s\n"
+                "import fcntl, os, sys\n"
+                "with open(os.path.join(os.environ['HOME'], '.copilot-sessions.lock'), 'a') as lock:\n"
+                "    try:\n"
+                "        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "    except BlockingIOError:\n"
+                "        pass\n"
+                "    else:\n"
+                "        sys.exit('launcher lock was released before rewrite')\n"
+                "os.execv('/bin/mv', ['/bin/mv', *sys.argv[1:]])\n" % sys.executable
+            )
+        os.chmod(probe, 0o755)
+        result = self._save({
+            "PATH": fake_bin + ":" + os.path.dirname(sys.executable) + ":/usr/bin:/bin",
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(self.registry, encoding="utf-8") as handle:
+            self.assertIn("Changed alias", handle.read())
+        with open(self.registry + ".lock", "a", encoding="utf-8") as contender:
+            fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _assert_failed_save_preserves_original_and_cleans_only_own_temp(self, command):
+        fake_bin = os.path.join(self.home, "failing-bin")
+        os.mkdir(fake_bin)
+        log_path = os.path.join(self.home, "failed-command.json")
+        fake_command = os.path.join(fake_bin, command)
+        with open(fake_command, "w", encoding="utf-8") as handle:
+            handle.write(
+                "#!%s\n"
+                "import json, os, sys\n"
+                "with open(os.environ['FAIL_COMMAND_LOG'], 'w') as log:\n"
+                "    json.dump(sys.argv[1:], log)\n"
+                "print('fixture command failure', file=sys.stderr)\n"
+                "sys.exit(42)\n" % sys.executable
+            )
+        os.chmod(fake_command, 0o755)
+        sentinel = self.registry + ".unrelated"
+        with open(sentinel, "wb") as handle:
+            handle.write(b"not this transaction's temp")
+        with open(self.registry + ".lock", "a", encoding="utf-8"):
+            pass
+        original_inode = os.stat(self.registry).st_ino
+        expected_paths = {name for name in os.listdir(self.home) if name.startswith(".copilot-sessions.")}
+        for session_id in ("lock-fixture", "new-row-fixture"):
+            with self.subTest(command=command, session_id=session_id):
+                result = self._save({
+                    "PATH": fake_bin + ":" + os.path.dirname(sys.executable) + ":/usr/bin:/bin",
+                    "FAIL_COMMAND_LOG": log_path,
+                }, session_id=session_id)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("fixture command failure", result.stderr)
+                with open(self.registry, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), self.original)
+                self.assertEqual(os.stat(self.registry).st_ino, original_inode)
+                self.assertEqual(
+                    {name for name in os.listdir(self.home) if name.startswith(".copilot-sessions.")},
+                    expected_paths, "only this transaction's temp may be cleaned",
+                )
+                with open(sentinel, "rb") as handle:
+                    self.assertEqual(handle.read(), b"not this transaction's temp")
+                with open(log_path, encoding="utf-8") as handle:
+                    arguments = json.load(handle)
+                if command == "mktemp":
+                    self.assertEqual(arguments, [self.registry + ".XXXXXX"])
+                else:
+                    self.assertEqual(arguments[0], "-f")
+                    self.assertEqual(arguments[-1], self.registry)
+                    temporary = arguments[1]
+                    self.assertEqual(os.path.dirname(temporary), self.home)
+                    self.assertTrue(temporary.startswith(self.registry + "."))
+                    self.assertFalse(os.path.lexists(temporary))
+                with open(self.registry + ".lock", "a", encoding="utf-8") as contender:
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_mktemp_failure_preserves_old_and_new_row_transactions(self):
+        self._assert_failed_save_preserves_original_and_cleans_only_own_temp("mktemp")
+
+    def test_mv_failure_preserves_old_and_new_row_transactions_and_removes_temp(self):
+        self._assert_failed_save_preserves_original_and_cleans_only_own_temp("mv")
 
 
 class TestNormalizeAndValidateTaskFastPathStderr(BaseHomeTestCase):
