@@ -1140,6 +1140,9 @@ delete_session() {
 # read-only; only the exact previewed candidates are passed to `apply`, which
 # re-validates each one and moves it into ~/.copilot-s-quarantine (never
 # deletes). Any helper failure is shown and leaves the session list usable.
+# Before the preview, an explicit opt-in (default No) can include recent
+# empty sessions (no 24h minimum age); the same --include-recent choice is
+# passed to both preview and apply, and the helper refuses a mismatch.
 cleanup_empty_sessions() {
   if [[ ! -f "$SESSION_CLEANUP_HELPER" ]]; then
     echo -e "${RED}Session cleanup helper not found at $SESSION_CLEANUP_HELPER — nothing was changed. Set COPILOT_SESSION_CLEANUP_HELPER or re-run the installer.${RESET}" >&2
@@ -1151,9 +1154,23 @@ cleanup_empty_sessions() {
   local -a scope_args=(--cwd "$PWD")
   [[ "$SHOW_ALL" == "true" ]] && scope_args=(--all)
 
+  # Opt-in only: anything other than y/yes (including Enter or EOF) keeps the
+  # default 24h minimum age.
+  local -a policy_args=()
+  local include_recent=""
+  echo -ne "${YELLOW}Also include recent empty sessions (created or changed within the last 24h)? [y/N]: ${RESET}"
+  prompt_read include_recent
+  case "$include_recent" in
+    y|Y|yes|YES|Yes)
+      policy_args=(--include-recent)
+      echo -e "${YELLOW}Recent sessions included. Warning: a recent empty session may have been created moments ago (e.g. by a Copilot that is still starting — its origin is not known) and could start being used right after the open-file check. That race is accepted: sessions are only moved to quarantine and can be restored.${RESET}"
+      ;;
+  esac
+
   local out="" rc=0 line tab=$'\t'
   local -a candidates=()
-  out=$(python3 "$SESSION_CLEANUP_HELPER" "${path_args[@]}" preview "${scope_args[@]}") || rc=$?
+  out=$(python3 "$SESSION_CLEANUP_HELPER" "${path_args[@]}" preview "${scope_args[@]}" \
+    "${policy_args[@]+"${policy_args[@]}"}") || rc=$?
   echo ""
   while IFS= read -r line; do
     if [[ "$line" == "CANDIDATE${tab}"* ]]; then
@@ -1177,7 +1194,8 @@ cleanup_empty_sessions() {
   fi
 
   rc=0
-  printf '%s\n' "${candidates[@]}" | python3 "$SESSION_CLEANUP_HELPER" "${path_args[@]}" apply "${scope_args[@]}" || rc=$?
+  printf '%s\n' "${candidates[@]}" | python3 "$SESSION_CLEANUP_HELPER" "${path_args[@]}" apply "${scope_args[@]}" \
+    "${policy_args[@]+"${policy_args[@]}"}" || rc=$?
   if [[ $rc -ne 0 ]]; then
     echo -e "${YELLOW}Warning: cleanup finished with problems (exit $rc) — see above. Nothing was deleted.${RESET}" >&2
   fi
@@ -1285,8 +1303,9 @@ ${BOLD}Features:${RESET}
     policies may still restrict routing
   - Resume, rename, or delete sessions (single/range/multi-select)
   - Clean up empty sessions (menu \`c\`): previews never-used, unnamed
-    sessions older than 24h in the listed scope and, after you type
-    \`yes\`, moves them to ~/.copilot-s-quarantine (recoverable, never
+    sessions older than 24h in the listed scope (answer \`y\` to the
+    first prompt to also include recent ones, default No) and, after you
+    type \`yes\`, moves them to ~/.copilot-s-quarantine (recoverable, never
     deleted). Restore with:
     copilot-session-cleanup.py restore --batch <batch>
   - Prompts to keep/rename/delete a session when \`copilot\` exits

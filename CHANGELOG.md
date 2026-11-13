@@ -6,6 +6,36 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Added — opt-in cleanup of recent empty sessions (recent-empty-option-20261113-c1)
+
+- Menu `c` now first asks whether to also include recent empty sessions
+  (created or changed within the last 24h), default No. Opting in passes
+  the new `copilot-session-cleanup.py --include-recent` flag to both
+  `preview` and `apply`; it waives only the 24h minimum age (timestamps must
+  still not be in the future) and keeps every other eligibility, activity,
+  fingerprint, lock, and no-replace check. Previewed candidate lines carry
+  an `include-recent` marker and `apply` refuses any preview/apply mismatch
+  before moving anything; the batch manifest's `scope` records
+  `include_recent`. The preview warns that a recent empty session's origin
+  is unknown and that a race with a starting Copilot is accepted because
+  quarantine is recoverable. The exact `yes` confirmation is unchanged;
+  `list`/`restore` and existing batches are unaffected.
+
+### Fixed — empty-session cleanup recognizes the empty session scaffold (empty-scaffold-fix-20261113-c1)
+
+- `copilot-session-cleanup.py` (menu `c`) kept never-used sessions whose
+  directory also held Copilot's empty scaffold, reporting them as "has
+  session history or other files". It now also accepts exactly
+  `workspace.yaml` plus the complete, untouched scaffold (empty regular
+  `.workspace-fork.lock`, empty `files/` and `research/`, and
+  `checkpoints/` with only the header-only `index.md`), verified through
+  no-follow descriptors (owner, type, single link, exact bytes). Partial or
+  modified scaffolds, symlinks, extra entries, and any history are still
+  kept. The preview fingerprint now covers every scaffold item and is
+  re-checked before and after the move and on restore; the open-file check
+  includes the scaffold paths. Workspace-only fingerprints are unchanged,
+  so existing quarantine batches still restore.
+
 ### Added — recoverable empty-session cleanup (cleanup-empty-sessions-20261113-c1)
 
 - New `copilot-s` menu option `c) Clean up empty sessions (recoverable)`

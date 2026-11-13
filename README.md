@@ -249,17 +249,40 @@ removed.
 - **Scope:** the current directory's exact cwd, or every directory when the
   list is showing all sessions (`--all`/`a`).
 - **Eligible only if all hold:** the directory is an exact UUID and contains
-  only a regular `workspace.yaml` (any `events.jsonl`, even empty, or other
-  file excludes it); the metadata is plain scalars with `user_named: false`,
-  no native name/summary, and `updated_at` within 1s of `created_at`; it
-  was created, and last modified on disk, more than 24h ago; it has no
-  custom name in `~/.copilot-sessions`; its ID is not in the current
-  environment; and `lsof` (macOS/Linux) positively reports it is not open.
-  If any check is unavailable or fails, the session is kept.
+  only a regular `workspace.yaml` — alone, or together with the complete,
+  untouched empty scaffold some Copilot CLI versions create for a never-used
+  session: an empty `.workspace-fork.lock`, empty `files/` and `research/`
+  directories, and `checkpoints/` holding only an `index.md` that is exactly
+  the empty "Checkpoint History" table header. A partial scaffold, any
+  symlink or hard-linked file, foreign owner, extra entry, non-empty lock,
+  checkpoint row, or any `events.jsonl`/`session.db`/other file (even
+  empty) excludes it. The metadata is plain scalars with
+  `user_named: false`, no native name/summary, and `updated_at` within 1s of
+  `created_at`; it was created, and it and every scaffold item last
+  modified on disk, more than 24h ago; it has no custom name in
+  `~/.copilot-sessions`; its ID is not in the current environment; and
+  `lsof` (macOS/Linux) positively reports that neither the directory nor
+  any of its files/directories (including the lock) is open. If any check
+  is unavailable or fails, the session is kept.
+- **Recent empty sessions (opt-in, default No):** before the preview, menu
+  `c` asks `Also include recent empty sessions (created or changed within
+  the last 24h)? [y/N]`. Only `y`/`yes` opts in; Enter or anything else
+  keeps the 24h minimum age. Opting in removes **only** the minimum age:
+  timestamps must still be valid, `updated_at` within 1s of `created_at`,
+  and no timestamp may be in the future; every other check above is
+  unchanged. The helper equivalent is `--include-recent`, which must be
+  passed to both `preview` and `apply` (`apply` refuses the whole request if
+  the previewed candidates were produced with a different choice). A recent
+  empty session may have been created moments ago — by a Copilot that is
+  still starting, or by something else; its origin is not known — and could
+  start being used right after the open-file check. That race is accepted
+  because the session is only moved to quarantine and can be restored; the
+  separate exact `yes` confirmation is still required.
 - The preview lists each candidate with counts of kept sessions by reason.
   Before each move the session is re-validated and compared with the
-  preview; changed sessions are skipped and nothing beyond the preview is
-  ever moved. Only moved IDs are removed from `~/.copilot-sessions`.
+  preview fingerprint (which covers `workspace.yaml` and every scaffold
+  item); changed sessions are skipped, a session that changes during the
+  move is moved back, and nothing beyond the preview is ever moved. Only moved IDs are removed from `~/.copilot-sessions`.
 - `copilot-s` and the cleanup share a lock on `~/.copilot-sessions.lock`;
   while another process holds it, the session list is left unchanged (and a
   delete is cancelled) rather than rewritten without the lock.

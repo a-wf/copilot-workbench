@@ -108,8 +108,17 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
 - **Empty-session cleanup** — menu `c` shells out to
   `copilot-session-cleanup.py` (`preview`, then `apply` with exactly the
   previewed `id`+fingerprint pairs after a typed `yes`). The helper
-  re-validates each session (only `workspace.yaml`, `user_named: false`, no
-  name/summary/alias, ≥24h old, not open per `lsof`, unchanged fingerprint)
+  re-validates each session (only `workspace.yaml`, alone or with the
+  complete, byte-for-byte verified empty Copilot scaffold —
+  `.workspace-fork.lock`, empty `files/`/`research/`, header-only
+  `checkpoints/index.md` — `user_named: false`, no name/summary/alias,
+  ≥24h old, not open per `lsof`, unchanged fingerprint; the fingerprint of
+  a workspace-only session is computed exactly as before, so existing
+  batches still restore; an opt-in prompt before the preview, default No,
+  passes `--include-recent` to both `preview` and `apply`, which waives only
+  the 24h minimum age — future timestamps are still refused — and marks
+  each candidate line so `apply` rejects a preview/apply policy mismatch,
+  since the fingerprint excludes the directory's own times)
   and renames it into `~/.copilot-s-quarantine/<batch>/sessions/` with an
   atomic no-replace rename (`renameatx_np`/`renameat2`) relative to
   directories opened without following symlinks (same filesystem only),

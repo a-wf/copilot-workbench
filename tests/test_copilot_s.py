@@ -20,6 +20,7 @@ tests. Self-contained: stdlib-only (unittest), no network, no writes
 outside per-test temp directories.
 """
 
+import datetime
 import fcntl
 import json
 import os
@@ -843,6 +844,42 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         os.chmod(lsof, 0o755)
         return self._env({"COPILOT_SESSION_CLEANUP_HELPER": wrapper})
 
+    def _cleanup_recent_fixture(self, number):
+        session_id, directory = self._cleanup_fixture(number)
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        with open(os.path.join(directory, "workspace.yaml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                "id: %s\ncwd: %s\nuser_named: false\ncreated_at: %s\nupdated_at: %s\n"
+                % (session_id, self.cwd, stamp, stamp)
+            )
+        return session_id, directory
+
+    def _cleanup_recording_env(self):
+        # Log argv, but run the real helper with its real clock, stat and rename.
+        wrapper = os.path.join(self.home, "cleanup-recording-fixture.py")
+        log_path = os.path.join(self.home, "cleanup-options.jsonl")
+        with open(log_path, "w", encoding="utf-8") as handle:
+            handle.write("")
+        with open(wrapper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import json, os, subprocess, sys\n"
+                "with open(os.environ['CLEANUP_LOG'], 'a', encoding='utf-8') as log:\n"
+                "    log.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "sys.exit(subprocess.run([sys.executable, %r, *sys.argv[1:]]).returncode)\n"
+                % CLEANUP_HELPER
+            )
+        lsof = os.path.join(self.fake_bin, "lsof")
+        with open(lsof, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 1\n")
+        os.chmod(lsof, 0o755)
+        return self._env({
+            "COPILOT_SESSION_CLEANUP_HELPER": wrapper, "CLEANUP_LOG": log_path,
+        })
+
+    def _cleanup_calls(self):
+        with open(os.path.join(self.home, "cleanup-options.jsonl"), encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
     def test_cleanup_current_scope_leaves_foreign_and_named_sessions_usable(self):
         local, local_dir = self._cleanup_fixture(1)
         foreign, foreign_dir = self._cleanup_fixture(2, cwd=os.path.join(self.home, "other"))
@@ -851,12 +888,13 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
             self._cleanup_env(),
             actions=[
                 ("Select session to resume", "c\n"),
+                ("Also include recent empty sessions", "\n"),
                 ("Type 'yes' to move 1 session(s)", "yes\n"),
                 ("Moved: 1", "q\n"),
             ],
         )
         self.assertEqual(status, 0, output)
-        self.assertEqual(actions, 3, output)
+        self.assertEqual(actions, 4, output)
         self.assertFalse(os.path.exists(local_dir), output)
         self.assertTrue(os.path.isdir(foreign_dir))
         self.assertTrue(os.path.isdir(kept_dir))
@@ -872,11 +910,12 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
             self._cleanup_env(), copilot_s_args=["--all"],
             actions=[
                 ("Select session to resume", "c\n"),
+                ("Also include recent empty sessions", "\n"),
                 ("Type 'yes' to move 2 session(s)", "yes\n"),
             ],
         )
         self.assertEqual(status, 0, output)
-        self.assertEqual(actions, 2, output)
+        self.assertEqual(actions, 3, output)
         self.assertIn("Moved: 2", output)
         self.assertIn("No sessions left. Run copilot-s again", output)
         self.assertFalse(os.path.exists(first_dir))
@@ -894,12 +933,13 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                     environment,
                     actions=[
                         ("Select session to resume", "c\n"),
+                        ("Also include recent empty sessions", "\n"),
                         ("Type 'yes' to move 1 session(s)", answer),
                         ("Cancelled. Nothing was changed.", "q\n"),
                     ],
                 )
                 self.assertEqual(status, 0, output)
-                self.assertEqual(actions, 3, output)
+                self.assertEqual(actions, 4, output)
                 self.assertTrue(os.path.isdir(directory))
                 self.assertFalse(os.path.exists(os.path.join(self.home, ".copilot-s-quarantine")))
                 self.assertFalse(os.path.exists(self.copilot_log))
@@ -914,14 +954,103 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
             (failing, "Cleanup preview failed (exit 7)"),
         ):
             with self.subTest(helper=helper):
+                responses = [("Select session to resume", "c\n")]
+                if helper == failing:
+                    responses.append(("Also include recent empty sessions", "\n"))
+                responses.append((marker, "q\n"))
                 status, output, actions = self._run_tty(
                     self._env({"COPILOT_SESSION_CLEANUP_HELPER": helper}),
-                    actions=[("Select session to resume", "c\n"), (marker, "q\n")],
+                    actions=responses,
                 )
                 self.assertEqual(status, 0, output)
-                self.assertEqual(actions, 2, output)
+                self.assertEqual(actions, len(responses), output)
                 self.assertIn("Still usable", output)
                 self.assertIn("Bye!", output)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_cleanup_recent_optin_spellings_use_same_policy_for_preview_and_apply(self):
+        for number, answer in enumerate(("y\n", "Y\n", "yes\n", "Yes\n", "YES\n"), 1):
+            with self.subTest(answer=answer):
+                sid, directory = self._cleanup_recent_fixture(number)
+                environment = self._cleanup_recording_env()
+                all_scope = number % 2 == 0
+                def confirm_move():
+                    self.assertTrue(os.path.isdir(directory), "opt-in alone must not move")
+                    self.assertEqual(len(self._cleanup_calls()), 1, "only preview before exact yes")
+                    return "yes\n"
+                status, output, actions = self._run_tty(
+                    environment, copilot_s_args=["--all"] if all_scope else [],
+                    actions=[
+                        ("Select session to resume", "c\n"),
+                        ("Also include recent empty sessions", answer),
+                        ("Type 'yes' to move 1 session(s)", confirm_move),
+                    ],
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(actions, 3, output)
+                self.assertIn("Recent sessions included. Warning:", output)
+                self.assertIn("Moved: 1   Skipped: 0   Failed: 0", output)
+                self.assertFalse(os.path.exists(directory), output)
+                calls = self._cleanup_calls()
+                self.assertEqual(len(calls), 2)
+                self.assertIn("preview", calls[0])
+                self.assertIn("apply", calls[1])
+                for call in calls:
+                    self.assertEqual(call.count("--include-recent"), 1)
+                    if all_scope:
+                        self.assertIn("--all", call)
+                        self.assertNotIn("--cwd", call)
+                    else:
+                        self.assertEqual(call[call.index("--cwd") + 1], self.cwd)
+                self.assertNotIn(sid, [row[0] for row in self._session_rows()])
+                self.assertFalse(os.path.exists(self.copilot_log), output)
+
+    def test_cleanup_recent_default_enter_no_eof_and_other_answers_keep_recent(self):
+        _, directory = self._cleanup_recent_fixture(1)
+        for answer in ("\n", "n\n", "\x04", "No\n", "yEs\n", " yes\n", "yes \n", "other\n"):
+            with self.subTest(answer=answer):
+                status, output, actions = self._run_tty(
+                    self._cleanup_recording_env(),
+                    actions=[
+                        ("Select session to resume", "c\n"),
+                        ("Also include recent empty sessions", answer),
+                        ("No empty sessions are eligible for quarantine.", "q\n"),
+                    ],
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(actions, 3, output)
+                self.assertIn("[y/N]", output)
+                self.assertIn("within the last 24h", output)
+                self.assertNotIn("Recent sessions included. Warning:", output)
+                self.assertNotIn("Type 'yes' to move", output)
+                calls = self._cleanup_calls()
+                self.assertEqual(len(calls), 1)
+                self.assertIn("preview", calls[0])
+                self.assertNotIn("--include-recent", calls[0])
+                self.assertTrue(os.path.isdir(directory))
+                self.assertFalse(os.path.exists(os.path.join(self.home, ".copilot-s-quarantine")))
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_cleanup_recent_optin_still_requires_separate_exact_yes_confirmation(self):
+        _, directory = self._cleanup_recent_fixture(1)
+        for answer in ("Yes\n", " yes\n", "yes \n", "\n", "\x04"):
+            with self.subTest(answer=answer):
+                status, output, actions = self._run_tty(
+                    self._cleanup_recording_env(),
+                    actions=[
+                        ("Select session to resume", "c\n"),
+                        ("Also include recent empty sessions", "y\n"),
+                        ("Type 'yes' to move 1 session(s)", answer),
+                        ("Cancelled. Nothing was changed.", "q\n"),
+                    ],
+                )
+                self.assertEqual(status, 0, output)
+                self.assertEqual(actions, 4, output)
+                self.assertTrue(os.path.isdir(directory))
+                calls = self._cleanup_calls()
+                self.assertEqual(len(calls), 1, "cancellation must never invoke apply")
+                self.assertIn("--include-recent", calls[0])
+                self.assertFalse(os.path.exists(os.path.join(self.home, ".copilot-s-quarantine")))
                 self.assertFalse(os.path.exists(self.copilot_log))
 
     def test_fresh_session_enrolls_exact_id_and_prints_metrics_before_keep_prompt(self):

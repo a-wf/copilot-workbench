@@ -31,6 +31,7 @@ Usage (path options, if given, go before the subcommand; defaults are
 ~/.copilot/session-state, ~/.copilot-sessions, ~/.copilot-s-quarantine):
   copilot-session-cleanup.py [--session-state-dir D] [--sessions-file F]
       [--quarantine-dir Q] {preview|apply} (--cwd DIR | --all)
+      [--include-recent]
   copilot-session-cleanup.py list
   copilot-session-cleanup.py restore --batch <batch>
 
@@ -39,22 +40,58 @@ anything unexpected):
   - its directory name is an exact lowercase UUID, it is a real directory
     (not a symlink) owned by the current user, directly in session-state;
   - it contains exactly one entry, a regular single-link file named
-    workspace.yaml (any events.jsonl — even empty — or other artifact
-    excludes it);
+    workspace.yaml — or exactly that plus the complete, untouched empty
+    scaffold some Copilot CLI versions create for a never-used session:
+    an empty single-link regular .workspace-fork.lock, empty files/ and
+    research/ directories, and checkpoints/ holding only index.md whose
+    bytes are exactly the empty "# Checkpoint History" table header (no
+    checkpoint rows). Every scaffold item must be owned by you and is
+    inspected through descriptors opened without following symlinks; a
+    partial scaffold, any symlink, extra entry, non-empty lock, different
+    index.md, or any events.jsonl/session.db/other artifact (even empty)
+    excludes the session;
   - workspace.yaml is small, plain `key: value` scalars only, with only
     known keys; id matches the directory; cwd is an absolute normalized path;
     `user_named: false` is explicitly present; there is no name/summary;
     summary_count/fork_count (if present) are 0; created_at/updated_at are
     valid UTC timestamps no more than 1 second apart;
-  - it was created at least 24h ago, and the directory and workspace.yaml
-    were not modified/changed within the last 24h;
+  - it was created at least 24h ago, and the directory, workspace.yaml, and
+    every scaffold item were not modified/changed within the last 24h
+    (with the explicit opt-in --include-recent this minimum age is 0: those
+    same timestamps must instead all be at or before the current time — a
+    future timestamp still excludes the session; every other check below is
+    unchanged);
   - its cwd matches the requested cwd exactly (unless --all);
   - it has no copilot-s alias in ~/.copilot-sessions (only the generated
     "unnamed" / "<cwd basename> session" names are allowed);
   - its ID does not appear in any environment variable value;
   - a supported open-file check (`lsof`, macOS/Linux) positively reports that
-    no process has the directory or workspace.yaml open. Unavailable,
-    failing, timed-out, or ambiguous checks exclude the session.
+    no process has the directory, workspace.yaml, or any scaffold item (e.g.
+    .workspace-fork.lock) open. Unavailable, failing, timed-out, or ambiguous
+    checks exclude the session.
+
+The preview fingerprint covers the directory's inode and entry names,
+workspace.yaml (inode, size, times, SHA-256) and, for a scaffold session,
+every scaffold item (type, inode, mode, owner, times; files also link count,
+size, SHA-256). It is re-checked before the move, under the session-list
+lock, and right after the move (a mismatch moves the session back), and
+again by `restore`. Workspace-only fingerprints are computed exactly as
+before scaffold support, so existing quarantine manifests keep restoring.
+
+--include-recent (preview and apply only; never needed or accepted by list or
+restore) must be given to both commands or to neither. A preview run with it
+marks every candidate line with a third field,
+"CANDIDATE<TAB><id><TAB><fingerprint><TAB>include-recent", and `apply`
+refuses the whole request (before creating a batch or moving anything) if
+any line's marker disagrees with its own --include-recent flag. This is
+needed because the fingerprint deliberately excludes the session
+directory's own times, so a fingerprint match alone could not stop a
+default preview from being applied with no minimum age. The fingerprint
+itself and the manifest entry format are unchanged; the manifest's "scope"
+also records "include_recent". Recent empty sessions may have been created
+moments ago by a starting Copilot process (or by something else) and may
+start being used right after the open-file check; that race is accepted
+because quarantine is recoverable, and the preview says so.
 
 Moves use the platform's atomic no-replace rename (macOS renameatx_np with
 RENAME_EXCL, Linux renameat2 with RENAME_NOREPLACE) relative to directory
@@ -105,10 +142,35 @@ LINE_RE = re.compile(r"^([a-z_]+):(?: (.*))?$")
 UNSAFE_VALUE_CHARS = set("\"'[]{}|>&*!%@`#\\")
 
 WORKSPACE_FILE = "workspace.yaml"
+# The only other layout accepted: the untouched empty scaffold some Copilot
+# CLI versions create next to workspace.yaml for a never-used session. It is
+# accepted only as a whole (all five top-level entries, nothing else) and
+# only with exactly this content; any partial or different layout is kept.
+WORKSPACE_LOCK_FILE = ".workspace-fork.lock"
+SCAFFOLD_EMPTY_DIRS = ("files", "research")
+CHECKPOINTS_DIR = "checkpoints"
+CHECKPOINT_INDEX_FILE = "index.md"
+EMPTY_CHECKPOINT_INDEX = (
+    b"# Checkpoint History\n\n"
+    b"Checkpoints are listed in chronological order. Checkpoint 1 is the oldest, "
+    b"higher numbers are more recent.\n\n"
+    b"| # | Title | File |\n"
+    b"|---|-------|------|\n"
+)
+SCAFFOLD_ENTRIES = sorted(
+    [WORKSPACE_FILE, WORKSPACE_LOCK_FILE, CHECKPOINTS_DIR] + list(SCAFFOLD_EMPTY_DIRS)
+)
+# Paths (relative to the session directory) also passed to the open-file check.
+SCAFFOLD_ACTIVITY_PATHS = (
+    [WORKSPACE_LOCK_FILE] + list(SCAFFOLD_EMPTY_DIRS)
+    + [CHECKPOINTS_DIR, os.path.join(CHECKPOINTS_DIR, CHECKPOINT_INDEX_FILE)]
+)
 MANIFEST_FILE = "manifest.json"
 SESSIONS_SUBDIR = "sessions"
 MANIFEST_VERSION = 1
 MIN_AGE_SECONDS = 24 * 3600
+# Third field of a CANDIDATE/apply line when previewed with --include-recent.
+INCLUDE_RECENT_MARKER = "include-recent"
 MAX_UPDATE_SKEW_SECONDS = 1.0
 MAX_WORKSPACE_BYTES = 64 * 1024
 LSOF_TIMEOUT_SECONDS = 15
@@ -123,10 +185,12 @@ REQUIRED_KEYS = ("id", "cwd", "user_named", "created_at", "updated_at")
 ZERO_KEYS = ("summary_count", "fork_count")
 NAME_KEYS = ("name", "summary")
 
-REASON_ARTIFACTS = "has session history or other files besides workspace.yaml"
+REASON_ARTIFACTS = "has session history or other files besides workspace.yaml and the empty scaffold"
+REASON_CHANGING = "changed while being inspected"
 REASON_NAMED = "has a native name or summary"
 REASON_METADATA = "metadata not in the expected empty-session form"
 REASON_RECENT = "created, updated, or modified within the last 24h"
+REASON_FUTURE = "timestamp in the future (clock or metadata problem)"
 REASON_USED = "updated after creation (the session was used)"
 REASON_ALIAS = "has a copilot-s session-list name"
 REASON_ENV = "referenced by the current environment (possibly the active session)"
@@ -534,12 +598,148 @@ def open_state(paths):
     return "unknown: lsof exit %d" % result.returncode
 
 
+class _ScaffoldProblem(Exception):
+    """Internal: the scaffold is not the verified empty one (args[0] = reason)."""
+
+
+def _stat_key(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_nlink,
+            st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _read_limited(fd, limit):
+    """Read at most limit + 1 bytes (so an oversized file is detectable)."""
+    chunks, remaining = [], limit + 1
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _scaffold_open(name, dir_fd, is_dir, uid):
+    """Open dir_fd/name for inspection only if lstat (no follow) shows the
+    expected type — so a symlink, FIFO, device, or socket is never opened —
+    then open it with O_NOFOLLOW and require the same inode, the expected
+    type, ownership by uid, and (files) a single link. Returns (fd, stat)."""
+    expected = stat.S_ISDIR if is_dir else stat.S_ISREG
+    lst = os.lstat(name, dir_fd=dir_fd)
+    if not expected(lst.st_mode):
+        raise _ScaffoldProblem(REASON_UNSAFE)
+    flags = DIR_OPEN_FLAGS if is_dir else (os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    fd = os.open(name, flags, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != (lst.st_dev, lst.st_ino) or not expected(st.st_mode):
+            raise _ScaffoldProblem(REASON_CHANGING)
+        if st.st_uid != uid or (not is_dir and st.st_nlink != 1):
+            raise _ScaffoldProblem(REASON_UNSAFE)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st
+
+
+def _scaffold_file(name, dir_fd, uid, expected_bytes):
+    """Verify a scaffold file has exactly expected_bytes and did not change
+    while it was read. Returns (stat, fingerprint part)."""
+    fd, st = _scaffold_open(name, dir_fd, False, uid)
+    try:
+        if st.st_size != len(expected_bytes):
+            raise _ScaffoldProblem(REASON_ARTIFACTS)
+        data = _read_limited(fd, len(expected_bytes))
+        if _stat_key(os.fstat(fd)) != _stat_key(st):
+            raise _ScaffoldProblem(REASON_CHANGING)
+    finally:
+        os.close(fd)
+    if data != expected_bytes:
+        raise _ScaffoldProblem(REASON_ARTIFACTS)
+    return st, ["f", name, st.st_ino, st.st_mode, st.st_uid, st.st_nlink, st.st_size,
+                st.st_mtime_ns, st.st_ctime_ns, hashlib.sha256(data).hexdigest()]
+
+
+def _scaffold_dir(name, dir_fd, uid, expected_entries, inner=None):
+    """Verify a scaffold directory lists exactly expected_entries (inner(fd)
+    verifies those) and did not change meanwhile. Returns its fingerprint
+    part and the stats of everything checked."""
+    fd, st = _scaffold_open(name, dir_fd, True, uid)
+    try:
+        if sorted(os.listdir(fd)) != expected_entries:
+            raise _ScaffoldProblem(REASON_ARTIFACTS)
+        children = inner(fd) if inner is not None else []
+        if sorted(os.listdir(fd)) != expected_entries or _stat_key(os.fstat(fd)) != _stat_key(st):
+            raise _ScaffoldProblem(REASON_CHANGING)
+    finally:
+        os.close(fd)
+    stats = [st] + [child[0] for child in children]
+    part = ["d", name, st.st_ino, st.st_mode, st.st_uid, st.st_mtime_ns, st.st_ctime_ns,
+            [child[1] for child in children]]
+    return stats, part
+
+
+def scan_scaffold(dfd, dst, uid):
+    """Verify that the session directory dfd (whose entries are exactly
+    SCAFFOLD_ENTRIES and whose fstat was dst) holds only the untouched empty
+    scaffold besides workspace.yaml:
+      .workspace-fork.lock   regular, empty, single link
+      files/, research/      empty directories
+      checkpoints/           a directory holding only index.md, which is a
+                             single-link regular file whose bytes are exactly
+                             EMPTY_CHECKPOINT_INDEX (no checkpoint rows)
+    Everything is owned by uid, inspected through descriptors opened without
+    following symlinks, and re-checked for changes after it was read.
+
+    Returns (part, problem, newest): part is the fingerprint material (None
+    if there is a problem), problem a REASON_* string or None, newest the
+    latest mtime/ctime of any scaffold item. Never raises for the content
+    found (OSError while inspecting is reported as REASON_UNREADABLE)."""
+    try:
+        stats, part = [], []
+        lock_st, lock_part = _scaffold_file(WORKSPACE_LOCK_FILE, dfd, uid, b"")
+        stats.append(lock_st)
+        part.append(lock_part)
+        for name in SCAFFOLD_EMPTY_DIRS:
+            dir_stats, dir_part = _scaffold_dir(name, dfd, uid, [])
+            stats.extend(dir_stats)
+            part.append(dir_part)
+
+        def checkpoint_index(cfd):
+            return [_scaffold_file(CHECKPOINT_INDEX_FILE, cfd, uid, EMPTY_CHECKPOINT_INDEX)]
+
+        dir_stats, dir_part = _scaffold_dir(CHECKPOINTS_DIR, dfd, uid,
+                                            [CHECKPOINT_INDEX_FILE], checkpoint_index)
+        stats.extend(dir_stats)
+        part.append(dir_part)
+        # The session directory itself must not have changed meanwhile.
+        if sorted(os.listdir(dfd)) != SCAFFOLD_ENTRIES or _stat_key(os.fstat(dfd)) != _stat_key(dst):
+            raise _ScaffoldProblem(REASON_CHANGING)
+    except _ScaffoldProblem as problem:
+        return None, problem.args[0], None
+    except OSError:
+        return None, REASON_UNREADABLE, None
+    newest = max(max(st.st_mtime, st.st_ctime) for st in stats)
+    return part, None, newest
+
+
 def fingerprint_dir(name, dir_fd):
     """Identity + contents fingerprint of the session directory dir_fd/name,
     opened without following symlinks. Excludes the directory's own times,
     which a rename may change; includes its inode, entry names, and (if
     present) workspace.yaml's inode, size, mtime, ctime, and SHA-256.
-    Returns (fingerprint, details); raises OSError/CleanupError."""
+
+    For a directory whose entries are exactly SCAFFOLD_ENTRIES it also
+    verifies the empty scaffold (scan_scaffold) and adds every scaffold
+    item's type, inode, mode, owner, times, and (files) link count, size and
+    SHA-256 to the material. A workspace.yaml-only directory hashes exactly
+    the same material as before the scaffold was supported, so fingerprints
+    recorded in existing quarantine manifests still match.
+
+    Returns (fingerprint, details); details["scaffold_problem"] is a REASON_*
+    string when the scaffold entries are present but are not the verified
+    empty scaffold (such a directory is never eligible or restorable).
+    Raises OSError/CleanupError."""
     dfd = os.open(name, DIR_OPEN_FLAGS, dir_fd=dir_fd)
     try:
         dst = os.fstat(dfd)
@@ -547,7 +747,8 @@ def fingerprint_dir(name, dir_fd):
         if (dst.st_dev, dst.st_ino) != (lst.st_dev, lst.st_ino):
             raise CleanupError("directory changed while being inspected")
         entries = sorted(os.listdir(dfd))
-        details = {"dir_stat": dst, "entries": entries, "ws_stat": None, "ws_bytes": None}
+        details = {"dir_stat": dst, "entries": entries, "ws_stat": None, "ws_bytes": None,
+                   "scaffold": False, "scaffold_problem": None, "scaffold_newest": None}
         ws_part = None
         if WORKSPACE_FILE in entries:
             wfd = os.open(WORKSPACE_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
@@ -570,7 +771,17 @@ def fingerprint_dir(name, dir_fd):
             details["ws_bytes"] = data
             ws_part = [wst.st_ino, wst.st_size, wst.st_mtime_ns, wst.st_ctime_ns,
                        hashlib.sha256(data).hexdigest()]
-        material = json.dumps([dst.st_ino, entries, ws_part], separators=(",", ":"))
+        material = [dst.st_ino, entries, ws_part]
+        if entries == SCAFFOLD_ENTRIES:
+            part, problem, newest = scan_scaffold(dfd, dst, os.getuid())
+            details["scaffold"] = True
+            details["scaffold_problem"] = problem
+            details["scaffold_newest"] = newest
+            # A fourth, tagged element keeps scaffold material disjoint from
+            # the (unchanged) three-element workspace-only material.
+            material.append(["empty-scaffold-v1", part] if problem is None
+                            else ["invalid-scaffold", problem])
+        material = json.dumps(material, separators=(",", ":"))
         return hashlib.sha256(material.encode("utf-8")).hexdigest(), details
     finally:
         os.close(dfd)
@@ -582,6 +793,8 @@ class Context(object):
         self.sessions_file = os.path.abspath(args.sessions_file)
         self.quarantine_root = os.path.abspath(args.quarantine_dir)
         self.uid = os.getuid()
+        # Explicit opt-in (preview/apply only): no minimum age.
+        self.include_recent = bool(getattr(args, "include_recent", False))
         self.env_blob = "\n".join(os.environ.values()).lower()
         self.state_fd = None
         self.registry_lines = []
@@ -648,13 +861,16 @@ def inspect_session(ctx, sid, scope_cwd, check_activity=True):
         return result
 
     entries = details["entries"]
-    text = None
+    text = strict_text = None
     if details["ws_bytes"] is not None:
         try:
-            text = details["ws_bytes"].decode("utf-8")
+            strict_text = details["ws_bytes"].decode("utf-8")
         except UnicodeDecodeError:
-            text = None
+            strict_text = None
+        text = strict_text
         if text is None and entries != [WORKSPACE_FILE]:
+            # Lenient decoding is only for scope filtering; the metadata
+            # checks below use strict_text.
             text = details["ws_bytes"].decode("utf-8", "replace")
     cwd = lenient_cwd(text) if text is not None else None
     result["cwd"] = cwd
@@ -665,7 +881,9 @@ def inspect_session(ctx, sid, scope_cwd, check_activity=True):
         if cwd != scope_cwd:
             return None
 
-    if entries != [WORKSPACE_FILE]:
+    # Only workspace.yaml alone, or workspace.yaml plus the complete,
+    # verified empty scaffold (details["scaffold"]); anything else is kept.
+    if entries != [WORKSPACE_FILE] and not details["scaffold"]:
         result["reason"] = REASON_ARTIFACTS
         return result
     dst, wst = details["dir_stat"], details["ws_stat"]
@@ -673,10 +891,13 @@ def inspect_session(ctx, sid, scope_cwd, check_activity=True):
             or not stat.S_ISREG(wst.st_mode)):
         result["reason"] = REASON_UNSAFE
         return result
-    if wst.st_size > MAX_WORKSPACE_BYTES or text is None:
+    if details["scaffold"] and details["scaffold_problem"] is not None:
+        result["reason"] = details["scaffold_problem"]
+        return result
+    if wst.st_size > MAX_WORKSPACE_BYTES or strict_text is None:
         result["reason"] = REASON_METADATA
         return result
-    fields, reason = parse_workspace(text)
+    fields, reason = parse_workspace(strict_text)
     if fields is None:
         result["reason"] = reason
         return result
@@ -692,9 +913,17 @@ def inspect_session(ctx, sid, scope_cwd, check_activity=True):
     if abs(updated - created) > MAX_UPDATE_SKEW_SECONDS:
         result["reason"] = REASON_USED if updated > created else REASON_METADATA
         return result
-    cutoff = now_epoch() - MIN_AGE_SECONDS
+    now = now_epoch()
     newest = max(created, updated, dst.st_mtime, dst.st_ctime, wst.st_mtime, wst.st_ctime)
-    if newest > cutoff:
+    if details["scaffold"]:
+        newest = max(newest, details["scaffold_newest"])
+    if ctx.include_recent:
+        # Opt-in: only the minimum age is waived. The same timestamps must
+        # still not lie in the future; all other checks below still apply.
+        if newest > now:
+            result["reason"] = REASON_FUTURE
+            return result
+    elif newest > now - MIN_AGE_SECONDS:
         result["reason"] = REASON_RECENT
         return result
 
@@ -711,7 +940,12 @@ def inspect_session(ctx, sid, scope_cwd, check_activity=True):
 
     if check_activity:
         path = os.path.join(ctx.state_dir, sid)
-        state = open_state([path, os.path.join(path, WORKSPACE_FILE)])
+        paths = [path, os.path.join(path, WORKSPACE_FILE)]
+        if details["scaffold"]:
+            # Every scaffold item too: e.g. a running Copilot holding
+            # .workspace-fork.lock open keeps the session.
+            paths.extend(os.path.join(path, rel) for rel in SCAFFOLD_ACTIVITY_PATHS)
+        state = open_state(paths)
         if state == "open":
             result["reason"] = REASON_OPEN
             return result
@@ -866,6 +1100,8 @@ def cmd_preview(args):
     try:
         scope_cwd = scope_of(args)
         scope_label = "all directories" if scope_cwd is None else display_path(scope_cwd)
+        if ctx.include_recent:
+            scope_label += "; including recent sessions"
         print("Empty-session cleanup preview (%s)" % scope_label)
         if not ctx.open_state_dir():
             print("  No session-state directory at %s — nothing to clean up." % display_path(ctx.state_dir))
@@ -894,9 +1130,20 @@ def cmd_preview(args):
             where = "  %s" % display_path(info["cwd"]) if scope_cwd is None else ""
             print("    - %s  created %s%s" % (info["id"], info["created_at"], where))
         print("")
-        print("  Why each qualifies: only workspace.yaml (no events/history or other files),")
+        print("  Why each qualifies: only workspace.yaml, alone or with Copilot's untouched")
+        print("  empty scaffold (no events/history, checkpoints, or other files),")
         print("  never named (user_named: false, no name/summary, no session-list name),")
-        print("  created and last changed more than 24h ago, not open by any process.")
+        if ctx.include_recent:
+            print("  not open by any process. Recent sessions included: no minimum age")
+            print("  (timestamps must not be in the future).")
+            print("")
+            print("  Warning: a recent empty session may have been created moments ago — by a")
+            print("  Copilot process that is still starting, or by something else; its origin")
+            print("  is not known — and could start being used right after the open-file")
+            print("  check. That race is accepted: sessions are only moved to quarantine and")
+            print("  can be restored.")
+        else:
+            print("  created and last changed more than 24h ago, not open by any process.")
     else:
         print("  No empty sessions are eligible for quarantine.")
     if skipped:
@@ -910,20 +1157,33 @@ def cmd_preview(args):
         print("  Directories are moved (not copied or deleted) and can be restored with:")
         print("    copilot-session-cleanup.py restore --batch <batch>")
         print("  Copilot's own session history/index is not modified and may still list them.")
+        marker = "\t" + INCLUDE_RECENT_MARKER if ctx.include_recent else ""
         for info in candidates:
-            print("CANDIDATE\t%s\t%s" % (info["id"], info["fingerprint"]))
+            print("CANDIDATE\t%s\t%s%s" % (info["id"], info["fingerprint"], marker))
     print("")
     return 0
 
 
-def read_requested(stream):
+def read_requested(stream, include_recent=False):
+    """Parse "<id><TAB><fingerprint>" lines, or — exactly when apply runs
+    with --include-recent — "<id><TAB><fingerprint><TAB>include-recent"
+    lines. Any policy mismatch rejects the whole request (nothing moved)."""
     requested, seen = [], set()
     for raw in stream.read().split("\n"):
         if raw == "":
             continue
         parts = raw.split("\t")
+        line_recent = len(parts) == 3 and parts[2] == INCLUDE_RECENT_MARKER
+        if line_recent:
+            parts = parts[:2]
         if len(parts) != 2 or not UUID_RE.match(parts[0]) or not FINGERPRINT_RE.match(parts[1]):
             raise CleanupError("malformed candidate line on stdin: %r" % raw)
+        if line_recent != include_recent:
+            raise CleanupError(
+                "candidate %s was previewed %s --include-recent but apply was run %s it; "
+                "preview and apply must use the same option (nothing was moved)"
+                % (parts[0], "with" if line_recent else "without",
+                   "with" if include_recent else "without"))
         if parts[0] in seen:
             raise CleanupError("duplicate candidate %s on stdin" % parts[0])
         seen.add(parts[0])
@@ -978,7 +1238,9 @@ def quarantine_one(ctx, scope_cwd, entry, batch_fd, sessions_fd, manifest):
         fsync_fd(ctx.state_fd)
         fsync_fd(sessions_fd)
         try:
-            moved_fp = fingerprint_dir(sid, sessions_fd)[0]
+            moved_fp, moved_details = fingerprint_dir(sid, sessions_fd)
+            if moved_details["scaffold_problem"] is not None:
+                moved_fp = None
         except (OSError, CleanupError):
             moved_fp = None
         if moved_fp != entry["fingerprint"]:
@@ -1021,7 +1283,7 @@ def cmd_apply(args):
 
 def apply_with_context(ctx, args):
     scope_cwd = scope_of(args)
-    requested = read_requested(sys.stdin)
+    requested = read_requested(sys.stdin, ctx.include_recent)
     if not requested:
         print("Nothing to quarantine.")
         return 0
@@ -1052,7 +1314,8 @@ def apply_with_context(ctx, args):
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "session_state_dir": ctx.state_dir,
             "sessions_file": ctx.sessions_file,
-            "scope": {"all": scope_cwd is None, "cwd": scope_cwd},
+            "scope": {"all": scope_cwd is None, "cwd": scope_cwd,
+                      "include_recent": ctx.include_recent},
             "entries": entries,
         }
         try:
@@ -1076,6 +1339,8 @@ def apply_with_context(ctx, args):
     print("")
     print("Quarantine batch: %s" % batch)
     print("  Location: %s" % display_path(batch_dir))
+    if ctx.include_recent:
+        print("  Recent sessions included (no minimum age), as previewed.")
     print("  Moved: %d   Skipped: %d   Failed: %d" % (counts["moved"], counts["skipped"], counts["failed"]))
     for entry in entries:
         if entry["state"] in ("skipped", "failed"):
@@ -1175,11 +1440,11 @@ def restore_batch(ctx, batch, opened):
             continue
         try:
             close_fds(open_private_dir(sid, dir_fd=sessions_fd))
-            current = fingerprint_dir(sid, sessions_fd)[0]
+            current, details = fingerprint_dir(sid, sessions_fd)
         except (OSError, CleanupError) as exc:
             refused.append((sid, "quarantined path is not a safe directory (%s)" % exc))
             continue
-        if current != entry.get("fingerprint"):
+        if details["scaffold_problem"] is not None or current != entry.get("fingerprint"):
             refused.append((sid, "quarantined contents changed; restore it manually if intended"))
             continue
         plan.append(entry)
@@ -1202,7 +1467,8 @@ def restore_batch(ctx, batch, opened):
     for entry in plan:
         sid = entry["id"]
         try:
-            if fingerprint_dir(sid, sessions_fd)[0] != entry.get("fingerprint"):
+            current, details = fingerprint_dir(sid, sessions_fd)
+            if details["scaffold_problem"] is not None or current != entry.get("fingerprint"):
                 failures.append((sid, "quarantined contents changed"))
                 continue
             previous_state = entry["state"]
@@ -1264,6 +1530,9 @@ def build_parser():
         scope = cmd.add_mutually_exclusive_group(required=True)
         scope.add_argument("--cwd", help="exact session cwd to clean up")
         scope.add_argument("--all", action="store_true", help="all directories")
+        cmd.add_argument("--include-recent", action="store_true",
+                         help="explicit opt-in: no 24h minimum age (timestamps must still not be "
+                              "in the future); preview and apply must both use it or both omit it")
     sub.add_parser("list", help="list quarantine batches")
     restore = sub.add_parser("restore", help="restore a quarantine batch (asks for confirmation)")
     restore.add_argument("--batch", required=True)
