@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -959,10 +960,12 @@ class BaseHomeTestCase(unittest.TestCase):
 
     def env(self):
         e = dict(os.environ)
-        for var in self.TOOLKIT_ENV_VARS:
-            e.pop(var, None)
+        for var in list(e):
+            if var.startswith(("COPILOT_", "XDG_")):
+                e.pop(var, None)
         e["HOME"] = self.home
         e["COPILOT_TASK_REPORT_PRICING_FETCH"] = "0"
+        e["PYTHONDONTWRITEBYTECODE"] = "1"
         return e
 
     def run_install(self):
@@ -1124,6 +1127,91 @@ class TestRequestPricingConfigInstall(BaseHomeTestCase):
         self.assertTrue(os.path.isfile(destination))
         with open(destination, "rb") as f:
             self.assertEqual(f.read(), original_contents)
+
+
+class TestModelRefreshDistribution(BaseHomeTestCase):
+    def test_install_modes_ship_helper_catalog_routes_and_preserve_local_data_on_uninstall(self):
+        state_dir = os.path.join(self.home, ".copilot", "model-refresh")
+        generated = os.path.join(self.home, ".copilot", "instructions",
+                                 "copilot-toolkit-model-routing.instructions.md")
+        preserved = {
+            os.path.join(state_dir, "state.json"): b'{"user": "confirmed state"}\n',
+            os.path.join(state_dir, "user-config.json"): b'{"pins": {"coder": {"model": "human"}}}\n',
+            os.path.join(state_dir, "backups", "old-version", "settings.bak"): b"old version\n",
+            os.path.join(self.home, ".copilot", "settings.json"): b'{"subagents": "user settings"}\n',
+            generated: b"<!-- copilot-toolkit:model-refresh:generated v1 -->\nuser routing\n",
+        }
+        for path, data in preserved.items():
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(data)
+        for copy_mode, custom in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(copy=copy_mode, custom_prefix=custom):
+                prefix = os.path.join(self.home, "custom", "bin") if custom else os.path.join(
+                    self.home, ".local", "bin")
+                args = ["--copy"] if copy_mode else []
+                if custom:
+                    args += ["--prefix", prefix]
+                result = subprocess.run(
+                    ["bash", INSTALL_SH, *args], env=self.env(), cwd=REPO_ROOT,
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                helper = os.path.join(prefix, "copilot-model-refresh.py")
+                catalog = os.path.join(self.home, ".copilot", "model-role-catalog.json")
+                routes = os.path.join(self.home, ".copilot", "agent-routing.yaml")
+                with open(self.manifest_path(), encoding="utf-8") as handle:
+                    manifest = handle.read().splitlines()
+                for installed, source in (
+                    (helper, os.path.join(REPO_ROOT, "bin", "copilot-model-refresh.py")),
+                    (catalog, os.path.join(REPO_ROOT, "config", "model-role-catalog.json")),
+                    (routes, ROUTING_CONFIG),
+                ):
+                    self.assertTrue(os.path.isfile(installed), installed)
+                    self.assertEqual(os.path.islink(installed), not copy_mode, installed)
+                    self.assertIn(installed, manifest)
+                    with open(installed, "rb") as actual, open(source, "rb") as expected:
+                        self.assertEqual(actual.read(), expected.read())
+                self.assertTrue(os.access(helper, os.X_OK))
+                smoke = subprocess.run(
+                    [sys.executable, "-B", helper, "--help"], env=self.env(),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(smoke.returncode, 0, smoke.stdout + smoke.stderr)
+                self.assertIn("propose", smoke.stdout)
+                # Exercise the launcher's actual helper resolution, not a source
+                # grep: copied custom-prefix installs need their sibling helper.
+                trace = subprocess.run(
+                    ["bash", "-x", os.path.join(prefix, "copilot-s"), "--version"],
+                    env=self.env(), capture_output=True, text=True, timeout=10)
+                self.assertEqual(trace.returncode, 0, trace.stderr)
+                observed = next(line.split("=", 1)[1] for line in trace.stderr.splitlines()
+                                if line.startswith("+ MODEL_REFRESH_HELPER="))
+                self.assertEqual(os.path.realpath(observed), os.path.realpath(helper))
+                for path, data in preserved.items():
+                    self.assertNotIn(path, manifest)
+                    with open(path, "rb") as handle:
+                        self.assertEqual(handle.read(), data)
+                removed = self.run_uninstall()
+                self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+                self.assertIn("model-refresh state remains", removed.stdout)
+                self.assertIn("reset --yes", removed.stdout)
+                for path in (helper, catalog, routes):
+                    self.assertFalse(os.path.lexists(path), path)
+                for path, data in preserved.items():
+                    with open(path, "rb") as handle:
+                        self.assertEqual(handle.read(), data)
+
+    def test_shipped_directive_routes_explicit_parameters_through_effective_table(self):
+        with open(ORCHESTRATOR_INSTRUCTIONS, encoding="utf-8") as handle:
+            text = handle.read()
+        directive = text.split("### Local effective-routing overrides", 1)[1].split(
+            "### Built-in Task tool route", 1)[0]
+        for phrase in ("Before each\ndelegation", "copilot-model-refresh.py status --instructions",
+                       "`reasoning_effort`", "`context_tier`", "`coder.small_casual`",
+                       "`reviewer.stronger`", "`task`", "`OMIT` must be left out",
+                       "never pass the word `OMIT` or `inherit`",
+                       "does not document whether explicit task parameters",
+                       "explicitly requests"):
+            self.assertIn(phrase, directive)
 
 
 if __name__ == "__main__":

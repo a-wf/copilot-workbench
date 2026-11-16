@@ -17,6 +17,13 @@
 #   - Quarantined empty sessions (~/.copilot-s-quarantine) — restore them
 #     with copilot-session-cleanup.py restore --batch <batch> before
 #     uninstalling if you still want them back in session-state.
+#   - Subagent model-refresh state (~/.copilot/model-refresh: confirmed
+#     overrides, your user-config.json pins/availability list, backups) and
+#     what an applied refresh wrote outside it (the /subagents values in
+#     ~/.copilot/settings.json and the generated
+#     ~/.copilot/instructions/copilot-toolkit-model-routing.instructions.md).
+#     Run `copilot-model-refresh.py reset --yes` BEFORE uninstalling to
+#     remove the tool's own overrides safely (your own pins are kept).
 #   - Any other user data.
 #
 # Two retired paths are handled by scripts/install.sh instead of here:
@@ -116,6 +123,9 @@ else
   log "${GREEN}Uninstall complete.${RESET} Removed $removed_count toolkit-managed path(s)."
   rm -f "$MANIFEST_FILE"
   log "Note: Task reports, task state, session state, quarantined sessions, and your pricing config were left untouched."
+  if [[ -f "$HOME/.copilot/model-refresh/state.json" ]]; then
+    log "${YELLOW}Note:${RESET} subagent model-refresh state remains in $HOME/.copilot/model-refresh. If you applied overrides, restore them from the checkout with: python3 bin/copilot-model-refresh.py reset --yes"
+  fi
   if ! $RESTORE; then
     log "Backups of any pre-existing files (if created during install) remain at: $STATE_DIR/backups/"
   fi

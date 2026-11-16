@@ -62,15 +62,15 @@ class BaseHomeTestCase(unittest.TestCase):
     def env(self, extra=None):
         e = dict(os.environ)
         e["HOME"] = self.home
-        for key in (
-            "COPILOT_TASK_REPORTS_DIR", "COPILOT_TASK_REPORT_HELPER",
-            "COPILOT_SESSION_CLEANUP_HELPER",
-        ):
+        for key in list(e):
+            if not key.startswith(("COPILOT_", "XDG_")):
+                continue
             e.pop(key, None)
         # Any real task-report helper reached by a shell subprocess must
         # remain network-free, even if the ambient environment enables
         # automatic official-price refreshes.
         e["COPILOT_TASK_REPORT_PRICING_FETCH"] = "0"
+        e["PYTHONDONTWRITEBYTECODE"] = "1"
         # Never let a real Copilot CLI be found/launched from these tests.
         e["PATH"] = "/usr/bin:/bin"
         if extra:
@@ -554,7 +554,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
     )
 
     def setUp(self):
-        super().setUp()
+        BaseHomeTestCase.setUp(self)
         self.cwd = os.path.realpath(os.path.join(self.home, "worktree"))
         os.makedirs(self.cwd)
         subprocess.run(["git", "init", "-q", self.cwd], check=True)
@@ -689,6 +689,11 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         multiple lines pasted together while the first prompt is displayed.
         An action response may be a callable returning text, for changes
         synchronized with a real prompt (such as acquiring a test flock).
+
+        These existing session-launch tests acknowledge the new empty-list
+        menu once, separately from their legacy name/save action counts.
+        Model-refresh/menu tests below use a separate strictly scripted driver:
+        they never auto-acknowledge this prompt and verify p cannot launch.
         """
         pid, master = pty.fork()
         if pid == 0:
@@ -702,6 +707,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         actions = list(actions)
         action_index = 0
         input_burst_sent = False
+        empty_menu_acknowledged = False
         status = None
         deadline = time.monotonic() + timeout
         try:
@@ -727,6 +733,12 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                                 pass
                         break
                     output.extend(chunk)
+                    if (
+                        not empty_menu_acknowledged
+                        and b"Start a new session? [Enter/n = new, p, q]:" in output
+                    ):
+                        os.write(master, b"\n")
+                        empty_menu_acknowledged = True
                     if (
                         input_burst is not None
                         and not input_burst_sent
@@ -1879,6 +1891,289 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertIn("Bye!", output)
         self.assertFalse(os.path.exists(self.copilot_log))
         self.assertEqual(self._commands("context-update"), [])
+
+
+class TestModelRefreshMenu(BaseHomeTestCase):
+    """Strict PTY scripts: no implicit Enter, no real helper/network/CLI."""
+
+    setUp = TestContextMetricsSessionManager.setUp
+    CONTEXT_SUMMARY = TestContextMetricsSessionManager.CONTEXT_SUMMARY
+    _env = TestContextMetricsSessionManager._env
+    _session = TestContextMetricsSessionManager._session
+
+    EMPTY_PROMPT = "Start a new session? [Enter/n = new, p, q]:"
+    SELECT_PROMPT = "Select session to resume"
+    CONFIRM = "anything else cancels):"
+    PAUSE = "Press Enter to return to the menu..."
+    PROPOSAL_ID = "0123456789abcdef"
+
+    def _refresh_env(self, extra=None):
+        helper = os.path.join(self.home, "fake-refresh.py")
+        self.refresh_log = os.path.join(self.home, "refresh.jsonl")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import json,os,runpy,sys\n"
+                "args=sys.argv[1:]\n"
+                "with open(os.environ['REFRESH_LOG'],'a') as f: f.write(json.dumps(args)+'\\n')\n"
+                "def real_helper():\n"
+                " os.environ['COPILOT_TASK_REPORT_HELPER']=os.environ['REAL_REPORT_HELPER']\n"
+                " runpy.run_path(os.environ['REAL_REFRESH_HELPER'],run_name='__main__')\n"
+                "if args[0]=='propose':\n"
+                " if os.environ.get('REAL_PROPOSE')=='1': real_helper()\n"
+                " print('Routes current -> proposed; 15/75/5/5 assumption; categorical fit NOT measured quality')\n"
+                " rc=int(os.environ.get('REFRESH_RC','0'))\n"
+                " if rc==0: print('PROPOSAL\\t'+os.environ.get('REFRESH_ID','0123456789abcdef'))\n"
+                " elif rc==3: print('Final effective routing (kept): ten routes')\n"
+                " else: print('fixture propose failed before a final table')\n"
+                " sys.exit(rc)\n"
+                "if args[0]=='apply':\n"
+                " rc=int(os.environ.get('APPLY_RC','0'))\n"
+                " print('Final effective routing: ten routes' if rc==0 else 'fixture apply refused before write')\n"
+                " sys.exit(rc)\n"
+                "if args[0]=='discard': print('Cancelled; Final effective routing (kept): ten routes')\n"
+                "if args[0]=='status':\n"
+                " rc=int(os.environ.get('STATUS_RC','0'))\n"
+                " if rc: print('fixture status could not read routing'); sys.exit(rc)\n"
+                " if os.environ.get('REAL_STATUS')=='1': real_helper()\n"
+                " print('Current effective routing: ten routes')\n"
+            )
+        additions = {
+            "COPILOT_MODEL_REFRESH_HELPER": helper, "REFRESH_LOG": self.refresh_log,
+            "REAL_REFRESH_HELPER": os.path.join(REPO_ROOT, "bin", "copilot-model-refresh.py"),
+            "REAL_REPORT_HELPER": TASK_HELPER,
+        }
+        if extra:
+            additions.update(extra)
+        return self._env(additions)
+
+    def _calls(self):
+        if not os.path.exists(self.refresh_log):
+            return []
+        with open(self.refresh_log, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle]
+
+    def _native_status_settings(self, malformed=False):
+        path = os.path.join(self.home, ".copilot", "settings.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write('{"subagents": invalid}' if malformed else json.dumps({
+                "theme": "user-theme", "subagents": {"agents": {
+                    "coder": {"model": "native-status-choice"}}}}))
+
+    def _assert_final_ten_route_table(self, output):
+        section = output.rsplit("Current effective routing:", 1)[1].split(self.PAUSE, 1)[0]
+        labels = ("discovery", "planner", "coder", "coder (small/casual)", "senior-coder",
+                  "reviewer (default)", "reviewer (stronger override)", "tester", "test-reviewer",
+                  "task (built-in)")
+        rows = [line.strip() for line in section.splitlines()
+                if any(line.lstrip().startswith(label + "  ") for label in labels)]
+        self.assertEqual(len(rows), 10, section)
+        for label in labels:
+            self.assertEqual(sum(row.startswith(label + "  ") for row in rows), 1, section)
+        self.assertIn("native-status-choice", section)
+
+    def _scripted_tty(self, env, actions, args=(), timeout=12):
+        pid, master = pty.fork()
+        if pid == 0:
+            os.chdir(self.cwd)
+            os.execve("/bin/bash", ["/bin/bash", COPILOT_S, *args], env)
+        output = bytearray()
+        cursor = answered = 0
+        status = None
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                readable, _, _ = select.select([master], [], [], 0.1)
+                if readable:
+                    try:
+                        chunk = os.read(master, 8192)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    while answered < len(actions):
+                        marker, response = actions[answered]
+                        found = output.find(marker.encode(), cursor)
+                        if found < 0:
+                            break
+                        cursor = found + len(marker.encode())
+                        if callable(response):
+                            response = response()
+                        os.write(master, response.encode())
+                        answered += 1
+                waited, child_status = os.waitpid(pid, os.WNOHANG)
+                if waited == pid:
+                    status = os.waitstatus_to_exitcode(child_status)
+                    break
+            else:
+                self.fail("Model menu timed out:\n" + output.decode(errors="replace"))
+            if status is None:
+                _, child_status = os.waitpid(pid, 0)
+                status = os.waitstatus_to_exitcode(child_status)
+        finally:
+            if status is None:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+            os.close(master)
+        text = output.decode(errors="replace")
+        self.assertEqual(answered, len(actions), text)
+        return status, text
+
+    def _assert_no_launch_at_pause(self):
+        self.assertFalse(os.path.exists(self.copilot_log), "p must never launch Copilot")
+        return "\n"
+
+    def test_empty_list_p_applies_only_exact_yes_pauses_and_returns_without_launch(self):
+        status, out = self._scripted_tty(self._refresh_env(), [
+            (self.EMPTY_PROMPT, "p\n"), (self.CONFIRM, "yes\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self._calls(), [
+            ["propose"], ["apply", "--proposal-id", self.PROPOSAL_ID]])
+        self.assertIn("Final effective routing", out)
+        self.assertNotIn("PROPOSAL\t", out, "machine marker must not leak into display")
+        self.assertNotIn("Session name (Enter for automatic):", out)
+        self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_populated_list_p_returns_to_select_without_launch(self):
+        self._session("existing", name="Saved session")
+        status, out = self._scripted_tty(self._refresh_env(), [
+            (self.SELECT_PROMPT, "P\n"), (self.CONFIRM, "yes\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.SELECT_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertIn("Saved session", out)
+        self.assertEqual(self._calls()[-1], ["apply", "--proposal-id", self.PROPOSAL_ID])
+        self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_default_no_nonexact_yes_and_terminal_eof_discard(self):
+        for answer in ("\n", "y\n", "YES\n", " yes\n", "yes \n", "no\n", "\x04"):
+            with self.subTest(answer=repr(answer)):
+                env = self._refresh_env()
+                if os.path.exists(self.refresh_log):
+                    os.unlink(self.refresh_log)
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), (self.CONFIRM, answer),
+                    (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [
+                    ["propose"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+                self.assertIn("Cancelled", out)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_no_changes_fetch_failure_refusal_interrupt_and_invalid_id_never_apply(self):
+        for rc, proposal_id in ((3, self.PROPOSAL_ID), (2, self.PROPOSAL_ID),
+                                (4, self.PROPOSAL_ID), (130, self.PROPOSAL_ID),
+                                (0, "bad-marker")):
+            with self.subTest(rc=rc, proposal_id=proposal_id):
+                env = self._refresh_env({"REFRESH_RC": str(rc), "REFRESH_ID": proposal_id})
+                if os.path.exists(self.refresh_log):
+                    os.unlink(self.refresh_log)
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"),
+                    (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [["propose"]] + ([] if rc == 3 else [["status"]]))
+                self.assertNotIn("Type 'yes'", out)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_apply_refusal_shows_status_then_returns_to_menu(self):
+        self._native_status_settings()
+        status, out = self._scripted_tty(self._refresh_env({"APPLY_RC": "4", "REAL_STATUS": "1"}), [
+            (self.EMPTY_PROMPT, "p\n"), (self.CONFIRM, "yes\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertIn("Apply did not complete (exit 4)", out)
+        self.assertEqual(self._calls()[-1], ["status"])
+        self._assert_final_ten_route_table(out)
+
+    def test_failed_or_malformed_propose_uses_real_status_for_complete_final_table(self):
+        self._native_status_settings()
+        for name, additions in (
+            ("no-pricing", {"REAL_PROPOSE": "1"}),
+            ("error", {"REFRESH_RC": "2"}),
+            ("refused", {"REFRESH_RC": "4"}),
+            ("malformed-proposal", {"REFRESH_ID": "invalid"}),
+        ):
+            with self.subTest(case=name):
+                env = self._refresh_env(dict(additions, REAL_STATUS="1"))
+                if os.path.exists(self.refresh_log):
+                    os.unlink(self.refresh_log)
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+                    (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [["propose"], ["status"]])
+                self._assert_final_ten_route_table(out)
+                self.assertNotIn("Type 'yes'", out)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_failed_final_status_is_explicitly_unavailable_instead_of_guessed_table(self):
+        for failure, additions in (
+            ("propose-error", {"REFRESH_RC": "2"}),
+            ("propose-refused", {"REFRESH_RC": "4"}),
+            ("malformed-proposal", {"REFRESH_ID": "invalid"}),
+            ("apply-refused", {"APPLY_RC": "4"}),
+        ):
+            for unavailable in ("malformed-settings", "status-error"):
+                with self.subTest(failure=failure, unavailable=unavailable):
+                    self._native_status_settings(malformed=unavailable == "malformed-settings")
+                    env = self._refresh_env(dict(
+                        additions, REAL_STATUS="1", STATUS_RC="2" if unavailable == "status-error" else "0"))
+                    if os.path.exists(self.refresh_log):
+                        os.unlink(self.refresh_log)
+                    actions = [(self.EMPTY_PROMPT, "p\n")]
+                    if failure == "apply-refused":
+                        actions.append((self.CONFIRM, "yes\n"))
+                    actions += [
+                        (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n")]
+                    status, out = self._scripted_tty(env, actions)
+                    self.assertEqual(status, 0, out)
+                    self.assertEqual(self._calls()[-1], ["status"])
+                    self.assertIn("Current effective routing is unavailable", out)
+                    self.assertIn("no table is shown rather than a guessed one", out)
+                    self.assertNotIn("Current effective routing:", out)
+                    self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_missing_helper_is_visible_and_returns_to_empty_menu(self):
+        status, out = self._scripted_tty(self._refresh_env({
+            "COPILOT_MODEL_REFRESH_HELPER": os.path.join(self.home, "missing.py")}), [
+            (self.EMPTY_PROMPT, "p\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+            (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertIn("helper not found", out)
+        self.assertEqual(self._calls(), [])
+        self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_empty_menu_n_still_launches_auto_balance_after_explicit_selection(self):
+        status, out = self._scripted_tty(self._refresh_env({
+            "FAKE_COPILOT_MODE": "new", "FAKE_SESSION_IDS": "empty-n-session"}), [
+            (self.EMPTY_PROMPT, "n\n"), ("Session name (Enter for automatic):", "\n"),
+            ("[K/r/d]:", "k\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        with open(self.copilot_log, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), ["--model", "auto", "--auto-tier", "balance"])
+        self.assertEqual(self._calls(), [])
+
+    def test_help_never_calls_refresh_or_copilot(self):
+        result = run([COPILOT_S, "--help"], env=self._refresh_env(), stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Refresh subagent models", result.stdout)
+        self.assertEqual(self._calls(), [])
+        self.assertFalse(os.path.exists(self.copilot_log))
 
 
 class TestRegistryLockSafety(BaseHomeTestCase):

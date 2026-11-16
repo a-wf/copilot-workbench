@@ -12,6 +12,11 @@
 # - instructions/copilot-instructions.md
 # - README.md's "Agent pipeline" section
 # - tests/test_agent_pipeline.py EXPECTED_AGENTS / EXPECTED_ROUTING
+#
+# These are the shipped defaults only. copilot-s menu `p`
+# (bin/copilot-model-refresh.py) never edits this file: confirmed local
+# overrides live under <COPILOT_HOME>/model-refresh/ plus a generated
+# personal instruction, and are resolved on top of these defaults.
 agents:
   # Keep this inventory to the seven toolkit-owned agents. Built-in CLI
   # routes belong in built_in_tools below, not in agents/*.agent.md.

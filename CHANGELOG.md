@@ -6,6 +6,63 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Added — subagent model refresh from current prices (model-refresh-20261116-c1)
+
+- New `copilot-s` menu `p) Refresh subagent models from current prices`,
+  also offered when there are no saved sessions (that screen now waits for
+  Enter/`n` to start a new session, `p`, or `q` instead of launching
+  immediately; `p` never launches a session). It runs the new
+  `bin/copilot-model-refresh.py` (`status`, `preview`, `propose`, `apply`,
+  `discard`, `reset`), shows current vs proposed model · effort · context for
+  ten routes (seven agents, small/casual coder, stronger reviewer, built-in
+  `task`) with official per-1M rates, snapshot id/age, reasons and evidence,
+  and applies only after an exact `yes` (default No), then prints the final
+  effective routing and waits for Enter before returning to the menu.
+- Fit comes from the new dated, sourced `config/model-role-catalog.json`
+  (official Category, Task area, extended-capability and Copilot CLI client
+  labels transcribed from docs.github.com on 2026-11-16; expires
+  2027-02-14). Unassessed models are listed, never assigned; replacements
+  also need the user's verified `available_models` list, the route's
+  specific reasoning level verified for the model (source-backed catalog
+  `reasoning_levels` — none shipped — or the user's dated
+  `verified_capabilities`; unknown fails closed), and a ≥ 10% saving under a
+  disclosed blended workload mix (Default tier, plus the above-threshold
+  tier for `long_context` routes). Stale/unknown/unpriced → keep. The table
+  states up front that fit is categorical, not measured or equal quality;
+  user-fixable blocks end with an ACTION REQUIRED block and a config
+  example (always on a first run). An existing managed override whose
+  evidence becomes unavailable/stale is kept with its reason (never
+  reverted or re-selected); an unpriced current model is always kept;
+  catalog origins with future-dated or inconsistent review/source dates
+  authorize nothing; all entered dates use the local calendar date.
+- The orchestrator reads routing live via the new read-only
+  `copilot-model-refresh.py status --instructions` before each toolkit
+  delegation; fields set in `/subagents` print as `OMIT` (left out of the
+  task call) and are never frozen into the generated instruction or
+  `effective-routing.json`, which exist only while a managed override or
+  user-config pin exists. Interrupted-apply journals are validated (known
+  targets, matching backups inside the tool's backups folder) before any
+  rollback and are never deleted when untrustworthy.
+- Local-only, two-phase, journaled apply: frozen proposal digests, refusal
+  on concurrent edits, backups, rollback/crash recovery. Writes managed
+  `subagents.agents.<agent>` fields in `~/.copilot/settings.json` (effective
+  override values with user-config pins applied; never a user-set
+  `/subagents` value), a generated personal instruction
+  `~/.copilot/instructions/copilot-toolkit-model-routing.instructions.md`,
+  and state under `~/.copilot/model-refresh/`. Shipped routing defaults,
+  agent frontmatter and tests' expected defaults are unchanged; the shipped
+  instructions gain a directive to read `status --instructions` live before
+  each toolkit delegation (generated table as fallback).
+- `copilot-task-report.py`: new `refresh_official_pricing_now()` (explicit
+  refresh: skips the 24h TTL and 1h failure backoff, reuses a snapshot under
+  5 min old, otherwise the same fetcher/validation/cache); the parser now
+  records optional per-model `category` / `release_status` labels
+  (validated when present; older caches stay valid; never used for
+  pricing).
+- Installer links/copies `copilot-model-refresh.py` and the catalog;
+  uninstall/update never touch model-refresh state (run
+  `copilot-model-refresh.py reset --yes` before uninstalling).
+
 ### Added — opt-in cleanup of recent empty sessions (recent-empty-option-20261113-c1)
 
 - Menu `c` now first asks whether to also include recent empty sessions

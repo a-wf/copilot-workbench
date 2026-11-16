@@ -266,6 +266,7 @@ mkdir_p "$BIN_PREFIX"
 install_one "$REPO_ROOT/bin/copilot-s" "$BIN_PREFIX/copilot-s" true
 install_one "$REPO_ROOT/bin/copilot-task-report.py" "$BIN_PREFIX/copilot-task-report.py" true
 install_one "$REPO_ROOT/bin/copilot-session-cleanup.py" "$BIN_PREFIX/copilot-session-cleanup.py" true
+install_one "$REPO_ROOT/bin/copilot-model-refresh.py" "$BIN_PREFIX/copilot-model-refresh.py" true
 
 # --- Remove a stale pre-2.0 copilot-jira-report.py helper, if present ---
 # Only ever touches it when it's clearly this toolkit's own doing (see
@@ -302,6 +303,14 @@ install_one "$REPO_ROOT/instructions/copilot-instructions.md" "$COPILOT_HOME/cop
 log ""
 log "${BOLD}Agent routing defaults${RESET} -> $COPILOT_HOME/agent-routing.yaml"
 install_one "$REPO_ROOT/config/agent-routing.yaml" "$COPILOT_HOME/agent-routing.yaml"
+
+# --- Curated model role catalog (read by copilot-model-refresh.py, menu p) ---
+# Toolkit-managed like agent-routing.yaml (symlink/copy, replaced on update).
+# The user's own refresh state, pins, availability list and local catalog
+# overlay live in $COPILOT_HOME/model-refresh/ and are never touched here.
+log ""
+log "${BOLD}Model role catalog${RESET} -> $COPILOT_HOME/model-role-catalog.json"
+install_one "$REPO_ROOT/config/model-role-catalog.json" "$COPILOT_HOME/model-role-catalog.json"
 
 # --- Legacy data migration ---
 # Force any pre-2.0 ~/.copilot/jira-reports data (and its edited pricing

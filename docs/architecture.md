@@ -206,7 +206,8 @@ aggregate as Markdown.
   reason. Cache validation covers every field used later (ids, URLs, unit,
   `snapshot_id` == `sha256:` + first 16 hex of `content_sha256`,
   `fetched_at` consistent with `fetched_epoch`, string display names /
-  providers, `notes` as a list of strings, `lookup` equal to the one
+  providers, `notes` as a list of strings, optional `category` /
+  `release_status` labels as bounded non-empty strings, `lookup` equal to the one
   derived from the models); an invalid cache is rejected whole and
   re-fetched. A corrupted refresh-state file (bad UTF-8/JSON, non-numeric
   or negative/non-finite epochs/counters) is reset with a warning and shown
@@ -407,6 +408,89 @@ work item.
 This is pure configuration — no code ties the pipeline to the session
 manager or the task reporter. You can adopt just the agents, just the
 session manager, or both.
+
+## 4. `copilot-model-refresh.py` — subagent model refresh (menu `p`)
+
+An optional, user-triggered helper that reviews the pipeline's routes
+against current official prices. It never edits the shipped defaults
+(`config/agent-routing.yaml`, `agents/*.agent.md`, the instructions); it
+layers confirmed local overrides on top of them.
+
+- **Inputs.** Shipped defaults (parsed from `agent-routing.yaml` with a
+  strict minimal YAML-subset parser) for ten routes: the seven agents,
+  `coder.small_casual`, `reviewer.stronger`, and the built-in `task`. The
+  curated catalog `config/model-role-catalog.json` (installed as
+  `~/.copilot/model-role-catalog.json`): official Category, Task area,
+  1M-context / configurable-reasoning support and Copilot CLI client
+  listing per model, with source URLs, `reviewed_on`, and `expires_on`. The
+  user's `model-refresh/user-config.json` (availability list with
+  `verified_on`, pins, optional dated local catalog overlay). Native
+  `settings.json` `subagents.agents.<agent>` values. Official pricing comes
+  from `copilot-task-report.py`, loaded via `importlib`:
+  `refresh_official_pricing_now()` reuses the fixed-URL fetcher, parser,
+  validation, lock, cache, and keep-last-valid behavior, skipping only the
+  24h TTL and 1h failure backoff (a snapshot under 5 min old is reused).
+  The parser additionally records each model's official `category` and
+  `release_status` labels when present and consistent (optional, validated
+  snapshot fields; never used for pricing).
+- **Resolution.** shipped defaults → managed overrides (`state.json`) →
+  `/subagents` values the tool did not write (agent default routes) →
+  user-config pins (any route). Pinned routes are never re-proposed.
+- **Decision.** Proposals require a pricing snapshot under 24h old and an
+  unexpired catalog. A candidate must match the route baseline's official
+  task area with an equal-or-higher Category (or a dated route override),
+  support configurable reasoning and, for `long_context` routes, the 1M
+  window, be listed as included for Copilot CLI, still show its catalogued
+  Category in the live pricing, be in the user's availability list (≤ 30
+  days old), have the route's specific reasoning level verified for that
+  model (source-backed catalog `reasoning_levels` — none shipped, since the
+  docs do not list levels per model — or the user's ≤ 30-day
+  `verified_capabilities`; never inferred from `configurable_reasoning`),
+  and be ≥ 10% cheaper on a disclosed blended mix (15% input, 75% cached,
+  5% cache write, 5% output) of the Default-tier rates and, for
+  `long_context` routes, of the above-threshold tier rates too. An unpriced
+  current model (shipped baseline or override) is always kept, and an
+  existing managed override whose evidence is unavailable or stale is kept
+  with the reason, never reverted or re-selected; returning from an
+  override to the shipped baseline is itself a change and must pass every
+  gate — only keeping the current baseline is exempt. All entered dates are
+  compared with the user's local calendar date (no tolerance). Catalog
+  origins with future-dated reviews/source retrievals, sources newer than
+  the review, or `expires_on` not after `reviewed_on` authorize nothing.
+  Otherwise the route is
+  kept with the reason; user-fixable blocks (availability, reasoning level)
+  end the output with an ACTION REQUIRED block and a config example. The
+  table states that fit is categorical, not measured or equal quality.
+- **Two-phase apply.** `propose` writes `pending-proposal.json` (15 min TTL)
+  with digests of settings, state, user config, routing defaults, catalog
+  and generated files plus the expected output digests; `copilot-s` asks
+  for an exact `yes`, then `apply --proposal-id` re-reads everything and
+  refuses on any mismatch. The commit writes a journal and per-file backups,
+  re-checks each file's digest immediately before replacing it, defers
+  SIGINT/SIGTERM/SIGHUP, and rolls back on failure; an interrupted commit is
+  rolled back on the next run unless the file was changed by someone else
+  (then it stops and reports). Writes: `settings.json` (managed fields only
+  — the effective value of a managed override with user-config pins on top —
+  never a human `/subagents` value, never through a symlink), the generated
+  `instructions/copilot-toolkit-model-routing.instructions.md` (only while
+  a managed override or a user-config pin exists; never through a symlink
+  or over a file it did not write), `effective-routing.json`, and
+  `state.json`. Native `/subagents` pins are never copied into either
+  generated file: their fields are written as "omit" (`null` in
+  `effective-routing.json`) so later `/subagents` edits stay live.
+- **Runtime effect.** The shipped instructions tell the orchestrator to run
+  `copilot-model-refresh.py status --instructions` (local, read-only, no
+  network, no pricing/catalog needed) before each delegation to a toolkit
+  route and pass the printed `model` / `reasoning_effort` /
+  `context_tier`; a field printed as `OMIT` (any field currently set by a
+  human in `/subagents`, read live from `settings.json`) is left out of the
+  task call — the task tool has no `inherit` value. If the helper is
+  unavailable or reports the routing unavailable, the generated table
+  (same omit rule) or else the shipped defaults apply. Copilot CLI does not
+  document the precedence between `subagents.agents` settings and explicit
+  task-tool parameters; omitting a field is the only way to leave the
+  native value in effect, and all of this is instruction guidance, not an
+  enforced runtime guarantee.
 
 ## Known limitations
 

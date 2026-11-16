@@ -87,6 +87,12 @@ sessions may need a reload or restart.
 - **Global session manager** (`copilot-s`) — list, resume, rename, and
   delete Copilot CLI sessions across every directory, not just the one
   you're in, plus a recoverable cleanup of empty, never-used sessions.
+- **Subagent model refresh** (`copilot-s` menu `p`) — compares each
+  subagent route against the current official GitHub Copilot prices and a
+  dated, sourced catalog of official model categories, shows the
+  current/proposed table with reasons, and applies local overrides only
+  after you type `yes`; shipped defaults and your own `/subagents` values
+  are never overwritten.
 - **Automatic per-task usage reports** — every session exit appends
   token counts, model-call time, reasoning-effort intent, and an estimated
   USD cost to a cumulative Markdown report for the task associated with
@@ -301,6 +307,182 @@ still list quarantined sessions; the activity check narrows but cannot
 eliminate a race with a Copilot process starting at the same moment.
 Quarantine is never purged automatically — remove old batches yourself once
 you are sure you do not need them.
+
+### Refreshing subagent models from current prices (menu `p`)
+
+Menu option `p) Refresh subagent models from current prices` (also offered
+when there are no saved sessions — there, Enter still starts a new session
+and `p` returns to that menu instead of launching anything) runs
+`copilot-model-refresh.py propose`:
+
+1. **Current prices.** It fetches the official
+   [models and pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
+   page now, through the same fixed-URL HTTPS fetcher, strict parser,
+   validation, and cache as the usage reports (an explicit refresh skips
+   the 24h TTL and the 1h failure backoff; a snapshot fetched under 5 min ago
+   is reused). On failure (offline, parse error) the last valid snapshot is
+   shown, but nothing is proposed unless it is under 24h old.
+2. **Table.** For each of the ten routes — the seven custom agents,
+   `coder (small/casual)`, `reviewer (stronger override)`, and the built-in
+   `task` route — it shows the current model · effort · context and its
+   source (shipped default / managed override / your pin), the proposal,
+   official input / cached / cache-write / output rates per 1M tokens
+   (plus long-context tier rates), the snapshot id and cache age, and the
+   reason and evidence for every keep/change decision. Priced models that
+   the catalog has not assessed are listed but never assigned; models new
+   since your last refresh are flagged.
+3. **Confirm.** Changes are applied only after you type exactly `yes`
+   (anything else, Enter, or EOF cancels). The proposal is frozen with
+   digests of everything it read; `apply` refuses and changes nothing if
+   `settings.json`, the refresh state, your user config, the routing
+   defaults, the catalog, or the generated files changed in between, or if
+   the proposal is older than 15 min. Every outcome — applied, cancelled,
+   no changes, failed — prints the final effective routing (after a failure
+   via `status`; if even that cannot read its inputs, an explicit
+   "unavailable" message instead of a guessed table) and waits for Enter
+   before returning to the menu.
+
+**How a replacement is chosen (categorical fit, not a quality score).**
+`config/model-role-catalog.json` is a small, dated registry (reviewed
+2026-11-16, expires 2027-02-14) transcribed from GitHub's official docs: the
+pricing page's *Category* (Lightweight / Versatile / Powerful), the model
+comparison's *Task area*, the supported-models page's 1M-context and
+configurable-reasoning support, and its per-client Copilot CLI column. The
+shipped routes stay the baseline. A route is changed only when it is not
+pinned and a candidate:
+
+- has the same official task area as the route's shipped baseline model and
+  a Category at least as high, configurable reasoning, 1M-context support if
+  the route uses `long_context`, and is listed as included for Copilot CLI;
+- still shows the catalogued Category in the live pricing (otherwise it
+  needs re-review) and the catalog entry has not expired;
+- is in **your verified availability list** — Copilot CLI documents no
+  programmatic model catalog, so availability under your plan and
+  organization policy is never assumed from the pricing page;
+- has the route's **specific reasoning level** (e.g. `high`, `xhigh`)
+  verified for that model — either a source-backed `reasoning_levels` entry
+  in the catalog or your own dated `verified_capabilities` record. The
+  official docs only say reasoning is "configurable" and that levels vary
+  per model (Copilot CLI shows them only in the interactive `/model`
+  picker), so the shipped catalog lists no levels and an unknown level
+  always blocks the replacement; and
+- is at least 10% cheaper under a disclosed blended workload assumption
+  (15% input, 75% cached input, 5% cache write, 5% output of the Default-
+  tier rates — and, for `long_context` routes, also of the rates billed above
+  the long-context threshold). A current model that is unpriced (shipped
+  default or override alike) is always kept: no saving can be shown.
+
+The effort and context tier stay those of the route baseline. Nothing is
+inferred from price or release date; unknown, unavailable, unverified,
+stale, or unpriced always means *keep* with the reason shown — including
+for an existing managed override whose evidence can no longer be
+re-verified (it is kept, never silently reverted; returning to the shipped
+default is a change that must pass the same availability, reasoning-level
+and catalog gates; `reset` returns it unconditionally). All dates you or a
+catalog enter (`reviewed_on`, `retrieved_on`, `expires_on`, `verified_on`)
+are compared with your **local** calendar date. A catalog (shipped or local) whose review or any source
+`retrieved_on` date lies in the future, whose sources postdate its review,
+or whose `expires_on` is not after `reviewed_on` cannot authorize any
+replacement. The table
+itself states, before the routes, that fit is categorical and **not**
+measured quality, and a proposed change never claims equal quality. When
+replacements are blocked only by availability or reasoning levels you have
+not verified (always the case on a first run), the output ends with an
+**ACTION REQUIRED** block naming the blocked candidates and a ready-to-edit
+`user-config.json` example.
+
+**Your user config** — `~/.copilot/model-refresh/user-config.json` (never
+written by the tool; all keys optional):
+
+```json
+{
+  "schema_version": 1,
+  "available_models": {"verified_on": "2026-11-16", "models": ["gpt-6.1-terra", "claude-sonnet-5.5"]},
+  "verified_capabilities": {"verified_on": "2026-11-16", "models": {"gpt-6.1-terra": {"reasoning_levels": ["low", "medium", "high"]}}},
+  "pins": {"reviewer.stronger": {"model": "claude-opus-5.5"}},
+  "catalog": {
+    "reviewed_on": "2026-11-16", "expires_on": "2027-02-14",
+    "sources": {"my-review": {"url": "https://example.com/my-review", "retrieved_on": "2026-11-16"}},
+    "routes": {"coder": {"accepted_task_areas": ["Complex coding tasks", "Interactive and agentic coding"]}},
+    "models": {}
+  }
+}
+```
+
+`available_models` older than 30 days blocks replacements until you re-verify
+it. `verified_capabilities` (same 30-day limit) records, per model, only the
+reasoning levels you have seen offered for it in Copilot CLI's `/model`
+picker — the example values above are illustrative, not verified facts.
+`pins` (route keys: the agent names plus `coder.small_casual`,
+`reviewer.stronger`, `task`) hold any of `model` / `reasoning_effort` /
+`context_tier`. `catalog` is an optional dated local overlay with the same
+schema as `config/model-role-catalog.json` (its model entries and route
+policies take precedence) — this is how you vet a new model.
+
+**What applying writes (and never writes).** Shipped defaults —
+`config/agent-routing.yaml`, `agents/*.agent.md`, and the instructions — are
+never edited, and the `copilot` launch still forces Auto with the Balance
+tier for the main session. Effective routing is resolved as shipped defaults
+→ managed overrides → your pins (native `/subagents` values in
+`~/.copilot/settings.json` that this tool did not write, then `pins` in the
+user config). One journaled transaction (backups under
+`~/.copilot/model-refresh/backups/`, rolled back on failure, recovered on
+the next run after a crash, Ctrl-C deferred while it commits) updates:
+
+- `~/.copilot/settings.json` → `subagents.agents.<agent>.{model,
+  effortLevel, contextTier}` for agent default routes with a managed
+  override or a `user-config.json` pin (each field gets the effective value,
+  so a tool-written value never contradicts a later user-config pin). Values
+  you set yourself in `/subagents` are never overwritten, and values the
+  tool wrote earlier are removed again when no longer needed. Other
+  settings are preserved, but the file is re-serialized as 2-space JSON; a
+  non-JSON or symlinked `settings.json` is never written.
+- `~/.copilot/instructions/copilot-toolkit-model-routing.instructions.md` —
+  a generated personal instruction holding only the effective table
+  (validated model IDs, efforts, tiers, `OMIT`; no prices or remote text).
+  It exists only while a managed override or a user-config pin exists —
+  native `/subagents` values alone never create it, and `reset` removes it
+  when only those remain. A field you set in `/subagents` is written as
+  `OMIT`, never as a frozen copy of its value. A symlinked `instructions/`
+  directory, or a file there that the tool did not write, is never written
+  through or replaced.
+- `~/.copilot/model-refresh/state.json` and `effective-routing.json` (same
+  lifetime as the generated instruction; `/subagents` fields are `null`).
+
+**How the orchestrator uses it.** The shipped orchestrator instructions
+tell it to run `copilot-model-refresh.py status --instructions` before each
+delegation to a toolkit route. That command is local and read-only (no
+network, pricing, or catalog) and reads `settings.json` live, so a
+`/subagents` change is honored on the next delegation without running `p`:
+
+```
+discovery            model=gpt-6-luna reasoning_effort=low context_tier=long_context
+coder                model=OMIT reasoning_effort=medium context_tier=default
+```
+
+`OMIT` means the field is left out of the task call so your live
+`/subagents` value applies (the task tool has no `inherit` value). If the
+command is unavailable or reports the routing unavailable (for example an
+unreadable `settings.json` or a pending interrupted apply), the generated
+table — same `OMIT` rule — or else the shipped defaults apply.
+
+**Limits.** Copilot CLI 1.0.112 documents the per-agent `subagents.agents`
+settings but not their precedence over explicit task-tool parameters, and
+one per-agent value cannot express the small/casual coder or stronger
+reviewer contexts. Omitting a field is the only way to leave a native value
+in effect; the routing above is instruction guidance the orchestrator
+follows, not a hard guarantee. New sessions load the generated instruction
+(check with `copilot instruction list`). `settings.json` can also be
+rewritten by Copilot itself; the tool re-checks its digest right before
+replacing it, which narrows but cannot eliminate that race.
+`copilot-model-refresh.py status` shows the effective routing without any
+network or writes (and reports it as unavailable rather than guessing when
+`settings.json` cannot be read); `copilot-model-refresh.py reset --yes`
+removes every managed override and only the `/subagents` values the tool
+wrote (your pins stay). An interrupted apply is rolled back on the next run
+only when its journal is fully valid (known targets, backups inside the
+tool's own backups folder that still match); otherwise nothing is restored
+or deleted and the output explains how to recover by hand.
 
 ### Context metrics (new copilot-s sessions only)
 
@@ -749,6 +931,8 @@ Verify the pipeline is loaded:
 | Legacy company fixed per-request policy (inactive) | `~/.copilot/task-reports/request-pricing.json` | copied from `config/request-pricing.json` on first install (only if absent); unused |
 | Executables install prefix | `scripts/install.sh --prefix DIR` | `~/.local/bin` |
 | Install method | `scripts/install.sh --copy` | symlink |
+| Subagent model refresh (menu `p`) | `copilot-model-refresh.py`; state, backups and your `user-config.json` in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated catalog `~/.copilot/model-role-catalog.json` | no overrides; replacements need your verified `available_models` list |
+| Model refresh helper path | `COPILOT_MODEL_REFRESH_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-model-refresh.py` |
 
 ## Security & privacy
 
@@ -756,8 +940,9 @@ Verify the pipeline is loaded:
   itself (the Copilot CLI's own telemetry is a separate concern — see
   GitHub's documentation). The only network request it makes is an
   anonymous HTTPS GET of the public GitHub pricing page (at most once per
-  24h; disable with `COPILOT_TASK_REPORT_PRICING_FETCH=0`) — no usage,
-  task, or account data is sent.
+  24h, or when you explicitly choose menu `p`; disable with
+  `COPILOT_TASK_REPORT_PRICING_FETCH=0`) — no usage, task, or account data
+  is sent.
 - Task IDs, tokens, and cost data are stored only in your own
   `~/.copilot/task-reports/` directory and your reports directory —
   nothing is transmitted or shared by these scripts.
@@ -778,6 +963,11 @@ scripts/update.sh                        # git pull --ff-only, then re-run the i
 Uninstalling never touches usage reports, task/session ingest state,
 your pricing configs/cache, Copilot session state, or quarantined sessions
 (`~/.copilot-s-quarantine`) — only the symlinks/copies this toolkit created.
+It also leaves the subagent model-refresh state and anything an applied
+refresh wrote (`/subagents` values in `~/.copilot/settings.json`, the
+generated `~/.copilot/instructions/copilot-toolkit-model-routing.instructions.md`);
+run `copilot-model-refresh.py reset --yes` first to remove the tool's own
+overrides. Updating keeps all of that state and your pins.
 
 ## Roadmap
 

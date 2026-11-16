@@ -70,6 +70,15 @@ else
   SESSION_CLEANUP_HELPER="$HOME/.local/bin/copilot-session-cleanup.py"
 fi
 SESSION_QUARANTINE_DIR="$HOME/.copilot-s-quarantine"
+# --- Subagent model refresh helper (menu option p) ---
+# Same resolution order as the task report helper above.
+if [[ -n "${COPILOT_MODEL_REFRESH_HELPER:-}" ]]; then
+  MODEL_REFRESH_HELPER="$COPILOT_MODEL_REFRESH_HELPER"
+elif [[ -f "$SCRIPT_DIR/copilot-model-refresh.py" ]]; then
+  MODEL_REFRESH_HELPER="$SCRIPT_DIR/copilot-model-refresh.py"
+else
+  MODEL_REFRESH_HELPER="$HOME/.local/bin/copilot-model-refresh.py"
+fi
 
 # --- Short cross-process lock for ~/.copilot-sessions rewrites ---
 # Exclusive flock(2) on "$SESSIONS_FILE.lock" (a persistent regular file),
@@ -759,6 +768,7 @@ list_sessions() {
   echo -e "  ${BOLD}${GREEN}n)${RESET} New session"
   echo -e "  ${BOLD}${YELLOW}d)${RESET} Delete a session"
   echo -e "  ${BOLD}${YELLOW}c)${RESET} Clean up empty sessions (recoverable)"
+  echo -e "  ${BOLD}${CYAN}p)${RESET} Refresh subagent models from current prices"
   echo -e "  ${BOLD}q)${RESET} Quit"
   echo ""
   return 0
@@ -1202,6 +1212,116 @@ cleanup_empty_sessions() {
   return 0
 }
 
+# --- Subagent model refresh (menu option p) ---
+# Fetches CURRENT official GitHub Copilot prices via copilot-model-refresh.py,
+# shows the current/proposed routing table, and applies the frozen proposal
+# only after an exact `yes` (default No). The helper refuses to apply if any
+# input changed since the table was shown. Every outcome (applied, cancelled,
+# no changes, offline/failed) prints the final effective routing and waits for
+# Enter, then the caller returns to the menu — never launches `copilot`.
+pause_for_menu() {
+  local _ignored=""
+  echo -ne "${DIM}Press Enter to return to the menu...${RESET}"
+  prompt_read _ignored
+  echo ""
+  return 0
+}
+
+# Best-effort final table after a failed/refused propose or apply: the
+# helper's read-only status. If even that fails (e.g. invalid settings or
+# state), say so plainly instead of printing guessed defaults.
+show_model_routing_status() {
+  echo ""
+  if ! python3 "$MODEL_REFRESH_HELPER" status; then
+    echo -e "${RED}Current effective routing is unavailable (status failed, see above). Nothing was changed; no table is shown rather than a guessed one.${RESET}" >&2
+  fi
+  return 0
+}
+
+refresh_model_routing() {
+  if [[ ! -f "$MODEL_REFRESH_HELPER" ]]; then
+    echo -e "${RED}Model refresh helper not found at $MODEL_REFRESH_HELPER — subagent routing unchanged. Set COPILOT_MODEL_REFRESH_HELPER or re-run the installer.${RESET}" >&2
+    pause_for_menu
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${RED}python3 not found — subagent routing unchanged.${RESET}" >&2
+    pause_for_menu
+    return 0
+  fi
+
+  echo -e "\n${CYAN}Fetching current official GitHub Copilot prices...${RESET}"
+  local out="" rc=0 line proposal_id="" tab=$'\t'
+  out=$(python3 "$MODEL_REFRESH_HELPER" propose) || rc=$?
+  echo ""
+  while IFS= read -r line; do
+    if [[ "$line" == "PROPOSAL${tab}"* ]]; then
+      proposal_id="${line#"PROPOSAL${tab}"}"
+    else
+      echo "$line"
+    fi
+  done <<< "$out"
+
+  if [[ $rc -eq 3 ]]; then
+    : # No changes: the helper already printed the final (kept) routing.
+  elif [[ $rc -ne 0 ]]; then
+    echo -e "${RED}Model refresh did not complete (exit $rc) — subagent routing unchanged.${RESET}" >&2
+    show_model_routing_status
+  elif [[ ! "$proposal_id" =~ ^[0-9a-f]{16}$ ]]; then
+    echo -e "${RED}Model refresh returned no valid proposal — subagent routing unchanged.${RESET}" >&2
+    show_model_routing_status
+  else
+    echo ""
+    echo -ne "${YELLOW}Type 'yes' to apply these subagent routing changes (categorical fit, not measured quality; anything else cancels): ${RESET}"
+    local confirm="" apply_rc=0
+    prompt_read confirm
+    if [[ "$confirm" == "yes" ]]; then
+      python3 "$MODEL_REFRESH_HELPER" apply --proposal-id "$proposal_id" || apply_rc=$?
+      if [[ $apply_rc -ne 0 ]]; then
+        echo -e "${RED}Apply did not complete (exit $apply_rc) — see the message above; current routing:${RESET}" >&2
+        show_model_routing_status
+      fi
+    else
+      python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" || true
+    fi
+  fi
+  echo ""
+  pause_for_menu
+  return 0
+}
+
+# Shown when there are no saved sessions at all. Enter (or n) starts a new
+# session exactly like before; p refreshes subagent models and comes back
+# here instead of launching anything; q quits.
+empty_session_menu() {
+  while true; do
+    echo -e "\n${DIM}No saved sessions found.${RESET}"
+    echo -e "  ${BOLD}${GREEN}n)${RESET} New session (default)"
+    echo -e "  ${BOLD}${CYAN}p)${RESET} Refresh subagent models from current prices"
+    echo -e "  ${BOLD}q)${RESET} Quit"
+    echo -ne "${BOLD}Start a new session? [Enter/n = new, p, q]: ${RESET}"
+    local choice=""
+    prompt_read choice
+    case "$choice" in
+      p|P)
+        refresh_model_routing
+        ;;
+      q|Q)
+        echo "Bye!"
+        return 0
+        ;;
+      ""|n|N)
+        echo -e "${DIM}Starting a new one...${RESET}\n"
+        run_copilot "" "$@"
+        return 0
+        ;;
+      *)
+        echo "Invalid selection."
+        ;;
+    esac
+  done
+}
+
 # --- Interactive menu ---
 select_session() {
   echo -ne "${BOLD}Select session to resume (or n/q): ${RESET}"
@@ -1247,6 +1367,15 @@ select_session() {
         fi
       else
         echo -e "\n${DIM}No sessions left. Run copilot-s again to start a new one.${RESET}"
+      fi
+      ;;
+    p|P)
+      refresh_model_routing
+      # Never auto-launch a new session after a model refresh.
+      if list_sessions; then
+        select_session "$@"
+      else
+        empty_session_menu "$@"
       fi
       ;;
     *)
@@ -1308,6 +1437,13 @@ ${BOLD}Features:${RESET}
     type \`yes\`, moves them to ~/.copilot-s-quarantine (recoverable, never
     deleted). Restore with:
     copilot-session-cleanup.py restore --batch <batch>
+  - Refresh subagent models (menu \`p\`, also offered when there are no
+    sessions): fetches the CURRENT official GitHub Copilot prices, shows
+    the current vs proposed model/effort/context per subagent route with
+    rates, reasons and evidence, and applies local overrides only after
+    you type \`yes\` (default No). Shipped defaults are never edited; your
+    own /subagents values are never overwritten. Undo with:
+    copilot-model-refresh.py reset --yes
   - Prompts to keep/rename/delete a session when \`copilot\` exits
   - For sessions created by copilot-s from now on: shows the context fill
     last observed before a compaction and the successful compaction count
@@ -1320,6 +1456,7 @@ ${BOLD}Environment:${RESET}
   COPILOT_TASK_REPORTS_DIR       Override where task usage reports are written
   COPILOT_TASK_REPORT_HELPER     Override the path to copilot-task-report.py
   COPILOT_SESSION_CLEANUP_HELPER Override the path to copilot-session-cleanup.py
+  COPILOT_MODEL_REFRESH_HELPER   Override the path to copilot-model-refresh.py
 
 Verify install with: copilot-s --help
 EOF
@@ -1449,8 +1586,9 @@ main() {
       echo -e "${DIM}  No sessions for current directory. Showing all.${RESET}\n"
       select_session "$@"
     else
-      echo -e "\n${DIM}No saved sessions found. Starting a new one...${RESET}\n"
-      run_copilot "" "$@"
+      # Not an automatic launch any more: Enter starts a new session as
+      # before, while p (model refresh) returns here instead of launching.
+      empty_session_menu "$@"
     fi
   fi
 }

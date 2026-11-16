@@ -2480,6 +2480,11 @@ OFFICIAL_PRICING_TTL_SECONDS = 24 * 3600
 # newly ingested calls; it is kept on disk and shown for reference only.
 OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS = 7 * 24 * 3600
 OFFICIAL_PRICING_RETRY_BACKOFF_SECONDS = 3600
+# Explicit, user-requested refreshes (refresh_official_pricing_now, used by
+# copilot-model-refresh.py / copilot-s menu `p`) bypass the 24h TTL and the
+# failure backoff, but still reuse a snapshot fetched less than this long ago
+# instead of re-downloading it (repeated menu presses never hammer the docs).
+OFFICIAL_PRICING_MANUAL_MIN_INTERVAL_SECONDS = 300
 OFFICIAL_PRICING_TIMEOUT_SECONDS = 10
 OFFICIAL_PRICING_TOTAL_DEADLINE_SECONDS = 20
 OFFICIAL_PRICING_MAX_BYTES = 1_000_000
@@ -2760,8 +2765,10 @@ _NOT_APPLICABLE = "not applicable"
 
 _OFFICIAL_COLUMNS = {
     "model": "model",
-    "release status": None,
-    "category": None,
+    # Descriptive (non-price) columns: recorded per model when present and
+    # consistent across its tier rows; never used for pricing.
+    "release status": "release_status",
+    "category": "category",
     "tier": "tier",
     "threshold (input tokens)": "threshold",
     "input": "input",
@@ -2770,6 +2777,8 @@ _OFFICIAL_COLUMNS = {
     "output": "output",
 }
 _REQUIRED_COLUMNS = ("model", "input", "cached_input", "output")
+_OFFICIAL_LABEL_MAX_LEN = 80
+_OFFICIAL_LABEL_KEYS = ("category", "release_status")
 _IMAGE_GENERATION_HEADING = "image generation models"
 _IMAGE_GENERATION_COLUMNS = (
     "model", "release status", "text input", "cached text input",
@@ -2983,10 +2992,14 @@ def parse_official_pricing_markdown(text):
             else:
                 rates["cache_write"] = None
                 rates["cache_write_status"] = CACHE_WRITE_NOT_LISTED
-            rows = rows_by_model.setdefault(model_id, {"display_name": display, "rows": [], "notes": []})
+            rows = rows_by_model.setdefault(model_id, {"display_name": display, "rows": [], "notes": [],
+                                                       "labels": {"category": set(), "release_status": set()}})
             if rows["display_name"] != display:
                 raise OfficialPricingError("%s: conflicting display names for id %r" % (where, model_id))
             rows["rows"].append({"tier": tier, "threshold": threshold, "rates": rates})
+            for label_key in ("category", "release_status"):
+                if label_key in col_index:
+                    rows["labels"][label_key].add(_clean_cell_text(cells[col_index[label_key]]))
             for note in notes:
                 if note not in rows["notes"]:
                     rows["notes"].append(note)
@@ -3003,6 +3016,14 @@ def parse_official_pricing_markdown(text):
                 "threshold": threshold,
                 "tiers": tiers,
             }
+            # Optional descriptive labels: kept only when exactly one
+            # non-empty, bounded value appears across the model's rows
+            # (anything else is simply omitted — never guessed).
+            for label_key, values in info["labels"].items():
+                if len(values) == 1:
+                    value = next(iter(values))
+                    if value and len(value) <= _OFFICIAL_LABEL_MAX_LEN:
+                        models[model_id][label_key] = value
 
     if n_tables == 0:
         raise OfficialPricingError("no pricing tables found")
@@ -3141,6 +3162,14 @@ def validate_official_snapshot(snap):
             notes = []
         if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
             raise OfficialPricingError("%s: 'notes' must be a list of strings" % where)
+        for label_key in _OFFICIAL_LABEL_KEYS:
+            # Optional (absent in caches written before these labels were
+            # recorded); when present, a bounded non-empty string.
+            label = entry.get(label_key)
+            if label is not None and (not isinstance(label, str) or not label
+                                      or len(label) > _OFFICIAL_LABEL_MAX_LEN):
+                raise OfficialPricingError("%s: %r must be a non-empty string of at most %d characters"
+                                           % (where, label_key, _OFFICIAL_LABEL_MAX_LEN))
         tiers = entry["tiers"]
         threshold = entry.get("threshold")
         if threshold is None:
@@ -3259,6 +3288,23 @@ def refresh_official_pricing_if_due(now=None):
     return result
 
 
+def refresh_official_pricing_now(now=None, min_interval_seconds=OFFICIAL_PRICING_MANUAL_MIN_INTERVAL_SECONDS):
+    """Explicit, user-requested refresh (copilot-model-refresh.py / copilot-s
+    menu `p`). Unlike refresh_official_pricing_if_due it ignores the 24h TTL
+    and the 1h failure backoff, but it keeps everything else: the
+    COPILOT_TASK_REPORT_PRICING_FETCH kill switch, the refresh lock, the same
+    fixed HTTPS source, strict parsing/validation, and keep-last-valid-cache
+    on failure (the failure is still recorded in the refresh state). A
+    snapshot fetched less than `min_interval_seconds` ago is reused instead
+    of downloaded again. Never raises; returns the same result dict shape
+    (also memoized so a later automatic refresh in this process is a no-op)."""
+    path = official_pricing_cache_path()
+    result = _refresh_official_pricing(time.time() if now is None else now, force=True,
+                                       min_interval_seconds=min_interval_seconds)
+    _OFFICIAL_REFRESH_RESULTS[path] = result
+    return result
+
+
 def official_snapshot_age_status(age_seconds):
     """Classify a cached snapshot by its age since it was FETCHED:
     'fresh' (< TTL), 'stale' (TTL .. OFFICIAL_PRICING_MAX_PRICING_AGE_SECONDS;
@@ -3282,7 +3328,7 @@ def _reset_invalid_refresh_state(state_error):
               "retry metadata." % ex, file=sys.stderr)
 
 
-def _refresh_official_pricing(now):
+def _refresh_official_pricing(now, force=False, min_interval_seconds=OFFICIAL_PRICING_MANUAL_MIN_INTERVAL_SECONDS):
     if not official_pricing_fetch_enabled():
         return {"attempted": False, "status": "disabled"}
     try:
@@ -3293,12 +3339,15 @@ def _refresh_official_pricing(now):
             snapshot, cache_error = read_official_snapshot_cache()
             if snapshot is not None:
                 age = now - snapshot["fetched_epoch"]
-                if 0 <= age < OFFICIAL_PRICING_TTL_SECONDS:
+                reuse_window = min_interval_seconds if force else OFFICIAL_PRICING_TTL_SECONDS
+                if 0 <= age < reuse_window:
                     return {"attempted": False, "status": "fresh"}
             # Validated above: epochs are None or finite nonnegative numbers.
+            # An explicit (forced) refresh is a direct user request, so it
+            # is not subject to the automatic failure backoff.
             last_fail = state.get("last_failure_epoch")
             last_ok = state.get("last_success_epoch") or 0
-            if (last_fail is not None and last_fail > last_ok
+            if (not force and last_fail is not None and last_fail > last_ok
                     and 0 <= now - last_fail < OFFICIAL_PRICING_RETRY_BACKOFF_SECONDS):
                 return {"attempted": False, "status": "suppressed"}
 
