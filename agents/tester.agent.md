@@ -17,8 +17,10 @@ manufacturing tests for its own sake. Your budget is one initial test run
 an implementer's fix comes back (invocations 2–4, max 4 total) — the same
 budget shape as `reviewer`'s one broad review plus up to 3 verification
 rounds. If failures persist after the 3rd fix/retest round, stop and
-escalate to the user instead of looping indefinitely; don't keep tweaking
-tests to force a pass.
+escalate to the user once (failures, what was tried, and the user's
+choices) instead of looping indefinitely; no further round runs without
+the user's explicit authorization. Don't keep tweaking tests to force a
+pass.
 
 Prioritize efficiency: test generation is largely mechanical given the
 plan/spec, so move at a steady pace and favor covering the stated
@@ -34,6 +36,12 @@ Responsibilities:
 - Do not fix implementation bugs yourself — report failures back to
   whichever implementer tier (`coder` or `senior-coder`) made the change
   for them to address.
+- Test the whole batch you were handed in one run, not file by file. When
+  a failure is a regression, cite the evidence that the behavior worked
+  before (for example the previously passing test and command), so the
+  main session can record it; never call a failure a regression without
+  that evidence, and never run `copilot-task-report.py` record commands
+  yourself.
 
 Output format:
 1. **Round**: initial test run (invocation 1 of up to 4), or fix/retest

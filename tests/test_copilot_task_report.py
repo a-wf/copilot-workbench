@@ -27,6 +27,7 @@ path constants are monkeypatched to point inside it).
 
 import contextlib
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -42,6 +43,7 @@ import urllib.error
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULE_PATH = os.path.join(REPO_ROOT, "bin", "copilot-task-report.py")
@@ -4169,6 +4171,107 @@ class TestMissingAndTruncatedTelemetry(BaseTestCase):
     """Missing files must not block other sources; truncation must warn and
     resync safely."""
 
+    def decode_failure_values(self):
+        limit = getattr(sys, "get_int_max_str_digits", lambda: 0)()
+        if limit <= 0:
+            self.skipTest("Python's integer conversion digit limit is unavailable or disabled")
+        # Python 3.12's JSON decoder has its own recursion limit, independent
+        # of sys.getrecursionlimit(). A fixed ~200 KB value exceeds both
+        # decoder limits without changing interpreter limits or growing
+        # the fixture from environment-dependent settings.
+        depth = 100_000
+        return (
+            ("oversized-int", "9" * max(5000, limit + 1), ValueError),
+            ("nested", "[" * depth + "0" + "]" * depth, RecursionError),
+        )
+
+    def test_otel_seed_and_reader_skip_oversized_integer_and_recursive_json_lines(self):
+        for kind, raw_value, error in self.decode_failure_values():
+            with self.subTest(kind=kind):
+                session_id = "sess-otel-json-" + kind
+                task_id = "JSON-OTEL-" + kind
+                spans = []
+                for index in (1, 2):
+                    start = self.t0 + timedelta(minutes=index)
+                    spans.append(otel_span(
+                        session_id, "chat gpt-6-luna", start, start + timedelta(seconds=1),
+                        usage_attrs("gpt-6-luna", prompt=10, completion=5),
+                        trace_id="json-recovery", span_id="call-%d" % index,
+                    ))
+                broken = copy.deepcopy(spans[0])
+                broken["attributes"]["gen_ai.usage.input_tokens"] = "BROKEN_JSON_VALUE"
+                bad_line = json.dumps(broken).replace('"BROKEN_JSON_VALUE"', raw_value) + "\n"
+                # Prove these exercise decoder ValueError/RecursionError,
+                # rather than ordinary invalid JSON or invalid usage counts.
+                with self.assertRaises(error):
+                    json.loads(bad_line)
+                path = self.otel_path(kind + ".jsonl")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    # The leading bad line reaches the seeder; the second
+                    # reaches the incremental reader before a valid span.
+                    f.write(bad_line + json.dumps(spans[0]) + "\n"
+                            + bad_line + json.dumps(spans[1]) + "\n")
+                self.assertEqual(self.mod.seed_jsonl_offset_by_ts(
+                    path, self.t0.timestamp(), lambda e: self.mod.otel_ts(e.get("startTime"))),
+                    len(bad_line.encode("utf-8")))
+                write_jsonl(self.events_path(session_id), [{
+                    "type": "session.usage_checkpoint",
+                    "timestamp": iso(self.t0 + timedelta(minutes=1)),
+                    "data": {"totalNanoAiu": 7, "totalPremiumRequests": 1},
+                }])
+                self.assertEqual(self.ingest(session_id, task_id), 0)
+                task = self.task(task_id)
+                self.assertEqual(task["totals"]["call_count"], 2)
+                self.assertEqual(task["totals"]["total_tokens"], 30)
+                self.assertEqual(task["totals"]["nano_aiu"], 7)
+                self.assertEqual(len(task["feature_usage"]["calls"]), 2)
+                cursor = self.mod.load_json(self.mod.STATE_FILE, {})[session_id]["otel_files"][path]
+                self.assertEqual(cursor["offset"], os.path.getsize(path))
+                self.assertEqual(self.ingest(session_id, task_id), 0)
+                self.assertEqual(self.task(task_id), task)
+                self.assertEqual(
+                    self.mod.load_json(self.mod.STATE_FILE, {})[session_id]["otel_files"][path],
+                    cursor,
+                )
+
+    def test_event_seed_and_reader_skip_oversized_integer_and_recursive_json_lines(self):
+        for kind, raw_value, error in self.decode_failure_values():
+            with self.subTest(kind=kind):
+                session_id = "sess-events-json-" + kind
+                task_id = "JSON-EVENTS-" + kind
+
+                def checkpoint(minute, nano_aiu, requests):
+                    return {"type": "session.usage_checkpoint",
+                            "timestamp": iso(self.t0 + timedelta(minutes=minute)),
+                            "data": {"totalNanoAiu": nano_aiu, "totalPremiumRequests": requests}}
+
+                pre = checkpoint(-1, 100, 10)
+                broken = checkpoint(1, "BROKEN_JSON_VALUE", 11)
+                bad_line = json.dumps(broken).replace('"BROKEN_JSON_VALUE"', raw_value) + "\n"
+                with self.assertRaises(error):
+                    json.loads(bad_line)
+                pre_line = json.dumps(pre) + "\n"
+                path = self.events_path(session_id)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(bad_line + pre_line + json.dumps(checkpoint(1, 125, 12)) + "\n"
+                            + bad_line + json.dumps(checkpoint(2, 150, 13)) + "\n")
+                seeded = self.mod.seed_events_state_for_install(path, self.t0.timestamp())
+                self.assertEqual(seeded["offset"], len((bad_line + pre_line).encode("utf-8")))
+                self.assertEqual(seeded["checkpoint_baseline"], {"nano_aiu": 100, "premium_requests": 10})
+                self.assertEqual(self.ingest(session_id, task_id), 0)
+                task = self.task(task_id)
+                self.assertEqual(task["totals"]["call_count"], 0)
+                self.assertEqual(task["totals"]["nano_aiu"], 50)
+                self.assertEqual(task["totals"]["premium_requests"], 3)
+                state = self.mod.load_json(self.mod.STATE_FILE, {})[session_id]
+                self.assertEqual(state["events_offset_state"]["offset"], os.path.getsize(path))
+                self.assertEqual(state["checkpoint_cursor"], {"nano_aiu": 150, "premium_requests": 13})
+                self.assertEqual(self.ingest(session_id, task_id), 0)
+                self.assertEqual(self.task(task_id), task)
+                self.assertEqual(self.mod.load_json(self.mod.STATE_FILE, {})[session_id], state)
+
     def test_missing_otel_does_not_block_events_only_ingest(self):
         session_id = "sess-no-otel"
         ts = self.t0 + timedelta(minutes=1)
@@ -6671,6 +6774,838 @@ class TestContextMetricsSidecars(BaseTestCase):
         self.assertEqual(rebuilt["last_precompaction_snapshot"]["token_limit"], 100)
         with open(sidecar_path, encoding="utf-8") as f:
             self.assertNotIn(str(huge), f.read())
+
+
+class FeatureTrackingCase(BaseTestCase):
+    """Synthetic spans and explicit records only; no personal reporting state."""
+
+    TASK = "FEATURE-1"
+    SID = "feature-session"
+    TRACE = "trace-a"
+
+    def call(self, span_id="call-1", *, session_id=None, trace_id=None,
+             parent="invoke-1", model="gpt-6-luna", minute=1, **usage):
+        start = self.t0 + timedelta(minutes=minute)
+        return otel_span(
+            session_id or self.SID, "chat " + model, start,
+            start + timedelta(seconds=2), usage_attrs(model, **usage),
+            trace_id=trace_id or self.TRACE, span_id=span_id, parent_span_id=parent,
+        )
+
+    def invocation(self, span_id="invoke-1", *, parent=None):
+        return otel_span(
+            self.SID, "invoke_agent", self.t0 + timedelta(minutes=1),
+            self.t0 + timedelta(minutes=2),
+            {"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": "senior-coder"},
+            trace_id=self.TRACE, span_id=span_id, parent_span_id=parent,
+        )
+
+    def seed(self, spans=None):
+        snapshot = self.write_official_snapshot()
+        write_jsonl(self.otel_path(), spans if spans is not None else [
+            self.invocation(), self.call(),
+        ])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        return snapshot
+
+    def delivery(self, event="started", *, record_id=None, feature="checkout",
+                 cycle="cycle-1", seconds=None, **extra):
+        if seconds is None:
+            seconds = 60 if event == "started" else 660
+        raw = {
+            "schema": "copilot-task-report.delivery-record", "schema_version": 1,
+            "record_id": record_id or (cycle + "-" + event), "task_id": self.TASK,
+            "feature_id": feature, "cycle_id": cycle, "event": event,
+            "occurred_at": iso(self.t0 + timedelta(seconds=seconds)),
+            "provenance": {"source": "orchestrator-supplied",
+                           "basis": "orchestrator-observed", "reference": "batch-1"},
+        }
+        if event in ("defect-confirmed", "regression-confirmed"):
+            raw.update(finding_id="finding-1", severity="high", category="correctness",
+                       evidence_reference="tests/test_checkout.py::test_total")
+        if event == "regression-confirmed":
+            raw["previous_working_reference"] = "commit-123:test_total passed"
+        raw.update(extra)
+        return raw
+
+    def selector(self, span="call-1", kind="call", *, session_id=None, trace_id=None):
+        return {"kind": kind, "session_id": session_id or self.SID,
+                "trace_id": trace_id or self.TRACE, "span_id": span}
+
+    def key(self, span="call-1", *, session_id=None, trace_id=None):
+        return "/".join((session_id or self.SID, trace_id or self.TRACE, span))
+
+    def usage_record(self, selectors=None, keys=None, *, record_id="link-1",
+                     feature="checkout", cycle="cycle-1"):
+        keys = [self.key()] if keys is None else keys
+        return {
+            "schema": "copilot-task-report.feature-usage-record", "schema_version": 1,
+            "record_id": record_id, "task_id": self.TASK, "feature_id": feature,
+            "cycle_id": cycle, "selectors": selectors or [self.selector()],
+            "expected_call_count": len(set(keys)),
+            # Independent of the production hash helper, including trailing newline.
+            "expected_call_set_sha256": hashlib.sha256(
+                "".join(k + "\n" for k in sorted(set(keys))).encode()).hexdigest(),
+            "provenance": {"source": "orchestrator-supplied",
+                           "basis": "orchestrator-selected", "reference": "batch-1 exact spans"},
+        }
+
+    def write_input(self, raw):
+        path = os.path.join(self.tmp, "tracking-input.json")
+        self.mod.atomic_write(path, json.dumps(raw))
+        return path
+
+    def record(self, command, raw):
+        out, err = io.StringIO(), io.StringIO()
+        args = SimpleNamespace(input=self.write_input(raw))
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = getattr(self.mod, "cmd_" + command.replace("-", "_"))(args)
+        return rc, out.getvalue(), err.getvalue()
+
+    def record_ok(self, command, raw):
+        rc, out, err = self.record(command, raw)
+        self.assertEqual(rc, 0, out + err)
+        return out
+
+    def cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", [MODULE_PATH, *args]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as result:
+                self.mod.main()
+        return result.exception.code, out.getvalue(), err.getvalue()
+
+    def preview(self, *selectors, **options):
+        args = ["feature-calls", "--task", self.TASK, "--session-id", self.SID,
+                "--feature-id", options.pop("feature", "checkout"),
+                "--cycle-id", options.pop("cycle", "cycle-1"), *selectors]
+        for key, value in options.items():
+            args.extend(("--" + key.replace("_", "-"), value))
+        rc, out, err = self.cli(*args)
+        self.assertEqual(rc, 0, out + err)
+        return json.loads(out)
+
+    def task_bytes(self):
+        with open(self.mod.task_path(self.TASK), "rb") as f:
+            return f.read()
+
+    def assert_reconciled(self, task):
+        summary = self.mod.summarize_feature_delivery(task)
+        ledger = summary["ledger"]
+        buckets = [ledger["baseline"], ledger["repeated"], *ledger["unledgered"].values()]
+        calls = ledger["calls"]
+        for total_key, ledger_key in (
+            ("call_count", "calls"), ("total_tokens", "total_tokens"),
+            ("duration_ms", "duration_ms"),
+        ):
+            self.assertEqual(
+                calls[ledger_key] + sum(b["usage"][total_key] for b in buckets),
+                task["totals"][total_key], total_key,
+            )
+        official = self.mod.summarize_official_cost(task)["totals"]
+        self.assertAlmostEqual(
+            calls["usd"] + ledger["baseline"]["official_cost"]["usd"]
+            + ledger["repeated"]["usd"]
+            + sum(b["usd"] for b in ledger["unledgered"].values()), official["usd"],
+        )
+        self.assertNotIn("do not reconcile", "\n".join(
+            self.mod.render_feature_delivery_section(task)))
+        return summary
+
+
+class TestFeatureDeliveryAndUsage(FeatureTrackingCase):
+    def test_ingest_preview_link_complete_report_frozen_partial_cost_end_to_end(self):
+        priced = self.call(prompt=1000, completion=200)
+        priced["attributes"].update({
+            "gen_ai.input.messages": "PRIVATE-PROMPT-MARKER",
+            "gen_ai.output.messages": "PRIVATE-COMPLETION-MARKER",
+            "tool.result": "PRIVATE-TOOL-RESULT-MARKER",
+        })
+        snapshot = self.seed([self.invocation(), priced,
+                              self.call("call-unknown", model="unlisted-model")])
+        task = self.task(self.TASK)
+        entry = task["feature_usage"]["calls"][self.key()]
+        self.assertEqual(entry["source"], "otel-chat-span")
+        self.assertEqual(entry["started_at"], "2026-01-01T12:01:00.000Z")
+        self.assertEqual(entry["duration_ms"], 2000)
+        self.assertEqual(entry["usage_present"], dict.fromkeys(
+            ("input", "output", "reasoning", "cache_read", "cache_write"), True))
+        self.assertEqual(entry["agent"]["agent_key"], "senior-coder")
+        self.assertEqual(entry["agent_link"], "direct-parent-invoke-agent-same-ingest")
+        self.assertEqual(entry["pricing"]["snapshot_id"], snapshot["snapshot_id"])
+        self.assertAlmostEqual(entry["pricing"]["usd"], 0.0002)
+        self.assertEqual(task["feature_usage"]["calls"][self.key("call-unknown")]
+                         ["pricing"]["status"], "unpriced")
+        for marker in ("PRIVATE-PROMPT-MARKER", "PRIVATE-COMPLETION-MARKER",
+                       "PRIVATE-TOOL-RESULT-MARKER"):
+            self.assertNotIn(marker, json.dumps(task))
+
+        self.record_ok("record-delivery", self.delivery())
+        payload = self.preview("--invocation", "trace-a/invoke-1", record_id="chosen-link",
+                               basis="user-supplied", reference="reviewed batch-1")
+        expected = self.usage_record(
+            [self.selector("invoke-1", "direct-invocation")],
+            [self.key(), self.key("call-unknown")])
+        self.assertEqual(payload["expected_call_count"], 2)
+        self.assertEqual(payload["expected_call_set_sha256"], expected["expected_call_set_sha256"])
+        self.assertEqual(payload["provenance"]["basis"], "user-supplied")
+        changed = OFFICIAL_PRICING_MARKDOWN.replace(
+            "| $0.1 | $0.01 | $0.125 | $0.5 |", "| $10 | $1 | $12.5 | $50 |")
+        self.write_official_snapshot(markdown=changed)
+        self.record_ok("record-feature-usage", payload)
+        self.record_ok("record-delivery", self.delivery("completed"))
+        task = self.task(self.TASK)
+        self.assertEqual(task["feature_usage"]["calls"][self.key()], entry)
+        summary = self.assert_reconciled(task)
+        row = summary["cycles"]["cycle-1"]
+        self.assertEqual(row["elapsed_ms"], 600000)
+        self.assertEqual(row["links"]["duration_ms"], 4000)
+        self.assertEqual((row["links"]["calls"], row["links"]["priced_calls"],
+                          row["links"]["unpriced_calls"]), (2, 1, 1))
+        self.assertAlmostEqual(row["links"]["usd"], 0.0002)
+        self.assertEqual(summary["features"]["checkout"]["completed"], 1)
+        report = self.mod.render_markdown(task)
+        self.assertIn("## Feature Delivery", report)
+        self.assertIn("**PARTIAL**: 1 of 2 linked calls priced, 1 unpriced", report)
+        self.assertIn("Elapsed (wall clock, incl. idle)", report)
+        self.assertIn("Linked model-call time", report)
+        self.assertIn("none recorded", report)
+        self.assertIn("lower bound", report)
+        rc, out, err = self.cli("feature-calls", "--task", self.TASK,
+                                "--session-id", self.SID, "--format", "json")
+        self.assertEqual(rc, 0, err)
+        listing = json.loads(out)
+        self.assertEqual({c["selector"] for c in listing["calls"]},
+                         {"trace-a/call-1", "trace-a/call-unknown"})
+        self.assertTrue(all(c["link"]["cycle_id"] == "cycle-1" for c in listing["calls"]))
+        self.assertEqual(listing["invocations"][0]["linked_direct_calls"],
+                         {"checkout/cycle-1": 2})
+
+    def test_scanner_retains_own_ids_start_and_strict_usage_before_pricing(self):
+        write_jsonl(self.otel_path(), [self.invocation(), self.call()])
+        calls, start, end, invocations = self.mod.scan_otel_files(
+            self.SID, {}, self.t0.timestamp())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["trace_id"], calls[0]["span_id"],
+                          calls[0]["parent_span_id"]), ("trace-a", "call-1", "invoke-1"))
+        self.assertEqual(calls[0]["start_ts"], (self.t0 + timedelta(minutes=1)).timestamp())
+        self.assertEqual(end - start, 2)
+        self.assertIs(calls[0]["usage_strict_ok"], True)
+        self.assertEqual((invocations[0]["trace_id"], invocations[0]["span_id"]),
+                         ("trace-a", "invoke-1"))
+        delta = self.mod.build_feature_ledger_delta(self.SID, calls, invocations)
+        self.assertEqual(delta["calls"][0]["pricing"]["status"], "not-recorded")
+        self.assertIn("no official pricing result", delta["calls"][0]["pricing"]["reason"])
+
+    def test_missing_own_id_and_invalid_usage_never_get_allocatable_keys(self):
+        self.write_official_snapshot()
+        missing = self.call()
+        missing.pop("spanId")
+        bad = self.call("bad-usage", prompt=True)
+        write_jsonl(self.otel_path(), [self.invocation(), missing, bad])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        task = self.task(self.TASK)
+        ledger = task["feature_usage"]
+        self.assertEqual(ledger["calls"], {})
+        self.assertEqual(task["totals"]["call_count"], 2)
+        self.assertEqual(set(ledger["unledgered"]), {
+            self.mod.LEDGER_REASON_NO_SPAN_ID, self.mod.LEDGER_REASON_INVALID_USAGE,
+        })
+        self.assertEqual(ledger["unledgered"][self.mod.LEDGER_REASON_NO_SPAN_ID]
+                         ["usage"]["total_tokens"], 150)
+        self.record_ok("record-delivery", self.delivery())
+        rc, out, err = self.cli(
+            "feature-calls", "--task", self.TASK, "--session-id", self.SID,
+            "--invocation", "trace-a/invoke-1", "--feature-id", "checkout", "--cycle-id", "cycle-1")
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("no ledgered direct child", err)
+        self.assert_reconciled(self.task(self.TASK))
+
+    def test_strict_usage_rejects_bad_raw_counts_without_crashing_or_inventing_keys(self):
+        snapshot = self.write_official_snapshot()
+        counts = ((True, 1), ("12", 12), (-1, -1), (1.5, 1),
+                  (2 ** 53 + 1, 2 ** 53 + 1), (float("nan"), 0),
+                  (float("inf"), 0), ("not-a-number", 0))
+        for index, (raw_count, aggregate_prompt) in enumerate(counts):
+            with self.subTest(raw_count=raw_count):
+                session_id = "invalid-usage-%d" % index
+                task_id = "INVALID-%d" % index
+                write_jsonl(self.otel_path("invalid-%d.jsonl" % index), [
+                    self.call(session_id=session_id, prompt=raw_count),
+                ])
+                calls, _, _, invocations = self.mod.scan_otel_files(
+                    session_id, {}, self.t0.timestamp())
+                self.assertEqual(len(calls), 1)
+                self.assertIs(calls[0]["usage_strict_ok"], False)
+                self.assertEqual(calls[0]["prompt_tokens"], aggregate_prompt)
+                result, reason = self.mod.price_call_official(calls[0], snapshot)
+                self.assertIsNone(result)
+                self.assertEqual(reason, self.mod.UNPRICED_INVALID_USAGE)
+                delta = self.mod.build_feature_ledger_delta(session_id, calls, invocations)
+                self.assertEqual(delta["calls"], [])
+                self.assertEqual(delta["unledgered"][self.mod.LEDGER_REASON_INVALID_USAGE]
+                                 ["usage"]["call_count"], 1)
+                # Exercise the actual ingest/pricing merge, not only the
+                # strict flag. Lenient aggregate conversion must never turn
+                # invalid raw usage into a priced zero-cost call.
+                self.assertEqual(self.ingest(session_id, task_id), 0)
+                self.record_ok("record-delivery", self.delivery(task_id=task_id))
+                task = self.task(task_id)
+                ledger = task["feature_usage"]
+                self.assertEqual(ledger["calls"], {})
+                self.assertEqual(ledger["assignments"], {})
+                bucket = ledger["unledgered"][self.mod.LEDGER_REASON_INVALID_USAGE]
+                self.assertEqual(bucket["usage"]["call_count"], 1)
+                self.assertEqual((bucket["priced_calls"], bucket["unpriced_calls"]), (0, 1))
+                self.assertEqual(task["totals"]["prompt_tokens"], aggregate_prompt)
+                self.assertEqual(task["totals"]["total_tokens"], aggregate_prompt + 50)
+                self.assertEqual(bucket["usage"]["total_tokens"], task["totals"]["total_tokens"])
+                cost = task["official_cost"]["by_model"]["gpt-6-luna"]
+                self.assertFalse(cost["priced"])
+                self.assertEqual(cost["unpriced"][self.mod.UNPRICED_INVALID_USAGE],
+                                 {"calls": 1, "total_tokens": task["totals"]["total_tokens"]})
+                self.assert_reconciled(task)
+                self.assertIn("N/A — none priced (not $0)", "\n".join(
+                    self.mod.render_feature_delivery_section(task)))
+
+    def test_usage_presence_reason_precedence_and_absent_optional_cache_are_preserved(self):
+        optional_absent = self.call("optional-absent")
+        for suffix in ("reasoning.output_tokens", "cache_read.input_tokens", "cache_write.input_tokens"):
+            optional_absent["attributes"].pop("gen_ai.usage." + suffix)
+        missing_input = self.call("missing-input", completion=True)
+        missing_input["attributes"].pop("gen_ai.usage.input_tokens")
+        missing_output = self.call("missing-output", prompt=True)
+        missing_output["attributes"].pop("gen_ai.usage.output_tokens")
+        unknown_model = self.call("unknown-model", model="unlisted-model", prompt=True)
+        snapshot = self.seed([optional_absent, missing_input, missing_output, unknown_model])
+        calls, _, _, _ = self.mod.scan_otel_files(self.SID, {}, self.t0.timestamp())
+        by_span = {call["span_id"]: call for call in calls}
+        good = by_span["optional-absent"]
+        self.assertIs(good["usage_strict_ok"], True)
+        self.assertEqual(good["usage_present"], {
+            "input": True, "output": True, "reasoning": False,
+            "cache_read": False, "cache_write": False,
+        })
+        result, reason = self.mod.price_call_official(good, snapshot)
+        self.assertIsNone(reason)
+        self.assertAlmostEqual(result["usd"], 0.000035)
+        # Missing required counts and an unknown model retain their original
+        # diagnostic priority, even when another raw count is also invalid.
+        for span_id, expected_reason in (
+            ("missing-input", self.mod.UNPRICED_NO_INPUT),
+            ("missing-output", self.mod.UNPRICED_NO_OUTPUT),
+            ("unknown-model", self.mod.UNPRICED_UNKNOWN_MODEL),
+        ):
+            with self.subTest(span_id=span_id):
+                call = by_span[span_id]
+                self.assertIs(call["usage_strict_ok"], False)
+                result, reason = self.mod.price_call_official(call, snapshot)
+                self.assertIsNone(result)
+                self.assertEqual(reason, expected_reason)
+        self.record_ok("record-delivery", self.delivery())
+        task = self.task(self.TASK)
+        self.assertEqual(set(task["feature_usage"]["calls"]), {self.key("optional-absent")})
+        summary = self.mod.summarize_official_cost(task)["totals"]
+        self.assertEqual((summary["priced_calls"], summary["unpriced_calls"]), (1, 3))
+        self.assert_reconciled(task)
+
+    def test_nonfinite_span_times_are_unknown_without_dropping_usage(self):
+        for field, value in (("startTime", float("nan")), ("endTime", float("inf"))):
+            with self.subTest(field=field):
+                span = self.call()
+                span[field] = [value, 0]
+                path = self.otel_path()
+                if os.path.exists(path):
+                    os.unlink(path)
+                # A valid invocation establishes the post-install boundary.
+                # A standalone unknown-start span must not bypass initial
+                # install-epoch seeding; here we test duration handling
+                # after that boundary, not the independent gating policy.
+                write_jsonl(path, [self.invocation(), span])
+                calls, first, last, _ = self.mod.scan_otel_files(
+                    self.SID, {}, self.t0.timestamp())
+                self.assertIsNone(self.mod.otel_ts(span[field]))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["duration_ms"], 0)
+                self.assertEqual(calls[0]["total_tokens"], 150)
+                self.assertIs(calls[0]["usage_strict_ok"], True)
+                self.assertEqual(first, last)  # only the other finite endpoint remains
+                self.assertIsNotNone(first)
+                if field == "startTime":
+                    self.assertIsNone(calls[0]["start_ts"])
+
+    def test_baseline_precedes_first_merge_is_unsplittable_and_never_backfilled(self):
+        self.seed()
+        historical = self.task(self.TASK)
+        historical.pop("feature_usage")  # persisted pre-ledger task, with recorded official cost
+        self.mod.atomic_write(self.mod.task_path(self.TASK), json.dumps(historical))
+        write_jsonl(self.otel_path(), [self.call("call-2", minute=2, prompt=200)])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        task = self.task(self.TASK)
+        baseline = copy.deepcopy(task["feature_usage"]["baseline"])
+        self.assertEqual(baseline["usage"], {
+            k: historical["totals"][k] for k in self.mod.blank_agg()})
+        self.assertAlmostEqual(baseline["official_cost"]["usd"], 0.000035)
+        self.assertEqual(set(task["feature_usage"]["calls"]), {self.key("call-2")})
+        self.record_ok("record-delivery", self.delivery())
+        self.assert_reconciled(self.task(self.TASK))
+        write_jsonl(self.otel_path(), [self.call("call-3", minute=3)])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        self.assertEqual(self.task(self.TASK)["feature_usage"]["baseline"], baseline)
+        self.assertNotIn(self.key(), self.task(self.TASK)["feature_usage"]["calls"])
+        other = self.call(session_id="fresh-session")
+        write_jsonl(self.otel_path("new-task.jsonl"), [other])
+        self.assertEqual(self.ingest("fresh-session", "FRESH-1"), 0)
+        fresh = self.task("FRESH-1")["feature_usage"]
+        self.assertEqual(fresh["baseline"]["usage"], self.mod.blank_agg())
+        self.assertEqual(fresh["baseline"]["official_cost"]["usd"], 0)
+        self.assertEqual(len(fresh["calls"]), 1)
+
+    def test_duplicate_exports_and_conflicting_observations_reconcile_without_double_links(self):
+        self.write_official_snapshot()
+        span = self.call(prompt=1000, completion=200)
+        for name in ("a.jsonl", "b.jsonl"):
+            write_jsonl(self.otel_path(name), [self.invocation(), span])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        self.record_ok("record-delivery", self.delivery())
+        self.record_ok("record-feature-usage", self.preview("--invocation", "trace-a/invoke-1"))
+        task = self.task(self.TASK)
+        original = copy.deepcopy(task["feature_usage"]["calls"][self.key()])
+        repeated = task["feature_usage"]["repeated_observations"]
+        self.assertEqual(task["totals"]["call_count"], 2)
+        self.assertEqual(len(task["feature_usage"]["calls"]), 1)
+        self.assertEqual(repeated["usage"], dict(
+            self.mod.blank_agg(), prompt_tokens=1000, completion_tokens=200,
+            total_tokens=1200, call_count=1, duration_ms=2000))
+        self.assertEqual((repeated["priced_calls"], repeated["unpriced_calls"],
+                          repeated["conflicting"]), (1, 0, 0))
+        self.assertAlmostEqual(repeated["usd"], 0.0002)
+        self.assertEqual(task["feature_usage"]["repeated_invocation_observations"], 1)
+        self.assertEqual(self.assert_reconciled(task)["ledger"]["linked"]["calls"], 1)
+        write_jsonl(self.otel_path("c.jsonl"), [self.call(prompt=2000, completion=200)])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        task = self.task(self.TASK)
+        self.assertEqual(task["feature_usage"]["calls"][self.key()], original)
+        self.assertEqual(task["feature_usage"]["repeated_observations"]["conflicting"], 1)
+        self.assertEqual(task["feature_usage"]["repeated_observations"]["usage"]["call_count"], 2)
+        self.assertEqual(self.assert_reconciled(task)["ledger"]["linked"]["calls"], 1)
+        before = copy.deepcopy(task["feature_usage"])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        self.assertEqual(self.task(self.TASK)["feature_usage"], before)
+
+    def test_stored_invocation_links_across_ingests_use_direct_ids_not_agent_inference(self):
+        self.seed([self.invocation(), self.call(), self.invocation("nested", parent="invoke-1"),
+                   self.invocation("empty")])
+        self.record_ok("record-delivery", self.delivery())
+        write_jsonl(self.otel_path(), [
+            self.call("late-child", minute=2),
+            self.call("nested-child", parent="nested", minute=2),
+            self.call("wrong-trace", trace_id="trace-b", minute=2),
+            self.call("no-parent", parent=None, minute=2),
+            self.call("other-session-call", session_id="other-session", minute=2),
+        ])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        self.assertEqual(self.ingest("other-session", self.TASK), 0)
+        task = self.task(self.TASK)
+        calls = task["feature_usage"]["calls"]
+        late = calls[self.key("late-child")]
+        self.assertIsNone(late["agent"])
+        self.assertEqual(late["agent_link"], "parent-not-observed-in-same-ingest")
+        payload = self.preview("--invocation", "trace-a/invoke-1")
+        self.assertEqual(payload["expected_call_set_sha256"], self.usage_record(
+            keys=[self.key(), self.key("late-child")])["expected_call_set_sha256"])
+        self.assertEqual(payload["expected_call_count"], 2)
+        self.record_ok("record-feature-usage", payload)
+        summary = self.assert_reconciled(self.task(self.TASK))
+        self.assertEqual(summary["ledger"]["calls"]["calls"], 6)
+        self.assertEqual(summary["ledger"]["linked"]["calls"], 2)
+        listing = self.mod.feature_calls_listing(self.task(self.TASK), self.TASK, self.SID)
+        self.assertEqual(next(i for i in listing["invocations"]
+                              if i["selector"] == "trace-a/invoke-1")["direct_calls"], 2)
+        self.assertEqual(listing["calls_without_ledgered_parent_invocation"], 2)
+
+    def test_unknown_empty_overlapping_and_unsafe_selectors_are_rejected_atomically(self):
+        self.seed([self.invocation(), self.invocation("empty"), self.call()])
+        self.record_ok("record-delivery", self.delivery())
+        bad_sets = [
+            [self.selector("future-call")],
+            [self.selector("future-invocation", "direct-invocation")],
+            [self.selector("empty", "direct-invocation")],
+            [self.selector(), self.selector("invoke-1", "direct-invocation")],
+            [self.selector(), self.selector()],
+            [self.selector(trace_id="../trace")],
+            [self.selector(session_id="other-session")],
+            [dict(self.selector(), kind="session")],
+            [dict(self.selector(), timestamp="2026-01-01T12:01:00Z")],
+        ]
+        for selectors in bad_sets:
+            with self.subTest(selectors=selectors):
+                before = self.task_bytes()
+                rc, _, err = self.record("record-feature-usage", self.usage_record(selectors))
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(self.task_bytes(), before)
+
+    def test_invocation_membership_drift_and_count_or_hash_tampering_reject_stale_preview(self):
+        self.seed()
+        self.record_ok("record-delivery", self.delivery())
+        preview = self.preview("--invocation", "trace-a/invoke-1")
+        write_jsonl(self.otel_path(), [self.call("call-2", minute=2)])
+        self.assertEqual(self.ingest(self.SID, self.TASK), 0)
+        for payload in (
+            preview,
+            dict(self.usage_record(), expected_call_count=2),
+            dict(self.usage_record(), expected_call_set_sha256="0" * 64),
+        ):
+            with self.subTest(payload=payload):
+                before = self.task_bytes()
+                rc, _, err = self.record("record-feature-usage", payload)
+                self.assertEqual(rc, 1, err)
+                self.assertIn("selection changed", err)
+                self.assertEqual(self.task_bytes(), before)
+        fresh = self.preview("--invocation", "trace-a/invoke-1")
+        self.assertEqual(fresh["expected_call_count"], 2)
+        self.record_ok("record-feature-usage", fresh)
+
+    def test_assignment_conflict_all_or_nothing_same_cycle_overlap_and_idempotency(self):
+        self.seed([self.invocation(), self.call(), self.call("call-2")])
+        self.record_ok("record-delivery", self.delivery())
+        self.record_ok("record-delivery", self.delivery(cycle="cycle-2", feature="search"))
+        self.record_ok("record-feature-usage", self.usage_record())
+        whole = self.usage_record(
+            [self.selector("invoke-1", "direct-invocation")],
+            [self.key(), self.key("call-2")], record_id="conflict", feature="search", cycle="cycle-2")
+        before = self.task_bytes()
+        rc, _, err = self.record("record-feature-usage", whole)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("already linked", err)
+        self.assertEqual(self.task_bytes(), before)
+        owners, _ = self.mod.current_call_assignments(self.task(self.TASK)["feature_usage"])
+        self.assertNotIn(self.key("call-2"), owners)
+        whole.update(feature_id="checkout", cycle_id="cycle-1", record_id="overlap")
+        self.record_ok("record-feature-usage", whole)
+        before = self.task_bytes()
+        self.assertIn("nothing changed", self.record_ok("record-feature-usage", whole))
+        self.assertEqual(self.task_bytes(), before)
+        changed = copy.deepcopy(whole)
+        changed["provenance"]["reference"] = "different content"
+        rc, _, err = self.record("record-feature-usage", changed)
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(self.task_bytes(), before)
+        summary = self.assert_reconciled(self.task(self.TASK))
+        self.assertEqual(summary["ledger"]["linked"]["calls"], 2)
+        self.assertEqual(self.task(self.TASK)["feature_usage"]["assignments"]["overlap"]
+                         ["newly_linked_call_count"], 1)
+
+    def test_delivery_order_identity_material_findings_and_late_audit_preserve_budget(self):
+        self.seed()
+        task = self.task(self.TASK)
+        task["reviews"] = {"schema_version": 1, "records": {"exhausted-review": {
+            "cycle_id": "cycle-1", "round": 3, "verdict": "needs-fixes",
+        }}}
+        reviews = copy.deepcopy(task["reviews"])
+        self.mod.atomic_write(self.mod.task_path(self.TASK), json.dumps(task))
+        rc, _, err = self.record("record-feature-usage", self.usage_record())
+        self.assertEqual(rc, 1, err)  # allocation cannot silently invent a cycle
+        rc, _, err = self.record("record-delivery", self.delivery("completed"))
+        self.assertEqual(rc, 1, err)
+        self.record_ok("record-delivery", self.delivery())
+        before = self.task_bytes()
+        self.assertIn("nothing changed", self.record_ok("record-delivery", self.delivery()))
+        self.assertEqual(self.task_bytes(), before)
+        bad = [
+            self.delivery(record_id="restart"),
+            self.delivery("completed", seconds=59),
+            self.delivery("completed", feature="wrong-feature"),
+            self.delivery(provenance={"source": "orchestrator-supplied", "basis": "agent-response",
+                                      "reference": "changed-same-record"}),
+        ]
+        for record in bad:
+            with self.subTest(record=record):
+                rc, _, err = self.record("record-delivery", record)
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(self.task_bytes(), before)
+        with mock.patch.object(self.mod, "now_iso", return_value="2026-01-01T12:11:01Z"):
+            self.record_ok("record-delivery", self.delivery("completed"))
+        for event in ("cancelled", "completed", "started"):
+            with self.subTest(terminal_event=event):
+                before = self.task_bytes()
+                rc, _, err = self.record("record-delivery", self.delivery(event, record_id="reopen"))
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(self.task_bytes(), before)
+        # Late findings/allocations are audit events, not review-budget resets.
+        with mock.patch.object(self.mod, "now_iso", return_value="2026-01-01T12:15:00Z"):
+            self.record_ok("record-feature-usage", self.usage_record())
+            self.record_ok("record-delivery", self.delivery("defect-confirmed", seconds=800))
+            self.record_ok("record-delivery", self.delivery(
+                "regression-confirmed", seconds=810, finding_id="regression-1"))
+        self.record_ok("record-delivery", self.delivery(cycle="cycle-2"))
+        before = self.task_bytes()
+        rc, _, err = self.record("record-delivery", self.delivery(
+            "defect-confirmed", cycle="cycle-2", record_id="duplicate-finding"))
+        self.assertEqual(rc, 1, err)
+        self.assertIn("finding 'finding-1' is already recorded", err)
+        self.assertEqual(self.task_bytes(), before)
+        task = self.task(self.TASK)
+        self.assertEqual(task["reviews"], reviews)
+        summary = self.assert_reconciled(task)
+        self.assertEqual((summary["cycles"]["cycle-1"]["defects"],
+                          summary["cycles"]["cycle-1"]["regressions"]), (1, 1))
+        self.assertEqual(summary["late_links"], 1)
+        self.assertEqual(summary["cycles"]["cycle-1"]["status"], "completed")
+        report = "\n".join(self.mod.render_feature_delivery_section(task))
+        self.assertIn("explicit late audit links", report)
+        self.assertIn("regression requires recorded evidence", report)
+        self.assertEqual(summary["cycles"]["cycle-2"]["links"]["calls"], 0)
+        self.assertIn("no linked calls (unknown, not $0)", report)
+
+    def test_strict_record_schemas_provenance_timestamps_counts_and_bounded_references(self):
+        base = self.delivery()
+        now = (self.t0 + timedelta(days=1)).timestamp()
+        delivery_bad = [
+            dict(base, schema_version=True), dict(base, schema_version=2),
+            dict(base, unexpected="not allowed"), dict(base, feature_id="bad/feature"),
+            dict(base, occurred_at="2026-01-01T12:01:00+00:00"),
+            dict(base, occurred_at="2026-02-30T12:01:00Z"),
+            dict(base, occurred_at=iso(self.t0 + timedelta(days=1, seconds=301))),
+            dict(base, provenance=dict(base["provenance"], source="telemetry")),
+            dict(base, provenance=dict(base["provenance"], basis="timestamp-inferred")),
+            dict(base, provenance=dict(base["provenance"], extra="unknown")),
+            dict(base, provenance={"source": "orchestrator-supplied", "basis": "agent-response"}),
+        ]
+        regression = self.delivery("regression-confirmed")
+        del regression["previous_working_reference"]
+        delivery_bad.extend((
+            regression, self.delivery("defect-confirmed", severity="low"),
+            self.delivery("defect-confirmed", category="style"),
+        ))
+        for raw in delivery_bad:
+            with self.subTest(delivery=raw):
+                with self.assertRaises(self.mod.TrackingRecordError):
+                    self.mod.validate_delivery_record(raw, now=now)
+        boundary = dict(base, occurred_at=iso(self.t0 + timedelta(days=1, seconds=300)))
+        self.assertEqual(self.mod.validate_delivery_record(boundary, now=now)
+                         ["occurred_at"], boundary["occurred_at"])
+        for reference in ("", "x" * 501, "line\nbreak", "bad`code", "bad|cell", "bad\\escape"):
+            with self.subTest(reference=reference):
+                raw = copy.deepcopy(base)
+                raw["provenance"]["reference"] = reference
+                with self.assertRaises(self.mod.TrackingRecordError):
+                    self.mod.validate_delivery_record(raw)
+        good = self.usage_record()
+        invalid_usage = [
+            dict(good, schema_version=True), dict(good, amount_usd=1),
+            dict(good, selectors=[]),
+            dict(good, provenance=dict(good["provenance"], basis="agent-response")),
+            dict(good, expected_call_set_sha256="A" * 64),
+        ]
+        invalid_usage += [dict(good, expected_call_count=count)
+                          for count in (True, 0, -1, 1.5, "1", 1000001, float("nan"), float("inf"))]
+        for raw in invalid_usage:
+            with self.subTest(usage=raw):
+                with self.assertRaises(self.mod.TrackingRecordError):
+                    self.mod.validate_feature_usage_record(raw)
+        for basis in ("orchestrator-observed", "agent-response", "user-supplied"):
+            raw = copy.deepcopy(base)
+            raw["provenance"]["basis"] = basis
+            self.mod.validate_delivery_record(raw)
+
+    def test_json_duplicate_keys_nonfinite_invalid_utf8_and_size_are_rejected(self):
+        for command, valid, max_bytes in (
+            ("delivery", self.delivery(), self.mod.DELIVERY_INPUT_MAX_BYTES),
+            ("feature_usage", self.usage_record(), self.mod.FEATURE_USAGE_INPUT_MAX_BYTES),
+        ):
+            text = json.dumps(valid)
+            bad_inputs = [
+                ('{"record_id":"duplicate",' + text[1:]).encode(),
+                text.replace('"schema_version": 1', '"schema_version": NaN').encode(),
+                text.replace('"schema_version": 1', '"schema_version": Infinity').encode(),
+                b"\xff", b"[]", b"", b"x" * (max_bytes + 1),
+            ]
+            for data in bad_inputs:
+                with self.subTest(command=command, sample=data[:80]):
+                    path = os.path.join(self.tmp, "invalid-tracking.json")
+                    with open(path, "wb") as f:
+                        f.write(data)
+                    with self.assertRaises(self.mod.TrackingRecordError):
+                        getattr(self.mod, "load_" + command + "_record_input")(path)
+
+    def test_readonly_cli_leaves_fresh_home_empty_and_existing_state_byte_identical(self):
+        home = os.path.join(self.tmp, "readonly-home")
+        os.mkdir(home)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("COPILOT_", "XDG_"))}
+        env.update(HOME=home, COPILOT_HOME=os.path.join(home, "custom-copilot"),
+                   COPILOT_TASK_REPORT_PRICING_FETCH="0", PYTHONDONTWRITEBYTECODE="1")
+        result = subprocess.run(
+            [sys.executable, "-B", MODULE_PATH, "feature-calls", "--task", self.TASK,
+             "--session-id", self.SID], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(os.listdir(home), [])
+        self.seed()
+        self.record_ok("record-delivery", self.delivery())
+
+        def read_bytes(path):
+            with open(path, "rb") as f:
+                return f.read()
+
+        def tree():
+            return {os.path.relpath(os.path.join(root, name), self.tmp):
+                    (os.stat(os.path.join(root, name)).st_mtime_ns,
+                     read_bytes(os.path.join(root, name)))
+                    for root, _, names in os.walk(self.tmp) for name in names}
+
+        before = tree()
+        with contextlib.ExitStack() as stack:
+            for name in ("run_startup_migrations", "ingest_lock", "ensure_dirs", "build_delta",
+                         "refresh_official_pricing_if_due", "load_official_pricing_context",
+                         "render_markdown"):
+                stack.enter_context(mock.patch.object(
+                    self.mod, name, side_effect=AssertionError("read-only command called " + name)))
+            rc, out, err = self.cli("feature-calls", "--task", self.TASK,
+                                    "--session-id", self.SID)
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(json.loads(out)["calls"][0]["link"], None)
+            self.preview("--call", "trace-a/call-1")
+        self.assertEqual(tree(), before)
+
+    def test_recorders_require_existing_task_and_never_create_phantom_usage(self):
+        for command, record in (
+            ("record-feature-usage", self.usage_record()),
+            ("record-delivery", self.delivery()),
+        ):
+            with self.subTest(command=command):
+                rc, out, err = self.record(command, record)
+                self.assertEqual(rc, 1, out + err)
+                self.assertFalse(os.path.exists(self.mod.task_path(self.TASK)))
+
+    def test_recorders_offline_without_sources_preserve_report_prices_and_review_state(self):
+        self.seed()
+        task = self.task(self.TASK)
+        task["reviews"] = {"schema_version": 1, "records": {"sentinel": {"round": 3}}}
+        self.mod.atomic_write(self.mod.task_path(self.TASK), json.dumps(task))
+        before = copy.deepcopy(task)
+        report_path = self.mod.report_path(self.TASK)
+        self.mod.atomic_write(report_path, "OLD REPORT MUST NOT CHANGE\n")
+        shutil.rmtree(self.mod.OTEL_DIR)
+        os.unlink(self.mod.official_pricing_cache_path())
+        with contextlib.ExitStack() as stack:
+            for name in ("build_delta", "scan_otel_files", "refresh_official_pricing_if_due",
+                         "load_official_pricing_context", "render_markdown"):
+                stack.enter_context(mock.patch.object(
+                    self.mod, name, side_effect=AssertionError("recorder called " + name)))
+            self.record_ok("record-delivery", self.delivery())
+            self.record_ok("record-feature-usage", self.usage_record())
+        stored = self.task(self.TASK)
+        for key, value in before.items():
+            if key != "feature_usage":
+                self.assertEqual(stored[key], value, key)
+        for key in ("calls", "invocations", "baseline", "unledgered", "repeated_observations"):
+            self.assertEqual(stored["feature_usage"][key], before["feature_usage"][key])
+        with open(report_path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "OLD REPORT MUST NOT CHANGE\n")
+        self.assertFalse(os.path.exists(self.mod.OTEL_DIR))
+        self.assertFalse(os.path.exists(self.mod.official_pricing_cache_path()))
+
+    def test_legacy_report_unchanged_until_explicit_records_and_malformed_blocks_fail_closed(self):
+        self.seed()
+        with_ledger = self.task(self.TASK)
+        legacy = copy.deepcopy(with_ledger)
+        legacy.pop("feature_usage")
+        self.assertEqual(self.mod.render_feature_delivery_section(with_ledger), [])
+        self.assertEqual(self.mod.render_markdown(legacy), self.mod.render_markdown(with_ledger))
+        with_ledger["delivery"] = {"schema_version": 1, "records": {}}
+        self.assertEqual(self.mod.render_markdown(legacy), self.mod.render_markdown(with_ledger))
+        for field in ("delivery", "feature_usage"):
+            with self.subTest(field=field):
+                malformed = copy.deepcopy(with_ledger)
+                malformed[field] = {"schema_version": 999}
+                self.mod.atomic_write(self.mod.task_path(self.TASK), json.dumps(malformed))
+                before = self.task_bytes()
+                command = "record-delivery" if field == "delivery" else "record-feature-usage"
+                raw = self.delivery() if field == "delivery" else self.usage_record()
+                rc, _, err = self.record(command, raw)
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(self.task_bytes(), before)
+                self.assertIn("malformed", "\n".join(
+                    self.mod.render_feature_delivery_section(self.task(self.TASK))))
+        for contents in ("{broken", "[]", '{"task_id":"OTHER-1"}'):
+            with self.subTest(contents=contents):
+                self.mod.atomic_write(self.mod.task_path(self.TASK), contents)
+                rc, _, err = self.record("record-delivery", self.delivery())
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(self.task_bytes(), contents.encode())
+
+    def test_reference_delimiters_rejected_and_html_pointer_stays_in_code_span(self):
+        self.seed()
+        raw = self.delivery()
+        raw["provenance"]["reference"] = "<img src=x onerror=alert(1)>"
+        self.record_ok("record-delivery", raw)
+        # References are not interpreted as markup or copied as free prose.
+        report = self.mod.render_markdown(self.task(self.TASK))
+        self.assertNotIn("\n<img", report)
+        self.assertIn("## Feature Delivery", report)
+        for value in ("<script>alert(1)</script>", "[label](https://example.invalid)", "a|b`c\\d"):
+            rendered = self.mod._md_code(value)
+            self.assertTrue(rendered.startswith("`") and rendered.endswith("`"))
+            self.assertNotIn("|", rendered)
+            self.assertNotIn("\\", rendered)
+            self.assertEqual(rendered.count("`"), 2)
+
+    def test_recording_and_ingest_concurrently_preserve_all_three_updates(self):
+        if self.mod.fcntl is None:
+            self.skipTest("fcntl not available")
+        self.seed()
+        self.record_ok("record-delivery", self.delivery())
+        delivery_path = os.path.join(self.tmp, "complete.json")
+        usage_path = os.path.join(self.tmp, "link.json")
+        for path, data in ((delivery_path, self.delivery("completed")),
+                           (usage_path, self.usage_record())):
+            self.mod.atomic_write(path, json.dumps(data))
+        write_jsonl(self.otel_path(), [self.call("call-2", minute=2)])
+        paths = {name: getattr(self.mod, name) for name in (
+            "SUPPORT_DIR", "TASKS_DIR", "STATE_FILE", "INSTALL_MARKER_FILE", "PRICING_FILE",
+            "LOCK_FILE", "REPORTS_DIR", "SESSION_STATE_DIR", "OTEL_DIR")}
+        code = (
+            "import importlib.util,json,sys\n"
+            "spec=importlib.util.spec_from_file_location('tracking_worker',sys.argv[1])\n"
+            "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)\n"
+            "for k,v in json.loads(sys.argv[2]).items(): setattr(m,k,v)\n"
+            "sys.argv=[sys.argv[1]]+sys.argv[3:]\n"
+            "m.main()\n"
+        )
+        home = os.path.join(self.tmp, "concurrent-home")
+        os.mkdir(home)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("COPILOT_", "XDG_"))}
+        env.update(HOME=home, COPILOT_HOME=os.path.join(home, "custom-copilot"),
+                   COPILOT_TASK_REPORT_PRICING_FETCH="0", PYTHONDONTWRITEBYTECODE="1")
+        processes = []
+        try:
+            # All children wait for the same existing lock before mutating.
+            with self.mod.ingest_lock():
+                for args in (
+                    ["ingest", "--session-id", self.SID, "--task", self.TASK,
+                     "--session-dir", os.path.join(self.mod.SESSION_STATE_DIR, self.SID)],
+                    ["record-feature-usage", "--input", usage_path],
+                    ["record-delivery", "--input", delivery_path],
+                ):
+                    processes.append(subprocess.Popen(
+                        [sys.executable, "-B", "-c", code, MODULE_PATH, json.dumps(paths), *args],
+                        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+            for process in processes:
+                out, err = process.communicate(timeout=30)
+                self.assertEqual(process.returncode, 0, out + err)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=10)
+        task = self.task(self.TASK)
+        self.assertEqual(task["totals"]["call_count"], 2)
+        self.assertEqual(set(task["feature_usage"]["calls"]), {self.key(), self.key("call-2")})
+        self.assertEqual(set(task["feature_usage"]["assignments"]), {"link-1"})
+        self.assertEqual(self.assert_reconciled(task)["cycles"]["cycle-1"]["status"], "completed")
+        self.assertEqual(self.mod.summarize_feature_delivery(task)["ledger"]["linked"]["calls"], 1)
 
 
 if __name__ == "__main__":

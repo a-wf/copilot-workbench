@@ -664,6 +664,99 @@ than hidden. No per-task summary is generated.
   observed registry at render time; an id seen before its session is
   ingested shows as not (yet) observed.
 
+### Feature delivery tracking
+
+Optional, for meaningful multi-agent features only (no overhead for small
+questions or one-line operations). A report without delivery records or
+feature links renders exactly as before.
+
+- **Call ledger (automatic).** Each ingest also stores every new model call
+  whose OTEL chat span has valid ids once, under the stable key *session id
+  + `traceId` + the span's own `spanId`*, in the task JSON
+  (`feature_usage`): model, token counts, usage-presence flags, span
+  duration, parent span id, the agent label only when the existing
+  trace-parent join resolved it, and the official price result **frozen at
+  ingestion** (snapshot, tier, component USD) or the explicit unpriced
+  reason. No prompts, completions or tool results are stored. `invoke_agent`
+  spans are stored the same way as observed invocations. Calls without
+  stable ids are counted per reason (no key is invented); a repeated key is
+  never ledgered twice. Usage already on the task when the ledger starts is
+  frozen as an unsplittable **pre-ledger baseline** — never rescanned or
+  backfilled. Existing totals, cost, attribution and review data are
+  unchanged.
+- **Delivery records.** `record-delivery --input FILE` stores one event
+  per call (schema `copilot-task-report.delivery-record`, `schema_version`
+  1): `record_id`, `task_id`, `feature_id`, `cycle_id`, `event`
+  (`started`, `completed`, `cancelled`, `defect-confirmed`,
+  `regression-confirmed`), `occurred_at` (UTC, e.g.
+  `2026-11-17T14:05:00Z`), and `provenance` (`source:
+  orchestrator-supplied`, `basis:
+  orchestrator-observed|agent-response|user-supplied`, short `reference`).
+  A cycle starts once and ends at most once (no reopen or review-budget
+  reset), its end cannot precede its start, and a `cycle_id` belongs to one
+  feature. Finding events add `finding_id` (unique within the task, so a
+  finding is counted once across rounds), `severity`
+  (`critical`/`high`/`medium` — optional polish is not recorded),
+  `category` (`correctness`/`security`/`safety`/`data-integrity`) and
+  `evidence_reference`; a regression also needs
+  `previous_working_reference` (recorded evidence the behavior worked
+  before). Late findings against a completed cycle are allowed. The task
+  must already exist (created by an ingest); the command never creates a
+  task file, so for a not-yet-ingested task record the start after the
+  first ingest with the real start time as `occurred_at`.
+- **Linking usage to a feature.** Inspect, preview, then record:
+
+  ```sh
+  # 1. Read-only: the session's ledgered calls and invoke_agent groups (JSON)
+  python3 "$HOME/.local/bin/copilot-task-report.py" feature-calls --task ABC-123 --session-id SESSION
+  # 2. Read-only preview: a ready-to-save payload with the expanded call count and sha256
+  python3 "$HOME/.local/bin/copilot-task-report.py" feature-calls --task ABC-123 --session-id SESSION \
+    --feature-id abc-123-export --cycle-id abc-123-c1 --invocation TRACE_ID/SPAN_ID > fu.json
+  # 3. Record it (re-checks the selection; refuses if it changed since the preview)
+  python3 "$HOME/.local/bin/copilot-task-report.py" record-feature-usage --input fu.json
+  ```
+
+  The payload (schema `copilot-task-report.feature-usage-record`,
+  `schema_version` 1) holds `record_id`, `task_id`, `feature_id`,
+  `cycle_id`, `selectors` (each `{kind: call|direct-invocation,
+  session_id, trace_id, span_id}`), `expected_call_count`,
+  `expected_call_set_sha256` (sha256 of the sorted
+  `session/trace/span` call keys, one per line) and `provenance` (`basis:
+  orchestrator-selected|user-supplied`). A `direct-invocation` selector
+  expands **only** to ledgered calls of the same session and trace whose
+  own `parentSpanId` is that `invoke_agent` span — never ancestors, time
+  windows, whole sessions or calls ingested later. If one invocation
+  served several features, select its calls individually with `--call`.
+  The cycle must have been started; each call belongs to at most one
+  feature cycle (a conflicting link is refused, never moved), overlapping
+  links to the same cycle are counted once, and late links after
+  completion are allowed as explicit audit records. `feature-calls` is
+  read-only: no lock, files, directories, pricing fetch or network.
+- **Report.** When such records exist, a *Feature Delivery* section shows
+  per cycle and per feature: status, recorded start/end, wall-clock elapsed
+  time (includes idle time), linked calls, the sum of their frozen per-call
+  estimates (priced/unpriced counts; partial is labeled and unpriced is
+  never $0; a feature without links has unknown cost), linked model-call
+  time (separate from elapsed), and recorded confirmed defects/regressions
+  ("none recorded" is not evidence of no defects). A *Feature usage ledger
+  coverage* table reconciles baseline + linked + unallocated + calls
+  without stable ids + repeated keys with the Summary totals and estimate;
+  feature cost is a subset of the Summary cost, never added to it again.
+  Repeated observations of an already-ledgered call key keep their exact
+  calls, tokens and priced/unpriced cost in their own bucket: they remain
+  in the Summary totals (existing aggregation unchanged), so those totals
+  are not a unique-call count, while the ledger and features count each
+  key once.
+
+All three commands validate strictly (duplicate JSON keys, unknown fields,
+bad ids/timestamps and conflicts are rejected with a non-zero exit);
+identical replays are no-ops; the record commands use the same lock and
+atomic replace as `record-review` and, like it, never ingest, fetch pricing
+or regenerate the Markdown report (run `report <task>` afterwards).
+Feature ownership is never inferred: unlinked calls simply stay
+unallocated. Per-call USD values are list-price estimates, not an invoice,
+and no externally supplied cost is accepted.
+
 ### Limitations
 
 - Usage is tracked only from the moment the toolkit is first used on a
@@ -701,6 +794,12 @@ than hidden. No per-task summary is generated.
   call with reasoning tokens is left unpriced; for other providers only
   reasoning > output is unpriced, so an undetectable gap there could still
   underestimate.
+- A usage count that is present but not a valid count (boolean, numeric
+  string, fraction, negative, unsafe huge, NaN/Infinity, non-numeric) makes
+  that call unpriced with an explicit invalid-usage reason and unallocated
+  in the feature ledger. The token totals still use the long-standing
+  lenient conversion (an unreadable value counts as 0), so they may include
+  such normalized values; estimates recorded earlier are never repriced.
 - The official page format is parsed strictly; if GitHub changes the table
   layout in an unsupported way, refreshes fail (last valid cache kept and
   labeled stale) until the parser is updated.
@@ -726,6 +825,12 @@ than hidden. No per-task summary is generated.
   cannot be verified as a genuinely new work item), and a task with no
   records — including all work before this feature — is not evidence of a
   skipped review.
+- Feature delivery tracking only covers what is explicitly recorded and
+  linked: usage before the call ledger started and calls without stable
+  OTEL ids can never be split by feature, a shared invocation needs manual
+  per-call selection, and defect counts include only confirmed recorded
+  findings. The ledger grows with every ledgered call (one compact entry
+  per call in the task JSON).
 - Crash safety is unchanged: offsets are written before the task file, so a
   crash between the two can undercount (never double count) usage and
   registry events; ingestion is not exactly-once. An existing task file that
@@ -767,9 +872,11 @@ Routine mechanical shell/git operations use a separate built-in route:
 
 The built-in `task` subagent is not an eighth custom agent: it has no
 `agents/task.agent.md` and `/agent` continues to list the seven custom
-roles above. This delegation is itself a cost-saving operation, even when
-no coding-agent stage is warranted. Route routine mechanics to it rather
-than consuming a higher-cost main-session model for command execution;
+roles above. Delegating to it is a cost-saving operation, even when no
+coding-agent stage is warranted, when the command work is substantial
+enough to pay for the handoff (long build/test runs, verbose formatter
+passes, authorized multi-file commits); tiny lookups, status checks and
+one-line commands stay in the main session by default. When it is used,
 the main session remains responsible for defining scope and checking the
 result. Do not spend a `senior-coder`/Opus call or route a command-only
 request through a coding/review agent. `discovery` is read-only mapping,
@@ -781,7 +888,7 @@ without authorization. If the built-in Task tool is unavailable or a
 command needs security-sensitive/complex judgment, handle it in the main
 session and explain why.
 
-Small or casual implementation/edit requests follow a separate mandatory
+Small or casual implementation/edit requests follow a separate default
 route: use the `task` tool to invoke the named custom agent `coder` (not
 the built-in `task` shell executor), with `model: gpt-6.1-terra`,
 `reasoning_effort: low`, and `context_tier: default`. The main session
@@ -789,9 +896,30 @@ scopes and coordinates the work and retains oversight. `coder` implements
 only and does not test or
 review its own changes; every code batch receives an independent reviewer
 pass, while tester remains conditional on behavior. Pure prose/docs and
-mechanical git-only changes are exempt. Answer simple informational
-questions directly.
-Routine shell/mechanical work remains routed to the built-in `task`.
+mechanical git-only changes are exempt. Genuinely trivial edits (a typo,
+a one-line doc/comment fix, a single obvious value) may be made directly
+by the main session when the handoff would cost more than the edit; a
+source/code edit made that way still gets the independent reviewer pass.
+Answer simple informational questions directly.
+Routine shell/mechanical work remains routed to the built-in `task` when
+it is worth a handoff.
+
+**Efficient orchestration.** The instructions treat delegation as a cost
+tool: the main session answers small questions and follows a single
+continuous investigation itself; implementers get one complete bounded
+batch (no per-file or micro handoffs); the tests run before one broad
+review of the whole source-and-test batch; stages run in parallel only for
+independent reads or non-overlapping writes; only significant correctness,
+security, safety, data-integrity and regression findings consume fix
+rounds (optional polish is deferred unless you ask for it). When a review
+or test budget is exhausted the orchestrator stops, sends **one**
+actionable escalation with explicit choices (accept as-is, authorize a
+targeted extension for named findings, or stop), waits, and resumes only
+with the permission you actually gave — no automatic new cycle, budget
+reset, or reminder loop. Delivery is judged by completion, cost, elapsed
+time and confirmed material defects/regressions, not by agent count or
+self-reported quality; see [Feature delivery
+tracking](#feature-delivery-tracking).
 
 Model choices follow a provisional cost/capability tiering (start cheap for routine
 work, step up for design/routing and higher-scrutiny review):

@@ -38,6 +38,9 @@ Responsibilities:
   changes, deep structural bugs, or new services (favor `senior-coder`) —
   so the orchestrator can route correctly.
 - Identify what tests should exist to validate the change, if any.
+- Plan the implementation as one complete, bounded batch per implementer
+  (not per-file handoffs). Mark steps as parallelizable only when they are
+  independent with non-overlapping writes; dependent stages stay ordered.
 - Keep the plan concise and actionable.
 
 Output format:

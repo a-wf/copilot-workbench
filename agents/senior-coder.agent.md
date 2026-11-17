@@ -40,6 +40,11 @@ Responsibilities:
   escalated fixes, what you continued from and which finding number each
   change addresses), so the next stage has context without re-reading
   everything.
+- Work the whole bounded batch you were handed in one pass; don't ask for
+  per-file or micro handoffs. Fix required findings (significant
+  correctness, security, safety, data-integrity, regressions); leave
+  findings marked optional/deferred alone unless the orchestrator says the
+  user asked for them.
 
 Never test, review, or approve your own work — hand off to `reviewer` or
 `tester` for verification. Never re-run a broad review or write tests

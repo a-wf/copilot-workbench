@@ -73,6 +73,23 @@ task_routing:
     review_budget: one_comprehensive_pass_plus_up_to_3_focused_verification_rounds
     broad_review_timing: after_complete_code_and_test_batch
     review_record_command: copilot-task-report.py record-review
+  orchestration_policy:
+    # Toolkit orchestration convention; not native Copilot CLI routing config.
+    # Policy only: it changes no model, reasoning_effort or context_tier value.
+    main_session_direct: [simple_questions, single_continuous_investigation, genuinely_trivial_edits_when_handoff_costs_more]
+    delegate_when: [substantial_separate_context, demonstrable_net_cost_benefit]
+    delegate_tiny_commands_by_default: false
+    trivial_main_session_edits_still_reviewed: true
+    handoff_granularity: one_complete_bounded_batch_per_implementer
+    test_before_single_broad_review: true
+    parallel_only_for: independent_reads_or_non_overlapping_writes
+    finding_triage: fix_significant_defer_optional_polish
+    budget_exhaustion: single_actionable_escalation_then_wait
+    budget_extension_requires: explicit_user_authorization
+    automatic_new_cycle_on_exhaustion: false
+    delivery_metrics: [completion, cost, elapsed_time, confirmed_material_defects_and_regressions]
+    delivery_tracking_scope: meaningful_multi_agent_features_only
+    delivery_record_commands: [copilot-task-report.py record-delivery, copilot-task-report.py feature-calls, copilot-task-report.py record-feature-usage]
 
 # User approval is required before substantive work on these routes.
 # This is an orchestrator convention, not a Copilot CLI enforcement feature.

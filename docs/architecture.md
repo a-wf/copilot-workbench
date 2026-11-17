@@ -297,6 +297,52 @@ aggregate as Markdown.
   legacy `jira_key`, exact or normalized) makes it exit non-zero with a
   stderr message, leaving the task file, state file and offsets untouched
   (a missing file is still a new task).
+- **Feature usage ledger** — additive `task["feature_usage"]` (schema v1),
+  started by the first ingest after upgrade. Before that ingest's delta is
+  merged, the task's totals and recorded official-cost coverage are frozen
+  as `baseline` (historical, unsplittable; never rescanned or backfilled).
+  `scan_otel_files` now also keeps each chat span's own `spanId` and start
+  time and each session `invoke_agent` span's ids; `build_official_cost_delta`
+  keeps the per-call result it already computed (snapshot, tier, component
+  USD, or the unpriced reason). `build_feature_ledger_delta` turns each call
+  with a valid key (session id + `traceId` + own `spanId`; ids validated
+  against a bounded charset, all-zero ids rejected) and strictly valid usage
+  (finite non-negative integers; booleans/strings rejected) into one
+  immutable entry with that frozen price; anything else is counted per
+  reason in `unledgered` (no key is invented). The same strict check now
+  gates official pricing of newly ingested calls: a present but invalid raw
+  count is unpriced (`UNPRICED_INVALID_USAGE`) while the token aggregates
+  keep their lenient conversion (unconvertible values count as 0). A key already in the ledger
+  is never re-added: the observation is counted in `repeated_observations`
+  (and as conflicting if its data differs) — the byte-offset aggregation
+  and its idempotence are unchanged, so those observations stay in the
+  totals. `baseline + ledger + unledgered + repeated == totals` (calls,
+  tokens, priced USD) is checked at render time. The existing attribution
+  rule is unchanged; the ledger only copies an agent label it resolved. A
+  malformed block is left untouched (new calls are then not ledgered).
+- **Delivery records and feature links** — `record-delivery` and
+  `record-feature-usage` follow the `record-review` pattern (strict
+  versioned input, duplicate keys/unknown fields/non-finite values rejected,
+  ingest lock, strict task read, atomic replace, identical replay = no-op,
+  conflicting payload under an existing `record_id` refused, nothing
+  ingested/fetched/rendered), except that both require an existing task
+  file created by ingest and never create one. `task["delivery"]` holds lifecycle events per
+  `(feature_id, cycle_id)` — one `started`, at most one terminal
+  `completed`/`cancelled` not before the start, one feature per cycle — and
+  confirmed material findings with a task-unique `finding_id` (regressions
+  require a previous-working evidence reference). Links in
+  `feature_usage.assignments` are append-only: selectors (exact call keys or
+  a direct invocation, which expands only to ledger calls whose own
+  `parentSpanId` is the observed `invoke_agent` span, same session and
+  trace) are expanded, compared against the previewed count and sha256,
+  checked against a started cycle and existing links (another cycle →
+  refused; same cycle → counted once), and stored with the expanded keys.
+  `feature-calls` is the read-only inspector/previewer (no lock,
+  directories, migrations, pricing or network). The report's *Feature
+  Delivery* section appears only when delivery records or links exist and
+  renders untrusted ids/references as inline code (references refuse
+  backticks, pipes and backslashes), so no HTML, link or table injection
+  renders.
 
 ### Effort intent labeling
 
@@ -404,6 +450,23 @@ a task report). The
 main session records each review round with `record-review` (see above);
 reviewers stay read-only, and `cycle_id` scopes a budget to one requested
 work item.
+
+Cost discipline is part of the orchestration contract: the main session
+handles small questions, single continuous investigations and genuinely
+trivial edits itself (main-authored code edits are still reviewed
+independently) and delegates only substantial context or demonstrable net
+savings; implementers receive one complete bounded batch; parallel stages
+are limited to independent reads/non-overlapping writes; only significant
+correctness/security/safety/data-integrity/regression findings consume fix
+rounds. An exhausted budget produces one actionable escalation with
+explicit choices and then waits — no extra round, automatic new cycle,
+budget reset or reminder loop without the user's explicit authorization.
+Delivery is measured by completion, cost, elapsed time and confirmed
+material defects/regressions (recorded with `record-delivery` and
+`record-feature-usage` for meaningful multi-agent features only), never by
+agent count or self-reported quality. `config/agent-routing.yaml`
+mirrors these rules under `task_routing.orchestration_policy`; no
+model/effort/context value changed.
 
 This is pure configuration — no code ties the pipeline to the session
 manager or the task reporter. You can adopt just the agents, just the

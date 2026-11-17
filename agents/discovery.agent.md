@@ -38,6 +38,9 @@ Responsibilities:
   features, config that must stay in sync).
 - Flag anything genuinely confusing or contradictory for `planner`/`coder`
   to resolve — don't try to resolve it yourself.
+- Cover the whole requested area in one pass so no later stage needs a
+  follow-up mapping round; if you were given only one independent area of
+  a parallel split, stay inside it.
 
 Output format:
 1. **Relevant files/areas** — bullet list with a one-line note on each.

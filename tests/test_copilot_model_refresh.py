@@ -767,6 +767,13 @@ class TestApplyPinsAndRouting(RefreshCase):
         self.assertIn("as the task call's `model`, `reasoning_effort` or `context_tier`", instruction)
         self.assertIn("status --instructions", instruction)
         self.assertIn(self.mod.INSTRUCTIONS_MARKER, instruction)
+        # A generated personal instruction must not restore the retired
+        # mandatory-delegation wording over the shipped trivial-edit exception.
+        prose = " ".join(instruction.split())
+        self.assertIn("default delegation to `coder` for meaningful small/casual", prose)
+        self.assertIn("main session may make a genuinely trivial edit itself", prose)
+        self.assertIn("independent review of every code change stays mandatory", prose)
+        self.assertNotIn("mandatory delegation to `coder`", prose)
         self.assertEqual(sum(line.startswith("| `") for line in instruction.splitlines()), 10)
         self.assertNotIn("http", instruction)
         for route in self.mod.ROUTES:

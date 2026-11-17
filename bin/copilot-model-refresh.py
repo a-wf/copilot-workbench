@@ -1220,8 +1220,10 @@ def build_instructions(effective, defaults):
             route["key"], cells[0], cells[1], cells[2], ", ".join(SOURCE_LABELS[s] for s in srcs)))
     lines += [
         "",
-        "Route keys: `coder.small_casual` is the mandatory small/casual implementation delegation to `coder`;",
-        "`reviewer.stronger` is the stronger reviewer override; `task` is the built-in Task tool route.",
+        "Route keys: `coder.small_casual` is the default delegation to `coder` for meaningful small/casual",
+        "implementation (the main session may make a genuinely trivial edit itself; independent review of",
+        "every code change stays mandatory); `reviewer.stronger` is the stronger reviewer override; `task` is",
+        "the built-in Task tool route.",
         "",
     ]
     return "\n".join(lines).encode("utf-8")

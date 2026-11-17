@@ -171,6 +171,35 @@ EXPECTED_ROUTING = {
             "broad_review_timing": "after_complete_code_and_test_batch",
             "review_record_command": "copilot-task-report.py record-review",
         },
+        "orchestration_policy": {
+            "main_session_direct": [
+                "simple_questions",
+                "single_continuous_investigation",
+                "genuinely_trivial_edits_when_handoff_costs_more",
+            ],
+            "delegate_when": [
+                "substantial_separate_context", "demonstrable_net_cost_benefit",
+            ],
+            "delegate_tiny_commands_by_default": False,
+            "trivial_main_session_edits_still_reviewed": True,
+            "handoff_granularity": "one_complete_bounded_batch_per_implementer",
+            "test_before_single_broad_review": True,
+            "parallel_only_for": "independent_reads_or_non_overlapping_writes",
+            "finding_triage": "fix_significant_defer_optional_polish",
+            "budget_exhaustion": "single_actionable_escalation_then_wait",
+            "budget_extension_requires": "explicit_user_authorization",
+            "automatic_new_cycle_on_exhaustion": False,
+            "delivery_metrics": [
+                "completion", "cost", "elapsed_time",
+                "confirmed_material_defects_and_regressions",
+            ],
+            "delivery_tracking_scope": "meaningful_multi_agent_features_only",
+            "delivery_record_commands": [
+                "copilot-task-report.py record-delivery",
+                "copilot-task-report.py feature-calls",
+                "copilot-task-report.py record-feature-usage",
+            ],
+        },
     },
     "routing_approval": {
         "required_tiers": ["standard", "complex", "high-risk"],
@@ -340,14 +369,57 @@ class TestAgentInventory(unittest.TestCase):
         required_phrases = (
             "for small or casual implementation/edit requests, delegate implementation using the `task` tool to invoke the named custom agent `coder`",
             "model: gpt-6.1-terra`, `reasoning_effort: low`, and `context_tier: default`",
-            "this is a mandatory implementation delegation, not a route to the built-in `task` shell executor",
+            "this is the default implementation delegation for meaningful small/casual work, not a route to the built-in `task` shell executor",
             "the main session defines the scope, coordinates the work, and retains oversight of the result",
+            "genuinely trivial edits are the exception: when the handoff would cost more than the edit itself",
+            "the main session may make the edit directly and say so",
+            "still gets the independent `reviewer` pass; the main session never reviews its own change",
             "simple informational questions should be answered directly in the main session",
             "routine shell/git and other mechanical command execution remains the built-in `task` route described above; do not use `coder` for mechanics",
         )
         for phrase in required_phrases:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, instructions)
+
+    def test_coordination_policy_keeps_batch_review_and_budget_guards_in_sync(self):
+        with open(ORCHESTRATOR_INSTRUCTIONS, encoding="utf-8") as f:
+            instructions = f.read()
+        start = instructions.index("## Efficient orchestration")
+        end = instructions.index("### Budget exhaustion", start)
+        rules = instructions[start:end]
+        self.assertEqual(
+            re.findall(r"^\d\. \*\*([^*]+)\*\*", rules, re.MULTILINE),
+            ["Direct work.", "Batch handoffs.", "Parallelism.", "Finding triage.",
+             "Budget exhaustion.", "Delivery metrics."],
+        )
+        normalized = " ".join(rules.split())
+        for requirement in (
+            "single continuous investigation",
+            "substantial separate context",
+            "run before **one** broad `reviewer` pass",
+            "independent reads or work with non-overlapping writes",
+            "Defer optional polish and style",
+            "no extra round, automatic new cycle, budget reset",
+            "confirmed material defects/regressions",
+            "never by how many agents ran",
+            "trivial questions and one-line operations need no tracking",
+        ):
+            with self.subTest(requirement=requirement):
+                self.assertIn(requirement, normalized)
+        # Existing whole-map/frontmatter assertions still pin every model,
+        # effort and context value; the new policy is additive, not ignored.
+        self.assertEqual(parse_agent_routing(ROUTING_CONFIG), EXPECTED_ROUTING)
+        for path, direct_phrase in (
+            ("README.md", "genuinely trivial edits"),
+            ("docs/architecture.md", "genuinely trivial edits"),
+        ):
+            with self.subTest(document=path):
+                with open(os.path.join(REPO_ROOT, path), encoding="utf-8") as f:
+                    text = " ".join(f.read().split()).lower()
+                self.assertIn(direct_phrase, text)
+                self.assertIn("independent", text)
+                self.assertIn("record-delivery", text)
+                self.assertIn("record-feature-usage", text)
 
     def test_orchestrator_requires_explicit_stage_skip_communication(self):
         with open(ORCHESTRATOR_INSTRUCTIONS, "r", encoding="utf-8") as f:

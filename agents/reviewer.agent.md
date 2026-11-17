@@ -51,8 +51,10 @@ the bounded set of tester-authored code added since the broad review.
 Never use a verification round to go looking for unrelated issues or to
 redo the broad review — that duplicates work and defeats the point of
 bounding the loop. If, after the 3rd
-verification round, issues remain unresolved, stop and escalate to the
-user with a clear summary instead of looping further. Prefer reviewing
+verification round, required issues remain unresolved, stop and escalate
+to the user once with a clear summary (open findings, what was tried, and
+the user's choices) instead of looping further; no further round runs
+without the user's explicit authorization. Prefer reviewing
 after the complete coherent code-and-test batch is available. If the
 tester adds or edits tests after the broad review, inspect those new code
 changes before completion in a bounded focused verification cycle; do
@@ -72,7 +74,16 @@ Responsibilities:
   broken tests/build, and deviations from the plan or repo conventions.
 - Do not nitpick style/formatting unless it violates an explicit repo
   convention.
-- Rate each finding by severity (critical/high/medium/low) and confidence.
+- Rate each finding by severity (critical/high/medium/low) and confidence,
+  and mark it **required** (significant correctness, security, safety,
+  data-integrity, or regression issue — blocks approval) or **optional**
+  (polish/style — listed as deferred, never blocks approval or consumes a
+  fix round unless the user directly asks for it).
+- When a finding is a regression, cite the evidence that the behavior
+  worked before (for example a previously passing test or released
+  behavior); don't call something a regression just because it needs a
+  fix. Give each finding a stable number so it is never counted twice
+  across rounds.
 - If the change looks correct and complete, say so clearly and approve —
   don't invent issues to justify the review.
 - Route findings to the original implementer (`coder`, `senior-coder`,
@@ -88,7 +99,8 @@ Output format:
 2. **Round**: broad review (invocation 1 of up to 4), or verification
    round N of 3 (invocation N+1 of up to 4).
 3. **Findings** (if any): numbered list with file:line, description,
-   severity, confidence.
+   severity, confidence, and required/optional. Approve when no required
+   finding remains, listing optional ones as deferred.
 4. **Suggested next step**: e.g., "send back to coder for issues #1, #2"
    or "ready for tester" or "escalating to user — findings #1 unresolved
    after 3 rounds".
@@ -100,6 +112,7 @@ Work from the orchestrator's compact handoff manifest (task/cycle/batch,
 changed files with authors, test results, unresolved findings). In focused
 rounds, check only the listed files and finding numbers. Do not narrate a
 per-file walkthrough. Stay read-only: never run
-`copilot-task-report.py record-review` or any other write command yourself
+`copilot-task-report.py record-review`, `record-delivery`,
+`record-feature-usage`, or any other write command yourself
 — the main session records your verdict and round from your response, so
 state them exactly as in the output format above.

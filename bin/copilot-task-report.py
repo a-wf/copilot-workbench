@@ -151,6 +151,15 @@ for the user-facing summary):
   reviewer/test-reviewer round records (task["reviews"]) after strict
   validation against the bounded review policy. They are not telemetry,
   and recording never ingests, fetches pricing or regenerates reports.
+- Feature delivery tracking (additive, optional): ingest also fills an
+  immutable per-call ledger (task["feature_usage"], keyed by session id +
+  traceId + the chat span's own spanId, with the official price frozen at
+  ingestion) on top of a frozen, unsplittable pre-ledger baseline.
+  `record-delivery` stores explicit feature/cycle lifecycle events and
+  confirmed material findings (task["delivery"]); the read-only
+  `feature-calls` previews exact call selections; `record-feature-usage`
+  links exact ledger calls to one started cycle. Nothing is assigned from
+  timestamps, models, agents, sessions or guesses (see the section notes).
 """
 
 import argparse
@@ -1326,9 +1335,11 @@ def otel_ts(pair):
     if not pair or len(pair) != 2:
         return None
     try:
-        return float(pair[0]) + float(pair[1]) / 1e9
-    except (TypeError, ValueError):
+        value = float(pair[0]) + float(pair[1]) / 1e9
+    except (TypeError, ValueError, OverflowError):
         return None
+    # Non-finite (NaN/Infinity) span times are unknown, never a timestamp.
+    return value if math.isfinite(value) else None
 
 
 # --------------------------------------------------------------------------
@@ -1397,7 +1408,7 @@ def seed_jsonl_offset_by_ts(path, install_epoch, ts_extractor):
             line_len = len(raw)
             try:
                 e = json.loads(raw)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):  # malformed line (incl. JSONDecodeError, huge ints): skip
                 pos += line_len
                 continue
             ts = ts_extractor(e)
@@ -1441,7 +1452,7 @@ def seed_events_state_for_install(events_path, install_epoch):
             line_len = len(raw)
             try:
                 e = json.loads(raw)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):  # malformed line (incl. JSONDecodeError, huge ints): skip
                 pos += line_len
                 continue
             ts = parse_ts(e.get("timestamp"))
@@ -1541,7 +1552,7 @@ def process_events_jsonl(raw_lines, sess_state):
     for raw in raw_lines:
         try:
             e = json.loads(raw)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # malformed line (incl. JSONDecodeError, huge ints): skip
             continue
         etype = e.get("type")
         data = e.get("data") or {}
@@ -1667,15 +1678,25 @@ def process_otel_span(attrs, start_ts, end_ts, sess_state):
         return None
 
     model = attrs.get("gen_ai.response.model") or attrs.get("gen_ai.request.model") or "unknown-model"
-    prompt_tokens = int(attrs.get("gen_ai.usage.input_tokens") or 0)
-    completion_tokens = int(attrs.get("gen_ai.usage.output_tokens") or 0)
-    reasoning_tokens = int(attrs.get("gen_ai.usage.reasoning.output_tokens") or 0)
-    cache_read_tokens = int(attrs.get("gen_ai.usage.cache_read.input_tokens") or 0)
-    cache_write_tokens = int(attrs.get("gen_ai.usage.cache_write.input_tokens") or 0)
+    # Same lenient int(value or 0) conversion as before for every value it
+    # already accepted; a value it cannot convert (NaN/Infinity, non-numeric
+    # string, list, ...) no longer crashes the ingest: it fails closed to 0
+    # in the aggregates, marks the call unpriceable (UNPRICED_INVALID_USAGE,
+    # never priced as 0 tokens) and fails usage_strict_ok (unledgered).
+    unconvertible = []
+    prompt_tokens = _lenient_usage_count(attrs, "gen_ai.usage.input_tokens", unconvertible)
+    completion_tokens = _lenient_usage_count(attrs, "gen_ai.usage.output_tokens", unconvertible)
+    reasoning_tokens = _lenient_usage_count(attrs, "gen_ai.usage.reasoning.output_tokens", unconvertible)
+    cache_read_tokens = _lenient_usage_count(attrs, "gen_ai.usage.cache_read.input_tokens", unconvertible)
+    cache_write_tokens = _lenient_usage_count(attrs, "gen_ai.usage.cache_write.input_tokens", unconvertible)
     total_tokens = prompt_tokens + completion_tokens
     duration_ms = 0
     if start_ts is not None and end_ts is not None:
-        duration_ms = max(0, int((end_ts - start_ts) * 1000))
+        span_seconds = end_ts - start_ts
+        # Non-finite span times (NaN/Infinity in the telemetry) give no
+        # duration rather than crashing the ingest.
+        if math.isfinite(span_seconds):
+            duration_ms = max(0, int(span_seconds * 1000))
 
     reasoning_level = attrs.get("gen_ai.request.reasoning.level")
     if reasoning_level:
@@ -1704,8 +1725,29 @@ def process_otel_span(attrs, start_ts, end_ts, sess_state):
             "cache_read": "gen_ai.usage.cache_read.input_tokens" in attrs,
             "cache_write": "gen_ai.usage.cache_write.input_tokens" in attrs,
         },
+        # Strict validity of the raw usage attributes (finite, non-negative,
+        # integral, at most 2**53, never a boolean or string). The aggregate
+        # counts above keep the lenient conversion; a call that fails this
+        # check is never priced (UNPRICED_INVALID_USAGE) and is booked as
+        # unledgered in the call ledger, never "repaired".
+        "usage_strict_ok": not unconvertible and all(
+            _strict_count(attrs[k]) is not None for k in LEDGER_USAGE_ATTRS if k in attrs
+        ),
+        # Usage attributes the lenient conversion above could not read (kept
+        # as 0 in the aggregates); such a call is never priced.
+        "usage_unconvertible": sorted(unconvertible),
     }
     return mc
+
+
+def _lenient_usage_count(attrs, key, unconvertible):
+    """Existing `int(value or 0)` usage conversion, failing closed: a value
+    it cannot convert is recorded in `unconvertible` and counted as 0."""
+    try:
+        return int(attrs.get(key) or 0)
+    except (TypeError, ValueError, OverflowError):
+        unconvertible.append(key)
+        return 0
 
 
 def scan_otel_files(session_id, sess_state, install_epoch):
@@ -1755,7 +1797,7 @@ def scan_otel_files(session_id, sess_state, install_epoch):
         for raw in raw_lines:
             try:
                 e = json.loads(raw)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):  # malformed line (incl. JSONDecodeError, huge ints): skip
                 continue
             if not isinstance(e, dict) or e.get("type") != "span":
                 continue
@@ -1779,8 +1821,11 @@ def scan_otel_files(session_id, sess_state, install_epoch):
                 continue
             if agent_info is not None:
                 # Observed invocation span of this session (counted once:
-                # each byte range is read exactly once per session).
-                agent_spans.append(agent_info)
+                # each byte range is read exactly once per session). The
+                # span's own ids are carried along (copy) for the
+                # feature-usage invocation ledger only.
+                agent_spans.append(dict(agent_info, trace_id=e.get("traceId"), span_id=e.get("spanId"),
+                                        parent_span_id=e.get("parentSpanId"), start_ts=start_ts))
                 continue
             if not name.startswith("chat"):
                 continue
@@ -1789,6 +1834,11 @@ def scan_otel_files(session_id, sess_state, install_epoch):
                 continue
             mc["trace_id"] = e.get("traceId")
             mc["parent_span_id"] = e.get("parentSpanId")
+            # The chat span's OWN id (with session + trace id) is the stable
+            # call-ledger key; it is validated, never invented, when the
+            # ledger delta is built.
+            mc["span_id"] = e.get("spanId")
+            mc["start_ts"] = start_ts
             calls.append(mc)
             for t in (start_ts, end_ts):
                 if t is None:
@@ -1983,6 +2033,11 @@ def build_delta(session_id, sess_state, events_path, pricing_ctx=None):
         delta["model_calls"] += 1
     for info in agent_spans:
         _attributed_agent_entry(delta["attribution"]["attributed"], info)["invocation_spans"] += 1
+    # Feature-usage call ledger delta: one immutable entry per call with a
+    # stable (session, trace, own span) key, plus explicit buckets for calls
+    # that have no stable key. Purely additive; the aggregates above are
+    # unchanged.
+    delta["feature_ledger"] = build_feature_ledger_delta(session_id, calls, agent_spans)
 
     delta["min_ts"] = min_ts
     delta["max_ts"] = max_ts
@@ -2027,6 +2082,10 @@ def merge_delta_into_task(task, delta, session_id, task_id):
     # started on an existing task, its "legacy" snapshot is exactly the usage
     # aggregated before attribution tracking existed for that task.
     attribution = prepare_attribution_block(task)
+    # Same rule for the feature-usage call ledger: its pre-ledger baseline
+    # (usage totals + recorded official-cost coverage) is frozen BEFORE this
+    # delta's usage and cost are merged, and is never split or backfilled.
+    feature_usage = prepare_feature_usage_block(task)
 
     totals = task.setdefault("totals", blank_agg())
     totals.setdefault("first_call_ts", None)
@@ -2107,6 +2166,13 @@ def merge_delta_into_task(task, delta, session_id, task_id):
                      if fallback["call_count"] else {},
                      "attributed": {}, "invocation_events": []}
     merge_attribution_delta(attribution, att_delta, session_id)
+    ledger_delta = delta.get("feature_ledger")
+    if ledger_delta is None:
+        # Older code path without ledger data: book its calls as unledgered
+        # (no stable keys are known, none are invented) so the ledger still
+        # reconciles with the totals and recorded cost merged above.
+        ledger_delta = _fallback_feature_ledger_delta(delta)
+    merge_feature_ledger_delta(feature_usage, ledger_delta)
     return task
 
 
@@ -2524,6 +2590,9 @@ UNPRICED_UNKNOWN_MODEL = "model not listed in the official GitHub pricing snapsh
 UNPRICED_NO_INPUT = "input token count missing from telemetry (never assumed 0)"
 UNPRICED_NO_OUTPUT = "output token count missing from telemetry (never assumed 0)"
 UNPRICED_NEGATIVE = "negative token count in telemetry"
+UNPRICED_INVALID_USAGE = ("a usage count in telemetry is not a valid count (boolean, numeric string, fraction, "
+                          "negative, unsafe huge, NaN/Infinity or non-numeric); the converted value is not "
+                          "trusted, never priced and never assumed 0")
 UNPRICED_CACHE_EXCEEDS_INPUT = "cache-read + cache-write tokens exceed input tokens (unexpected usage shape)"
 UNPRICED_REASONING_EXCEEDS_OUTPUT = ("reasoning tokens exceed output tokens (output may exclude reasoning; "
                                      "billable output unknown)")
@@ -3486,6 +3555,14 @@ def price_call_official(mc, snapshot, no_snapshot_reason=UNPRICED_NO_SNAPSHOT):
         return None, UNPRICED_NO_INPUT
     if not present.get("output", True):
         return None, UNPRICED_NO_OUTPUT
+    # Fail closed on raw usage that is present but not a strict count
+    # (boolean, numeric string, fraction, negative, unsafe huge, NaN/Infinity,
+    # non-numeric): the leniently converted aggregate value is not trusted as
+    # known usage, so the call is never priced from it. Absent optional
+    # attributes are fine. Calls built without these flags (older code
+    # paths) are checked exactly as before.
+    if mc.get("usage_unconvertible") or mc.get("usage_strict_ok") is False:
+        return None, UNPRICED_INVALID_USAGE
     inp = int(mc.get("prompt_tokens") or 0)
     out = int(mc.get("completion_tokens") or 0)
     reasoning = int(mc.get("reasoning_tokens") or 0)
@@ -3552,6 +3629,9 @@ def build_official_cost_delta(calls, pricing_ctx):
         rec = out["by_model"].setdefault(model, {"priced": {}, "unpriced": {}})
         result, reason = price_call_official(mc, snapshot, no_snapshot_reason or UNPRICED_NO_SNAPSHOT)
         if result is None:
+            # Frozen per-call outcome for the feature-usage call ledger
+            # (recorded once, never repriced).
+            mc["official_pricing"] = {"status": "unpriced", "reason": reason}
             u = rec["unpriced"].setdefault(reason, {"calls": 0, "total_tokens": 0})
             u["calls"] += 1
             u["total_tokens"] += int(mc.get("total_tokens") or 0)
@@ -3559,6 +3639,14 @@ def build_official_cost_delta(calls, pricing_ctx):
         # Per-call estimate kept on the call record (not persisted on its
         # own) so attribution can sum exactly what was recorded here.
         mc["official_usd"] = result["usd"]
+        mc["official_pricing"] = {
+            "status": "priced",
+            "snapshot_id": snapshot["snapshot_id"],
+            "official_model": result["model_id"],
+            "tier": result["tier"],
+            "usd": result["usd"],
+            "components": dict(result["components"]),
+        }
         bucket = rec["priced"].setdefault(snapshot["snapshot_id"], _blank_official_bucket())
         bucket["calls"] += 1
         bucket["usd"] += result["usd"]
@@ -4451,6 +4539,8 @@ def render_markdown(task):
 
     lines.extend(render_attribution_section(task))
     lines.extend(render_review_section(task))
+    feature_lines = render_feature_delivery_section(task)
+    lines.extend(feature_lines)
 
     lines.append("## Limitations")
     lines.append("")
@@ -4504,6 +4594,16 @@ def render_markdown(task):
                   "not native telemetry, and recording them does not regenerate this report. A task "
                   "with no recorded reviews (including any work done before recording existed) is not "
                   "evidence of a skipped or failed review.")
+    if feature_lines:
+        lines.append("- Feature delivery records (`record-delivery`) and feature-usage links "
+                      "(`record-feature-usage`) are explicit orchestrator-supplied records, not telemetry. "
+                      "A call counts toward a feature only through an exact recorded call-key link; nothing "
+                      "is assigned from timestamps, models, agent names, sessions or semantic guesses. Usage "
+                      "before the call ledger started and calls without stable OTEL ids can never be split by "
+                      "feature. Per-call USD values are list-price estimates frozen at ingestion, not an "
+                      "invoice. Elapsed time is wall-clock between recorded start and completion (includes "
+                      "idle time). Defect/regression counts include only explicitly confirmed, recorded "
+                      "findings; none recorded is not evidence of no defects.")
     lines.append("")
     return "\n".join(lines)
 
@@ -5044,6 +5144,1515 @@ def _load_task_file_strict(tpath, task_id):
                               % (tpath, stored, task_id))
             break
     return task, None
+
+
+# --------------------------------------------------------------------------
+# Feature delivery tracking: call ledger, delivery records and explicit
+# feature-usage links (`record-delivery`, `feature-calls`,
+# `record-feature-usage`) — additive and versioned
+# --------------------------------------------------------------------------
+#
+# Three explicitly separated pieces, all optional (a task that never uses
+# them renders exactly as before):
+#
+# 1. task["feature_usage"] (schema FEATURE_USAGE_SCHEMA_VERSION) — an
+#    immutable per-call LEDGER filled by ingest. A model call whose OTEL chat
+#    span carries valid ids is stored once under the stable key
+#    (session id, traceId, the chat span's OWN spanId) with minimal data:
+#    model, token counts, usage-presence flags, span duration, parent span
+#    id, start time (display only), the agent label ONLY when the existing
+#    attribution rule resolved it (direct invoke_agent parent read in the
+#    same ingest — unchanged) and the official pricing outcome FROZEN at
+#    ingestion (snapshot id, tier, component USD) or the explicit unpriced
+#    reason. No prompts, completions or tool results are stored.
+#    invoke_agent spans of the session are stored the same way as observed
+#    invocations. Native OTEL data is untrusted: ids must match
+#    OTEL_ID_RE and usage counts must be finite non-negative integers
+#    (booleans/strings rejected). A call without a valid stable key is
+#    counted per reason under "unledgered" — no key is ever invented. A
+#    stable key seen again (e.g. the same span exported to two files) is
+#    never ledgered twice: it is counted under "repeated_observations"
+#    (the existing byte-offset aggregation and its idempotence are
+#    unchanged, so those observations stay in the task totals). When the
+#    block starts on a task, the task's existing totals and recorded cost
+#    coverage are frozen as the "baseline": historical, unsplittable, never
+#    rescanned or backfilled. Conservation, checked by the report:
+#      totals == baseline + ledger calls + unledgered + repeated.
+#
+# 2. task["delivery"] (schema DELIVERY_SCHEMA_VERSION) — explicit
+#    orchestrator-supplied lifecycle records per (feature_id, cycle_id):
+#    exactly one "started", then at most one terminal "completed" or
+#    "cancelled" (no reopen/restart, so a cycle's review budget is never
+#    reset), plus confirmed material findings ("defect-confirmed" /
+#    "regression-confirmed") identified by a task-unique finding_id so one
+#    logical finding is never counted twice across rounds. A cycle_id
+#    belongs to exactly one feature_id within the task. Late findings and
+#    late usage links against an ended cycle are allowed (explicit audit;
+#    the lifecycle is unchanged).
+#
+# 3. task["feature_usage"]["assignments"] — append-only explicit links of
+#    exact ledger call keys to one started (feature_id, cycle_id). A
+#    selector is an exact call key, or a direct invocation (session + trace +
+#    the span id of an invoke_agent span recorded in the ledger) that
+#    expands ONLY to ledger calls of the same session and trace whose own
+#    parentSpanId equals that span id — never ancestors, time windows,
+#    models, whole sessions, or calls ingested after the record. The
+#    expanded set is fingerprinted (count + sha256 of the sorted call keys)
+#    by the read-only `feature-calls` preview and re-checked when recording;
+#    a changed selection is refused. Each call belongs to at most one
+#    feature cycle per task: a conflicting link is refused (never moved),
+#    while links overlapping calls already linked to the SAME cycle are
+#    accepted and counted once (e.g. re-selecting an invocation after more
+#    of its calls were ingested).
+#
+# Recording commands never ingest, fetch pricing or regenerate the report;
+# `feature-calls` is read-only (no lock, directories, pricing or network).
+# Per-call USD values are list-price estimates frozen at ingestion, not an
+# invoice; nothing here accepts an externally supplied cost.
+
+FEATURE_USAGE_SCHEMA_VERSION = 1
+FEATURE_USAGE_RECORD_SCHEMA = "copilot-task-report.feature-usage-record"
+FEATURE_USAGE_RECORD_SCHEMA_VERSION = 1
+FEATURE_CALLS_OUTPUT_SCHEMA = "copilot-task-report.feature-calls"
+FEATURE_CALLS_OUTPUT_SCHEMA_VERSION = 1
+DELIVERY_RECORD_SCHEMA = "copilot-task-report.delivery-record"
+DELIVERY_RECORD_SCHEMA_VERSION = 1
+DELIVERY_SCHEMA_VERSION = 1
+
+LEDGER_CALL_SOURCE = "otel-chat-span"
+LEDGER_INVOCATION_SOURCE = "otel-invoke-agent-span"
+LEDGER_USAGE_ATTRS = (
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.reasoning.output_tokens",
+    "gen_ai.usage.cache_read.input_tokens",
+    "gen_ai.usage.cache_write.input_tokens",
+)
+LEDGER_TOKEN_KEYS = ("prompt_tokens", "completion_tokens", "reasoning_tokens", "cache_read_tokens",
+                     "cache_write_tokens", "total_tokens")
+LEDGER_MAX_COUNT = 2 ** 53
+LEDGER_MAX_LABEL_LEN = 200
+# OTEL trace/span ids (hex in practice). Deliberately excludes "/" so the
+# "session/trace/span" call key is unambiguous; all-zero ids are invalid.
+OTEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+LEDGER_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
+
+LEDGER_REASON_SESSION_ID = "session id is not a safe identifier, so no stable call key can be formed"
+LEDGER_REASON_NO_TRACE_ID = "chat span has no valid traceId (no stable call key; never invented)"
+LEDGER_REASON_NO_SPAN_ID = "chat span has no valid own spanId (no stable call key; never invented)"
+LEDGER_REASON_INVALID_USAGE = ("usage attributes are not finite non-negative integers (booleans, strings and "
+                               "fractions rejected)")
+LEDGER_REASON_INVALID_MODEL = "model identifier is missing or not a bounded printable string"
+LEDGER_REASON_DELTA_WITHOUT_LEDGER = "the ingest delta carried no call-ledger data (older code path)"
+
+LEDGER_AGENT_LINK_RESOLVED = "direct-parent-invoke-agent-same-ingest"
+LEDGER_AGENT_LINK_CODES = {
+    ATTRIBUTION_REASON_NO_SUPPORTED_LINK: "no-trace-parent",
+    ATTRIBUTION_REASON_PARENT_NOT_OBSERVED: "parent-not-observed-in-same-ingest",
+    ATTRIBUTION_REASON_PARENT_NOT_AGENT: "parent-not-invoke-agent",
+}
+LEDGER_PROVENANCE = {
+    "calls": ("OTEL 'chat *' spans of the session, keyed by session id + traceId + the span's own spanId; "
+              "pricing frozen at ingestion"),
+    "invocations": "OTEL invoke_agent spans of the session, keyed by session id + traceId + spanId",
+    "baseline": "task totals and recorded official-cost coverage frozen when the ledger started (unsplittable)",
+}
+
+DELIVERY_EVENTS_LIFECYCLE = ("started", "completed", "cancelled")
+DELIVERY_EVENTS_TERMINAL = ("completed", "cancelled")
+DELIVERY_EVENTS_FINDING = ("defect-confirmed", "regression-confirmed")
+DELIVERY_EVENTS = DELIVERY_EVENTS_LIFECYCLE + DELIVERY_EVENTS_FINDING
+# Only material findings are recorded; optional polish/style is out of scope.
+DELIVERY_SEVERITIES = ("critical", "high", "medium")
+DELIVERY_CATEGORIES = ("correctness", "security", "safety", "data-integrity")
+DELIVERY_PROVENANCE_BASES = ("user-supplied", "agent-response", "orchestrator-observed")
+FEATURE_USAGE_PROVENANCE_BASES = ("user-supplied", "orchestrator-selected")
+TRACKING_PROVENANCE_SOURCES = ("orchestrator-supplied",)
+DELIVERY_COMMON_KEYS = ("schema", "schema_version", "record_id", "task_id", "feature_id", "cycle_id", "event",
+                        "occurred_at", "provenance")
+DELIVERY_FINDING_KEYS = ("finding_id", "severity", "category", "evidence_reference")
+DELIVERY_REGRESSION_KEYS = ("previous_working_reference",)
+DELIVERY_CORE_KEYS = ("record_id", "task_id", "feature_id", "cycle_id", "event", "occurred_at", "provenance",
+                      "finding_id", "severity", "category", "evidence_reference", "previous_working_reference")
+DELIVERY_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
+DELIVERY_FUTURE_SKEW_SECONDS = 300
+DELIVERY_INPUT_MAX_BYTES = 64 * 1024
+
+FEATURE_USAGE_INPUT_KEYS = frozenset((
+    "schema", "schema_version", "record_id", "task_id", "feature_id", "cycle_id", "selectors",
+    "expected_call_count", "expected_call_set_sha256", "provenance",
+))
+FEATURE_USAGE_CORE_KEYS = ("record_id", "task_id", "feature_id", "cycle_id", "selectors", "expected_call_count",
+                           "expected_call_set_sha256", "provenance")
+FEATURE_SELECTOR_KEYS = frozenset(("kind", "session_id", "trace_id", "span_id"))
+FEATURE_SELECTOR_KINDS = ("call", "direct-invocation")
+FEATURE_USAGE_MAX_SELECTORS = 5000
+FEATURE_USAGE_MAX_CALLS = 10 ** 6
+FEATURE_USAGE_INPUT_MAX_BYTES = 1024 * 1024
+SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+TRACKING_PROVENANCE_KEYS = frozenset(("source", "basis", "reference"))
+# Characters refused in stored free-text references (they are rendered
+# inside Markdown code spans, so no HTML/link/table injection is possible).
+TRACKING_REFERENCE_FORBIDDEN = frozenset("`|\\")
+
+
+class TrackingRecordError(ValueError):
+    """Invalid delivery / feature-usage input, or a record that conflicts
+    with the task's existing state or the call ledger."""
+
+
+# ---- call ledger (ingest side) -------------------------------------------
+
+def _strict_count(value):
+    """A finite, non-negative, integral usage count as int, else None.
+    Booleans, strings, fractions and out-of-range values are rejected."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= LEDGER_MAX_COUNT else None
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer() and 0 <= value <= LEDGER_MAX_COUNT:
+        return int(value)
+    return None
+
+
+def _valid_otel_id(value):
+    return (isinstance(value, str) and bool(OTEL_ID_RE.match(value))
+            and value.strip("0") != "")
+
+
+def _valid_ledger_session_id(value):
+    return isinstance(value, str) and bool(LEDGER_SESSION_ID_RE.match(value))
+
+
+def _ledger_key(session_id, trace_id, span_id):
+    """Stable call/invocation key. Every component is validated to exclude
+    "/", so the key is unambiguous."""
+    return "%s/%s/%s" % (session_id, trace_id, span_id)
+
+
+def _epoch_to_iso(epoch):
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(epoch):
+        return None
+    try:
+        dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (dt.microsecond // 1000)
+
+
+def _safe_label(value):
+    if not isinstance(value, str) or not value or len(value) > LEDGER_MAX_LABEL_LEN:
+        return None
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        return None
+    return value
+
+
+def _blank_ledger_bucket():
+    return {"usage": blank_agg(), "priced_calls": 0, "unpriced_calls": 0, "usd": 0.0}
+
+
+def _ledger_bucket_add(bucket, tokens, duration_ms, pricing):
+    usage = bucket.setdefault("usage", blank_agg())
+    for k in LEDGER_TOKEN_KEYS:
+        usage[k] = _int_or_zero(usage.get(k)) + _int_or_zero(tokens.get(k))
+    usage["call_count"] = _int_or_zero(usage.get("call_count")) + 1
+    usage["duration_ms"] = _int_or_zero(usage.get("duration_ms")) + _int_or_zero(duration_ms)
+    status = pricing.get("status") if isinstance(pricing, dict) else None
+    if status == "priced":
+        bucket["priced_calls"] = _int_or_zero(bucket.get("priced_calls")) + 1
+        bucket["usd"] = _float_or_zero(bucket.get("usd")) + _float_or_zero(pricing.get("usd"))
+    elif status == "unpriced":
+        bucket["unpriced_calls"] = _int_or_zero(bucket.get("unpriced_calls")) + 1
+
+
+def _merge_ledger_bucket(dst, src):
+    usage = dst.setdefault("usage", blank_agg())
+    src_usage = src.get("usage") if isinstance(src.get("usage"), dict) else {}
+    for k in blank_agg():
+        usage[k] = _int_or_zero(usage.get(k)) + _int_or_zero(src_usage.get(k))
+    for k in ("priced_calls", "unpriced_calls"):
+        dst[k] = _int_or_zero(dst.get(k)) + _int_or_zero(src.get(k))
+    dst["usd"] = _float_or_zero(dst.get("usd")) + _float_or_zero(src.get("usd"))
+
+
+def _ledger_call_entry(mc, session_id, ingested_at):
+    """(entry, None) for a call with a valid stable key and strictly valid
+    usage, else (None, unledgered_reason). `session_id` is None when the
+    session id itself is not a safe identifier."""
+    if session_id is None:
+        return None, LEDGER_REASON_SESSION_ID
+    trace_id, span_id = mc.get("trace_id"), mc.get("span_id")
+    if not _valid_otel_id(trace_id):
+        return None, LEDGER_REASON_NO_TRACE_ID
+    if not _valid_otel_id(span_id):
+        return None, LEDGER_REASON_NO_SPAN_ID
+    if mc.get("usage_strict_ok") is not True:
+        return None, LEDGER_REASON_INVALID_USAGE
+    model = _safe_label(mc.get("model"))
+    if model is None:
+        return None, LEDGER_REASON_INVALID_MODEL
+    tokens = {}
+    for k in LEDGER_TOKEN_KEYS:
+        value = mc.get(k)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2 * LEDGER_MAX_COUNT:
+            return None, LEDGER_REASON_INVALID_USAGE
+        tokens[k] = value
+    parent = mc.get("parent_span_id")
+    resolved = mc.get("attribution") if isinstance(mc.get("attribution"), dict) else {}
+    if isinstance(resolved.get("agent_key"), str):
+        agent = {"agent_key": resolved["agent_key"],
+                 "agent_type": resolved.get("agent_type") if isinstance(resolved.get("agent_type"), str) else None}
+        agent_link = LEDGER_AGENT_LINK_RESOLVED
+    else:
+        agent = None
+        agent_link = LEDGER_AGENT_LINK_CODES.get(resolved.get("reason"), "not-resolved")
+    pricing = mc.get("official_pricing")
+    if isinstance(pricing, dict) and pricing.get("status") == "priced":
+        frozen = {
+            "status": "priced",
+            "snapshot_id": pricing.get("snapshot_id"),
+            "official_model": pricing.get("official_model"),
+            "tier": pricing.get("tier"),
+            "usd": _float_or_zero(pricing.get("usd")),
+            "components": {k: _float_or_zero(v) for k, v in (pricing.get("components") or {}).items()},
+        }
+    elif isinstance(pricing, dict) and pricing.get("status") == "unpriced":
+        frozen = {"status": "unpriced", "reason": str(pricing.get("reason"))}
+    else:
+        frozen = {"status": "not-recorded",
+                  "reason": "no official pricing result was recorded for this call at ingestion"}
+    present = mc.get("usage_present") if isinstance(mc.get("usage_present"), dict) else {}
+    entry = {
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_span_id": parent if _valid_otel_id(parent) else None,
+        "started_at": _epoch_to_iso(mc.get("start_ts")),
+        "model": model,
+        "usage": tokens,
+        "usage_present": {k: bool(v) for k, v in present.items()},
+        "duration_ms": _int_or_zero(mc.get("duration_ms")),
+        "agent": agent,
+        "agent_link": agent_link,
+        "pricing": frozen,
+        "source": LEDGER_CALL_SOURCE,
+        "ingested_at": ingested_at,
+    }
+    return entry, None
+
+
+def _ledger_invocation_entry(info, session_id, ingested_at):
+    if session_id is None:
+        return None
+    trace_id, span_id = info.get("trace_id"), info.get("span_id")
+    if not _valid_otel_id(trace_id) or not _valid_otel_id(span_id):
+        return None
+    parent = info.get("parent_span_id")
+    return {
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_span_id": parent if _valid_otel_id(parent) else None,
+        "agent_key": info.get("agent_key") if isinstance(info.get("agent_key"), str) else None,
+        "agent_type": info.get("agent_type") if isinstance(info.get("agent_type"), str) else None,
+        "started_at": _epoch_to_iso(info.get("start_ts")),
+        "source": LEDGER_INVOCATION_SOURCE,
+        "ingested_at": ingested_at,
+    }
+
+
+def build_feature_ledger_delta(session_id, calls, agent_spans):
+    """Ledger delta for one ingest batch (see the section notes above)."""
+    out = {"calls": [], "unledgered": {}, "invocations": [], "invocations_without_stable_ids": 0}
+    sid = session_id if _valid_ledger_session_id(session_id) else None
+    ingested_at = now_iso()
+    for mc in calls:
+        entry, reason = _ledger_call_entry(mc, sid, ingested_at)
+        if entry is not None:
+            out["calls"].append(entry)
+            continue
+        bucket = out["unledgered"].setdefault(reason, _blank_ledger_bucket())
+        _ledger_bucket_add(bucket, mc, mc.get("duration_ms"), mc.get("official_pricing"))
+    for info in agent_spans:
+        inv = _ledger_invocation_entry(info, sid, ingested_at)
+        if inv is None:
+            out["invocations_without_stable_ids"] += 1
+        else:
+            out["invocations"].append(inv)
+    return out
+
+
+def _fallback_feature_ledger_delta(delta):
+    """Unledgered booking for a delta built without ledger data: usage from
+    its by_model aggregates and cost coverage from its recorded official-cost
+    buckets (so conservation with the merged totals still holds)."""
+    bucket = _blank_ledger_bucket()
+    for agg in (delta.get("by_model") or {}).values():
+        for k in blank_agg():
+            bucket["usage"][k] += _int_or_zero(agg.get(k))
+    oc = delta.get("official_cost") or {}
+    for rec in (oc.get("by_model") or {}).values():
+        for b in (rec.get("priced") or {}).values():
+            bucket["priced_calls"] += _int_or_zero(b.get("calls"))
+            bucket["usd"] += _float_or_zero(b.get("usd"))
+        for u in (rec.get("unpriced") or {}).values():
+            bucket["unpriced_calls"] += _int_or_zero(u.get("calls"))
+    unledgered = {LEDGER_REASON_DELTA_WITHOUT_LEDGER: bucket} if bucket["usage"]["call_count"] else {}
+    return {"calls": [], "unledgered": unledgered, "invocations": [], "invocations_without_stable_ids": 0}
+
+
+def _feature_usage_shape_ok(fu):
+    if not (isinstance(fu, dict) and fu.get("schema_version") == FEATURE_USAGE_SCHEMA_VERSION):
+        return False
+    baseline = fu.get("baseline")
+    if not (isinstance(baseline, dict) and isinstance(baseline.get("usage"), dict)
+            and isinstance(baseline.get("official_cost"), dict)):
+        return False
+    return all(isinstance(fu.get(k), dict) for k in
+               ("calls", "invocations", "unledgered", "repeated_observations", "assignments"))
+
+
+def prepare_feature_usage_block(task):
+    """Return the task's feature-usage block, starting it (with the frozen
+    pre-ledger baseline) if absent. Must run before the current delta is
+    merged. An unsupported/malformed block is left untouched (None)."""
+    fu = task.get("feature_usage")
+    if fu is None:
+        prior = task.get("totals") if isinstance(task.get("totals"), dict) else {}
+        oc = summarize_official_cost(task)["totals"]
+        fu = task["feature_usage"] = {
+            "schema_version": FEATURE_USAGE_SCHEMA_VERSION,
+            "since": now_iso(),
+            "baseline": {
+                "usage": {k: _int_or_zero(prior.get(k)) for k in blank_agg()},
+                "official_cost": {
+                    "priced_calls": _int_or_zero(oc.get("priced_calls")),
+                    "unpriced_calls": _int_or_zero(oc.get("unpriced_calls")),
+                    "legacy_calls": _int_or_zero(oc.get("legacy_calls")),
+                    "usd": _float_or_zero(oc.get("usd")),
+                },
+            },
+            "calls": {},
+            "invocations": {},
+            "unledgered": {},
+            "repeated_observations": dict(_blank_ledger_bucket(), conflicting=0),
+            "repeated_invocation_observations": 0,
+            "invocations_without_stable_ids": 0,
+            "assignments": {},
+            "provenance": dict(LEDGER_PROVENANCE),
+        }
+        return fu
+    if _feature_usage_shape_ok(fu):
+        return fu
+    print("Warning: task '%s' has an unsupported/malformed feature_usage block; leaving it unchanged "
+          "(new calls are still counted in the task totals but not ledgered)." % task.get("task_id", "?"),
+          file=sys.stderr)
+    return None
+
+
+def _ledger_observation_core(entry):
+    return (entry.get("model"), entry.get("usage"), entry.get("parent_span_id"), entry.get("started_at"),
+            entry.get("duration_ms"))
+
+
+def merge_feature_ledger_delta(fu, ledger_delta):
+    """Merge one ingest's ledger delta. Existing entries are never modified;
+    a repeated stable key is counted once in repeated_observations (and as
+    conflicting when its observed data differs) instead of being ledgered
+    twice."""
+    if fu is None or not ledger_delta:
+        return
+    calls = fu["calls"]
+    repeated = fu["repeated_observations"]
+    for entry in ledger_delta.get("calls") or []:
+        key = _ledger_key(entry["session_id"], entry["trace_id"], entry["span_id"])
+        existing = calls.get(key)
+        if existing is None:
+            calls[key] = entry
+            continue
+        _ledger_bucket_add(repeated, entry["usage"], entry.get("duration_ms"), entry.get("pricing"))
+        if not isinstance(existing, dict) or _ledger_observation_core(existing) != _ledger_observation_core(entry):
+            repeated["conflicting"] = _int_or_zero(repeated.get("conflicting")) + 1
+    for reason, bucket in (ledger_delta.get("unledgered") or {}).items():
+        dst = fu["unledgered"].get(reason)
+        if not isinstance(dst, dict):
+            dst = fu["unledgered"][reason] = _blank_ledger_bucket()
+        _merge_ledger_bucket(dst, bucket)
+    invocations = fu["invocations"]
+    for inv in ledger_delta.get("invocations") or []:
+        key = _ledger_key(inv["session_id"], inv["trace_id"], inv["span_id"])
+        if key in invocations:
+            fu["repeated_invocation_observations"] = _int_or_zero(fu.get("repeated_invocation_observations")) + 1
+        else:
+            invocations[key] = inv
+    missing = _int_or_zero(ledger_delta.get("invocations_without_stable_ids"))
+    if missing:
+        fu["invocations_without_stable_ids"] = _int_or_zero(fu.get("invocations_without_stable_ids")) + missing
+
+
+# ---- shared strict input helpers -----------------------------------------
+
+def _tracking_identifier(value, field):
+    try:
+        return _review_identifier(value, field, allow_unknown=False)
+    except ReviewRecordError as ex:
+        raise TrackingRecordError(str(ex))
+
+
+def _tracking_reference(value, field):
+    try:
+        text = _review_text(value, field)
+    except ReviewRecordError as ex:
+        raise TrackingRecordError(str(ex))
+    if TRACKING_REFERENCE_FORBIDDEN & set(text):
+        raise TrackingRecordError("%s must not contain backticks, pipes or backslashes (store a short "
+                                  "reference such as a PR/test/finding pointer, not prose)" % field)
+    return text
+
+
+def _tracking_choice(value, field, choices):
+    if not isinstance(value, str) or value not in choices:
+        raise TrackingRecordError("%s must be one of %s (got %r)" % (field, ", ".join(choices), value))
+    return value
+
+
+def _tracking_task_id(value):
+    if not isinstance(value, str):
+        raise TrackingRecordError("task_id must be a string")
+    task_id = normalize_task_id(value)
+    if task_id is None:
+        raise TrackingRecordError(
+            "task_id %r is not a valid task ID/name (expected e.g. ABC-123, a free-form name using "
+            "letters/digits/./_/- up to %d characters, or the literal '%s')" % (value, MAX_TASK_ID_LEN, UNASSIGNED))
+    return task_id
+
+
+def _tracking_header(raw, schema, version, allowed_keys, required_keys, what):
+    if not isinstance(raw, dict):
+        raise TrackingRecordError("the %s must be a JSON object" % what)
+    unknown = sorted(set(raw) - set(allowed_keys))
+    if unknown:
+        raise TrackingRecordError("unknown field(s): %s" % ", ".join(unknown))
+    missing = sorted(set(required_keys) - set(raw))
+    if missing:
+        raise TrackingRecordError("missing required field(s): %s" % ", ".join(missing))
+    if raw["schema"] != schema:
+        raise TrackingRecordError("schema must be %r (got %r)" % (schema, raw["schema"]))
+    got = raw["schema_version"]
+    if isinstance(got, bool) or not isinstance(got, int) or got != version:
+        raise TrackingRecordError("unsupported schema_version %r (this tool supports %d)" % (got, version))
+
+
+def _tracking_provenance(prov, bases):
+    if not isinstance(prov, dict):
+        raise TrackingRecordError("provenance must be an object with source, basis and reference")
+    unknown = sorted(set(prov) - TRACKING_PROVENANCE_KEYS)
+    if unknown:
+        raise TrackingRecordError("unknown provenance field(s): %s" % ", ".join(unknown))
+    missing = sorted(TRACKING_PROVENANCE_KEYS - set(prov))
+    if missing:
+        raise TrackingRecordError("missing provenance field(s): %s" % ", ".join(missing))
+    return {
+        "source": _tracking_choice(prov["source"], "provenance.source", TRACKING_PROVENANCE_SOURCES),
+        "basis": _tracking_choice(prov["basis"], "provenance.basis", bases),
+        "reference": _tracking_reference(prov["reference"], "provenance.reference"),
+    }
+
+
+def _load_tracking_input(path, max_bytes):
+    """Strictly read one JSON input file (UTF-8, bounded size, no duplicate
+    keys, no NaN/Infinity literals)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(max_bytes + 1)
+    except OSError as ex:
+        raise TrackingRecordError("cannot read input file %r: %s" % (path, ex))
+    if len(data) > max_bytes:
+        raise TrackingRecordError("input file exceeds %d bytes" % max_bytes)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as ex:
+        raise TrackingRecordError("input file is not valid UTF-8: %s" % ex)
+    if not text.strip():
+        raise TrackingRecordError("input file is empty")
+    try:
+        return json.loads(text, object_pairs_hook=_review_no_duplicate_keys,
+                          parse_constant=_review_reject_constant)
+    except ReviewRecordError as ex:
+        raise TrackingRecordError(str(ex))
+    except json.JSONDecodeError as ex:
+        raise TrackingRecordError("input file is not valid JSON: %s" % ex)
+
+
+def _utc_ts_epoch(value):
+    """Epoch for a strict UTC timestamp 'YYYY-MM-DDTHH:MM:SS[.ffffff]Z', else None."""
+    if not isinstance(value, str) or not DELIVERY_TS_RE.match(value):
+        return None
+    try:
+        dt = datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    fraction = value[19:-1]
+    return dt.timestamp() + (float(fraction) if fraction else 0.0)
+
+
+# ---- delivery records (`record-delivery`) ---------------------------------
+
+def validate_delivery_record(raw, now=None):
+    """Validate one parsed delivery-record document and return its normalized
+    form (every DELIVERY_CORE_KEYS key present; finding fields None for
+    lifecycle events). Nothing is defaulted."""
+    if isinstance(raw, dict) and raw.get("event") in DELIVERY_EVENTS_FINDING:
+        extra = DELIVERY_FINDING_KEYS + (DELIVERY_REGRESSION_KEYS if raw["event"] == "regression-confirmed" else ())
+    else:
+        extra = ()
+    allowed = DELIVERY_COMMON_KEYS + extra
+    _tracking_header(raw, DELIVERY_RECORD_SCHEMA, DELIVERY_RECORD_SCHEMA_VERSION, allowed, allowed,
+                     "delivery record")
+    event = _tracking_choice(raw["event"], "event", DELIVERY_EVENTS)
+    occurred_at = raw["occurred_at"]
+    epoch = _utc_ts_epoch(occurred_at)
+    if epoch is None:
+        raise TrackingRecordError("occurred_at must be a UTC timestamp like 2026-11-17T14:05:00Z (got %r)"
+                                  % (occurred_at,))
+    now = time.time() if now is None else now
+    if epoch > now + DELIVERY_FUTURE_SKEW_SECONDS:
+        raise TrackingRecordError("occurred_at %s is in the future" % occurred_at)
+    record = {
+        "record_id": _tracking_identifier(raw["record_id"], "record_id"),
+        "task_id": _tracking_task_id(raw["task_id"]),
+        "feature_id": _tracking_identifier(raw["feature_id"], "feature_id"),
+        "cycle_id": _tracking_identifier(raw["cycle_id"], "cycle_id"),
+        "event": event,
+        "occurred_at": occurred_at,
+        "provenance": _tracking_provenance(raw["provenance"], DELIVERY_PROVENANCE_BASES),
+        "finding_id": None,
+        "severity": None,
+        "category": None,
+        "evidence_reference": None,
+        "previous_working_reference": None,
+    }
+    if event in DELIVERY_EVENTS_FINDING:
+        record["finding_id"] = _tracking_identifier(raw["finding_id"], "finding_id")
+        record["severity"] = _tracking_choice(raw["severity"], "severity", DELIVERY_SEVERITIES)
+        record["category"] = _tracking_choice(raw["category"], "category", DELIVERY_CATEGORIES)
+        record["evidence_reference"] = _tracking_reference(raw["evidence_reference"], "evidence_reference")
+        if event == "regression-confirmed":
+            record["previous_working_reference"] = _tracking_reference(
+                raw["previous_working_reference"], "previous_working_reference")
+    return record
+
+
+def load_delivery_record_input(path):
+    return validate_delivery_record(_load_tracking_input(path, DELIVERY_INPUT_MAX_BYTES))
+
+
+def _delivery_shape_ok(block):
+    return (isinstance(block, dict) and block.get("schema_version") == DELIVERY_SCHEMA_VERSION
+            and isinstance(block.get("records"), dict))
+
+
+def _delivery_cycles(records):
+    """{cycle_id: {feature_id, started, terminal, defects, regressions}} from
+    stored delivery records, in recording order."""
+    cycles = {}
+    for r in records.values():
+        if (not isinstance(r, dict) or not isinstance(r.get("cycle_id"), str)
+                or not isinstance(r.get("feature_id"), str)):
+            continue
+        c = cycles.setdefault(r["cycle_id"], {"feature_id": r.get("feature_id"), "started": None,
+                                              "terminal": None, "defects": [], "regressions": [],
+                                              "feature_conflict": False})
+        if r.get("feature_id") != c["feature_id"]:
+            c["feature_conflict"] = True
+        event = r.get("event")
+        if event == "started" and c["started"] is None:
+            c["started"] = r
+        elif event in DELIVERY_EVENTS_TERMINAL and c["terminal"] is None:
+            c["terminal"] = r
+        elif event == "defect-confirmed":
+            c["defects"].append(r)
+        elif event == "regression-confirmed":
+            c["regressions"].append(r)
+    return cycles
+
+
+def apply_delivery_record(task, record):
+    """Check `record` against the task's delivery records and add it.
+    Returns "recorded" or "duplicate" (identical replay; task unchanged).
+    Raises TrackingRecordError on any conflict, leaving `task` unchanged."""
+    block = task.get("delivery")
+    if block is None:
+        block = {"schema_version": DELIVERY_SCHEMA_VERSION, "records": {}}
+    elif not _delivery_shape_ok(block):
+        raise TrackingRecordError("task '%s' has an unsupported or malformed 'delivery' block; refusing to "
+                                  "modify it" % record["task_id"])
+    records = block["records"]
+    existing = records.get(record["record_id"])
+    if existing is not None:
+        if isinstance(existing, dict) and {k: existing.get(k) for k in DELIVERY_CORE_KEYS} == record:
+            return "duplicate"
+        raise TrackingRecordError("record_id '%s' is already recorded for task '%s' with different content"
+                                  % (record["record_id"], record["task_id"]))
+    cycle_id, feature_id, event = record["cycle_id"], record["feature_id"], record["event"]
+    cycle = _delivery_cycles(records).get(cycle_id)
+    if cycle is not None and cycle["feature_id"] != feature_id:
+        raise TrackingRecordError("cycle '%s' belongs to feature '%s', not '%s'; a cycle id names one work item "
+                                  "of one feature within the task" % (cycle_id, cycle["feature_id"], feature_id))
+    if event == "started":
+        if cycle is not None and cycle["started"] is not None:
+            raise TrackingRecordError(
+                "cycle '%s' was already started (record '%s'); a cycle starts once — no restart, reopen or "
+                "review-budget reset" % (cycle_id, cycle["started"].get("record_id")))
+    else:
+        if cycle is None or cycle["started"] is None:
+            raise TrackingRecordError("cycle '%s' has no 'started' record; record the start first" % cycle_id)
+        start_epoch = _utc_ts_epoch(cycle["started"].get("occurred_at"))
+        if start_epoch is None:
+            raise TrackingRecordError("the stored start of cycle '%s' has an unreadable timestamp" % cycle_id)
+        if _utc_ts_epoch(record["occurred_at"]) < start_epoch:
+            raise TrackingRecordError("occurred_at %s precedes the start of cycle '%s' (%s)" % (
+                record["occurred_at"], cycle_id, cycle["started"].get("occurred_at")))
+        if event in DELIVERY_EVENTS_TERMINAL:
+            if cycle["terminal"] is not None:
+                raise TrackingRecordError(
+                    "cycle '%s' already ended as '%s' (record '%s'); it cannot be completed, cancelled or "
+                    "reopened again" % (cycle_id, cycle["terminal"].get("event"), cycle["terminal"].get("record_id")))
+        else:
+            for r in records.values():
+                if isinstance(r, dict) and r.get("finding_id") == record["finding_id"]:
+                    raise TrackingRecordError(
+                        "finding '%s' is already recorded (record '%s', cycle '%s'); a logical finding is counted "
+                        "once — do not re-record it in later rounds" % (
+                            record["finding_id"], r.get("record_id"), r.get("cycle_id")))
+    stored = dict(record)
+    stored["provenance"] = dict(record["provenance"])
+    stored["recorded_at"] = now_iso()
+    records[record["record_id"]] = stored
+    block["updated_at"] = stored["recorded_at"]
+    task["delivery"] = block
+    return "recorded"
+
+
+# ---- feature-usage links (`feature-calls`, `record-feature-usage`) --------
+
+def feature_call_set_sha256(call_keys):
+    """sha256 (hex) of the UTF-8 text formed by the sorted, de-duplicated
+    call keys ("session/trace/span"), each followed by a newline."""
+    text = "".join("%s\n" % k for k in sorted(set(call_keys)))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _validate_selector(sel, index):
+    where = "selectors[%d]" % index
+    if not isinstance(sel, dict):
+        raise TrackingRecordError("%s must be an object" % where)
+    unknown = sorted(set(sel) - FEATURE_SELECTOR_KEYS)
+    if unknown:
+        raise TrackingRecordError("%s: unknown field(s): %s" % (where, ", ".join(unknown)))
+    missing = sorted(FEATURE_SELECTOR_KEYS - set(sel))
+    if missing:
+        raise TrackingRecordError("%s: missing field(s): %s" % (where, ", ".join(missing)))
+    kind = _tracking_choice(sel["kind"], where + ".kind", FEATURE_SELECTOR_KINDS)
+    if not _valid_ledger_session_id(sel["session_id"]):
+        raise TrackingRecordError("%s.session_id %r is not a valid session id" % (where, sel["session_id"]))
+    for field in ("trace_id", "span_id"):
+        if not _valid_otel_id(sel[field]):
+            raise TrackingRecordError("%s.%s %r is not a valid OTEL id" % (where, field, sel[field]))
+    return {"kind": kind, "session_id": sel["session_id"], "trace_id": sel["trace_id"], "span_id": sel["span_id"]}
+
+
+def _validate_selectors(raw_selectors):
+    if not isinstance(raw_selectors, list) or not raw_selectors:
+        raise TrackingRecordError("selectors must be a non-empty list")
+    if len(raw_selectors) > FEATURE_USAGE_MAX_SELECTORS:
+        raise TrackingRecordError("at most %d selectors are allowed per record" % FEATURE_USAGE_MAX_SELECTORS)
+    out, seen = [], set()
+    for i, sel in enumerate(raw_selectors):
+        norm = _validate_selector(sel, i)
+        ident = (norm["kind"], norm["session_id"], norm["trace_id"], norm["span_id"])
+        if ident in seen:
+            raise TrackingRecordError("selectors[%d] duplicates an earlier selector" % i)
+        seen.add(ident)
+        out.append(norm)
+    return out
+
+
+def validate_feature_usage_record(raw):
+    _tracking_header(raw, FEATURE_USAGE_RECORD_SCHEMA, FEATURE_USAGE_RECORD_SCHEMA_VERSION,
+                     FEATURE_USAGE_INPUT_KEYS, FEATURE_USAGE_INPUT_KEYS, "feature-usage record")
+    count = raw["expected_call_count"]
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= FEATURE_USAGE_MAX_CALLS:
+        raise TrackingRecordError("expected_call_count must be an integer from 1 to %d (got %r)"
+                                  % (FEATURE_USAGE_MAX_CALLS, count))
+    digest = raw["expected_call_set_sha256"]
+    if not isinstance(digest, str) or not SHA256_HEX_RE.match(digest):
+        raise TrackingRecordError("expected_call_set_sha256 must be 64 lowercase hex characters")
+    return {
+        "record_id": _tracking_identifier(raw["record_id"], "record_id"),
+        "task_id": _tracking_task_id(raw["task_id"]),
+        "feature_id": _tracking_identifier(raw["feature_id"], "feature_id"),
+        "cycle_id": _tracking_identifier(raw["cycle_id"], "cycle_id"),
+        "selectors": _validate_selectors(raw["selectors"]),
+        "expected_call_count": count,
+        "expected_call_set_sha256": digest,
+        "provenance": _tracking_provenance(raw["provenance"], FEATURE_USAGE_PROVENANCE_BASES),
+    }
+
+
+def load_feature_usage_record_input(path):
+    return validate_feature_usage_record(_load_tracking_input(path, FEATURE_USAGE_INPUT_MAX_BYTES))
+
+
+def _readable_feature_usage(task):
+    fu = task.get("feature_usage")
+    if fu is None:
+        raise TrackingRecordError("task '%s' has no call ledger yet (it starts at the next ingest of a session "
+                                  "of this task)" % task.get("task_id", "?"))
+    if not _feature_usage_shape_ok(fu):
+        raise TrackingRecordError("task '%s' has an unsupported or malformed 'feature_usage' block; refusing "
+                                  "to use it" % task.get("task_id", "?"))
+    return fu
+
+
+def _require_started_cycle(task, feature_id, cycle_id):
+    block = task.get("delivery")
+    if block is None:
+        raise TrackingRecordError("cycle '%s' has no 'started' delivery record; record-delivery the start first"
+                                  % cycle_id)
+    if not _delivery_shape_ok(block):
+        raise TrackingRecordError("task '%s' has an unsupported or malformed 'delivery' block"
+                                  % task.get("task_id", "?"))
+    cycle = _delivery_cycles(block["records"]).get(cycle_id)
+    if cycle is None or cycle["started"] is None:
+        raise TrackingRecordError("cycle '%s' has no 'started' delivery record; record-delivery the start first"
+                                  % cycle_id)
+    if cycle["feature_id"] != feature_id:
+        raise TrackingRecordError("cycle '%s' belongs to feature '%s', not '%s'"
+                                  % (cycle_id, cycle["feature_id"], feature_id))
+    return cycle
+
+
+def _invocation_children_index(fu):
+    """{(session_id, trace_id, parent_span_id): [call keys]} over the ledger:
+    a call is indexed ONLY under its own direct parent span id."""
+    index = {}
+    for k, c in fu["calls"].items():
+        if isinstance(c, dict) and c.get("parent_span_id"):
+            index.setdefault((c.get("session_id"), c.get("trace_id"), c.get("parent_span_id")), []).append(k)
+    return index
+
+
+def expand_feature_selectors(fu, selectors):
+    """Sorted exact call keys selected by validated `selectors`. Every
+    selector must resolve to ledgered data and no call may be selected by
+    two selectors. A direct-invocation selector expands only to ledger calls
+    of the same session and trace whose own parentSpanId is the selected
+    invoke_agent span id (no ancestors, time windows or later calls)."""
+    owner = {}
+    children = None
+    for i, sel in enumerate(selectors):
+        key = _ledger_key(sel["session_id"], sel["trace_id"], sel["span_id"])
+        if sel["kind"] == "call":
+            if not isinstance(fu["calls"].get(key), dict):
+                raise TrackingRecordError("selectors[%d]: call %s is not in this task's call ledger" % (i, key))
+            matched = [key]
+        else:
+            if not isinstance(fu["invocations"].get(key), dict):
+                raise TrackingRecordError("selectors[%d]: invoke_agent span %s is not in this task's ledger of "
+                                          "observed invocations" % (i, key))
+            if children is None:
+                children = _invocation_children_index(fu)
+            matched = sorted(children.get((sel["session_id"], sel["trace_id"], sel["span_id"]), []))
+            if not matched:
+                raise TrackingRecordError("selectors[%d]: invocation %s has no ledgered direct child calls"
+                                          % (i, key))
+        for k in matched:
+            if k in owner:
+                raise TrackingRecordError("selectors[%d] and selectors[%d] both select call %s; select each call "
+                                          "exactly once" % (owner[k], i, k))
+            owner[k] = i
+    if not owner:
+        raise TrackingRecordError("the selection is empty")
+    return sorted(owner)
+
+
+def current_call_assignments(fu):
+    """({call_key: (feature_id, cycle_id, record_id)}, conflicting_keys) from
+    the append-only assignment records, in recording order. Conflicting
+    keys (only possible in a hand-edited file) are excluded everywhere."""
+    owners, conflicts = {}, set()
+    for rid, rec in fu["assignments"].items():
+        if (not isinstance(rec, dict) or not isinstance(rec.get("call_keys"), list)
+                or not isinstance(rec.get("feature_id"), str) or not isinstance(rec.get("cycle_id"), str)):
+            continue
+        target = (rec.get("feature_id"), rec.get("cycle_id"))
+        for k in rec["call_keys"]:
+            if not isinstance(k, str):
+                continue
+            cur = owners.get(k)
+            if cur is None:
+                owners[k] = (target[0], target[1], rid)
+            elif (cur[0], cur[1]) != target:
+                conflicts.add(k)
+    return owners, conflicts
+
+
+def _check_assignment_conflicts(fu, call_keys, feature_id, cycle_id):
+    """Refuse any call already linked to another feature cycle; return the
+    number of calls already linked to this same cycle (counted once)."""
+    owners, conflicts = current_call_assignments(fu)
+    already = 0
+    for k in call_keys:
+        if k in conflicts:
+            raise TrackingRecordError("call %s has conflicting stored links; refusing to link it" % k)
+        cur = owners.get(k)
+        if cur is None:
+            continue
+        if (cur[0], cur[1]) != (feature_id, cycle_id):
+            raise TrackingRecordError(
+                "call %s is already linked to feature '%s' cycle '%s' (record '%s'); links are never moved or "
+                "shared — select the calls of this work explicitly" % (k, cur[0], cur[1], cur[2]))
+        already += 1
+    return already
+
+
+def apply_feature_usage_record(task, record):
+    """Validate `record` against the ledger, delivery records and existing
+    links, and append it. Returns "recorded" or "duplicate"; raises
+    TrackingRecordError (task unchanged) otherwise."""
+    fu = _readable_feature_usage(task)
+    assignments = fu["assignments"]
+    existing = assignments.get(record["record_id"])
+    if existing is not None:
+        if isinstance(existing, dict) and {k: existing.get(k) for k in FEATURE_USAGE_CORE_KEYS} == record:
+            return "duplicate"
+        raise TrackingRecordError("record_id '%s' is already recorded for task '%s' with different content"
+                                  % (record["record_id"], record["task_id"]))
+    _require_started_cycle(task, record["feature_id"], record["cycle_id"])
+    call_keys = expand_feature_selectors(fu, record["selectors"])
+    digest = feature_call_set_sha256(call_keys)
+    if len(call_keys) != record["expected_call_count"] or digest != record["expected_call_set_sha256"]:
+        raise TrackingRecordError(
+            "the selection changed since the preview: it now expands to %d call(s) with sha256 %s (expected %d, "
+            "%s); re-run feature-calls and review the new selection" % (
+                len(call_keys), digest, record["expected_call_count"], record["expected_call_set_sha256"]))
+    already = _check_assignment_conflicts(fu, call_keys, record["feature_id"], record["cycle_id"])
+    stored = dict(record)
+    stored["selectors"] = [dict(s) for s in record["selectors"]]
+    stored["provenance"] = dict(record["provenance"])
+    stored["call_keys"] = call_keys
+    stored["newly_linked_call_count"] = len(call_keys) - already
+    stored["recorded_at"] = now_iso()
+    assignments[record["record_id"]] = stored
+    fu["assignments_updated_at"] = stored["recorded_at"]
+    return "recorded"
+
+
+def _pricing_view(pricing):
+    if not isinstance(pricing, dict):
+        return {"status": "not-recorded"}
+    if pricing.get("status") == "priced":
+        return {"status": "priced", "usd": _float_or_zero(pricing.get("usd")),
+                "snapshot_id": pricing.get("snapshot_id"), "tier": pricing.get("tier"),
+                "official_model": pricing.get("official_model")}
+    return {"status": pricing.get("status") or "not-recorded", "reason": pricing.get("reason")}
+
+
+def feature_calls_listing(task, task_id, session_id):
+    """Read-only JSON view of one session's ledger calls and invocation
+    groups with their exact selectors and current links."""
+    out = {
+        "schema": FEATURE_CALLS_OUTPUT_SCHEMA,
+        "schema_version": FEATURE_CALLS_OUTPUT_SCHEMA_VERSION,
+        "task_id": task_id,
+        "session_id": session_id,
+        "ledger_status": "active",
+        "ledger_since": None,
+        "calls": [],
+        "invocations": [],
+        "calls_without_ledgered_parent_invocation": 0,
+        "task_unledgered_calls": {},
+        "task_repeated_key_observations": None,
+        "notes": [
+            "Selectors are exact ids: --call TRACE/SPAN selects one call; --invocation TRACE/SPAN selects only "
+            "the ledgered calls whose own parentSpanId is that invoke_agent span (direct children, same session "
+            "and trace) at preview time.",
+            "If one invocation served several features, select its calls individually with --call.",
+            "USD values are list-price estimates frozen at ingestion, not an invoice; unpriced is not $0.",
+        ],
+    }
+    fu = task.get("feature_usage")
+    if fu is None:
+        out["ledger_status"] = "not_started"
+        return out
+    if not _feature_usage_shape_ok(fu):
+        out["ledger_status"] = "unreadable"
+        return out
+    out["ledger_since"] = fu.get("since")
+    owners, conflicts = current_call_assignments(fu)
+    session_calls = sorted(((k, c) for k, c in fu["calls"].items()
+                            if isinstance(c, dict) and c.get("session_id") == session_id),
+                           key=lambda kv: (str(kv[1].get("started_at") or ""), kv[0]))
+    invocations = {k: inv for k, inv in fu["invocations"].items()
+                   if isinstance(inv, dict) and inv.get("session_id") == session_id}
+    groups = {}
+    for key, c in session_calls:
+        owner = owners.get(key)
+        link = None
+        if key in conflicts:
+            link = {"status": "conflicting-stored-links"}
+        elif owner is not None:
+            link = {"feature_id": owner[0], "cycle_id": owner[1], "record_id": owner[2]}
+        usage = c.get("usage") if isinstance(c.get("usage"), dict) else {}
+        out["calls"].append({
+            "selector": "%s/%s" % (c.get("trace_id"), c.get("span_id")),
+            "trace_id": c.get("trace_id"),
+            "span_id": c.get("span_id"),
+            "parent_span_id": c.get("parent_span_id"),
+            "started_at": c.get("started_at"),
+            "model": c.get("model"),
+            "agent": c.get("agent"),
+            "agent_link": c.get("agent_link"),
+            "duration_ms": _int_or_zero(c.get("duration_ms")),
+            "total_tokens": _int_or_zero(usage.get("total_tokens")),
+            "pricing": _pricing_view(c.get("pricing")),
+            "link": link,
+        })
+        parent_key = _ledger_key(session_id, c.get("trace_id"), c.get("parent_span_id"))
+        if c.get("parent_span_id") and parent_key in invocations:
+            groups.setdefault(parent_key, []).append((key, link))
+        else:
+            out["calls_without_ledgered_parent_invocation"] += 1
+    for key, inv in sorted(invocations.items(), key=lambda kv: (str(kv[1].get("started_at") or ""), kv[0])):
+        members = groups.get(key, [])
+        linked = {}
+        for _k, link in members:
+            if link and "cycle_id" in link:
+                label = "%s/%s" % (link["feature_id"], link["cycle_id"])
+                linked[label] = linked.get(label, 0) + 1
+        out["invocations"].append({
+            "selector": "%s/%s" % (inv.get("trace_id"), inv.get("span_id")),
+            "trace_id": inv.get("trace_id"),
+            "span_id": inv.get("span_id"),
+            "parent_span_id": inv.get("parent_span_id"),
+            "started_at": inv.get("started_at"),
+            "agent_key": inv.get("agent_key"),
+            "agent_type": inv.get("agent_type"),
+            "direct_calls": len(members),
+            "unlinked_direct_calls": sum(1 for _k, link in members if link is None),
+            "linked_direct_calls": linked,
+        })
+    for reason, bucket in fu["unledgered"].items():
+        if isinstance(bucket, dict):
+            usage = bucket.get("usage") if isinstance(bucket.get("usage"), dict) else {}
+            out["task_unledgered_calls"][reason] = _int_or_zero(usage.get("call_count"))
+    rep = fu["repeated_observations"]
+    rep_usage = rep.get("usage") if isinstance(rep.get("usage"), dict) else {}
+    out["task_repeated_key_observations"] = {
+        "calls": _int_or_zero(rep_usage.get("call_count")),
+        "total_tokens": _int_or_zero(rep_usage.get("total_tokens")),
+        "priced_calls": _int_or_zero(rep.get("priced_calls")),
+        "unpriced_calls": _int_or_zero(rep.get("unpriced_calls")),
+        "usd": _float_or_zero(rep.get("usd")),
+        "conflicting": _int_or_zero(rep.get("conflicting")),
+    }
+    return out
+
+
+def build_feature_usage_preview(task, task_id, feature_id, cycle_id, selectors, record_id=None,
+                                basis="orchestrator-selected", reference=None):
+    """Ready-to-save record-feature-usage payload for validated selectors,
+    applying the same checks as recording (read-only). Returns
+    (payload, already_linked_to_this_cycle)."""
+    fu = _readable_feature_usage(task)
+    _require_started_cycle(task, feature_id, cycle_id)
+    call_keys = expand_feature_selectors(fu, selectors)
+    digest = feature_call_set_sha256(call_keys)
+    already = _check_assignment_conflicts(fu, call_keys, feature_id, cycle_id)
+    if record_id is None:
+        seed = "%s\n%s\n%s\n" % (feature_id, cycle_id, digest)
+        record_id = "fu-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+    if reference is None:
+        reference = "feature-calls preview: %d call(s) via %d selector(s)" % (len(call_keys), len(selectors))
+    payload = {
+        "schema": FEATURE_USAGE_RECORD_SCHEMA,
+        "schema_version": FEATURE_USAGE_RECORD_SCHEMA_VERSION,
+        "record_id": _tracking_identifier(record_id, "record_id"),
+        "task_id": task_id,
+        "feature_id": feature_id,
+        "cycle_id": cycle_id,
+        "selectors": [dict(s) for s in selectors],
+        "expected_call_count": len(call_keys),
+        "expected_call_set_sha256": digest,
+        "provenance": {
+            "source": TRACKING_PROVENANCE_SOURCES[0],
+            "basis": _tracking_choice(basis, "basis", FEATURE_USAGE_PROVENANCE_BASES),
+            "reference": _tracking_reference(reference, "reference"),
+        },
+    }
+    return payload, already
+
+
+# ---- report ----------------------------------------------------------------
+
+def _feature_tracking_present(task):
+    """True when the task has delivery records or feature-usage links (or an
+    unreadable block of either); otherwise the report is unchanged."""
+    block = task.get("delivery")
+    if block is not None and (not _delivery_shape_ok(block) or block["records"]):
+        return True
+    fu = task.get("feature_usage")
+    if fu is None:
+        return False
+    if not _feature_usage_shape_ok(fu):
+        return True
+    return bool(fu["assignments"])
+
+
+def _ledger_entry_cost(entry):
+    pricing = entry.get("pricing") if isinstance(entry.get("pricing"), dict) else {}
+    status = pricing.get("status")
+    return status, (_float_or_zero(pricing.get("usd")) if status == "priced" else 0.0)
+
+
+def _blank_link_totals():
+    return {"calls": 0, "priced_calls": 0, "unpriced_calls": 0, "usd": 0.0, "duration_ms": 0, "total_tokens": 0}
+
+
+def _add_ledger_entry_to_totals(dst, entry):
+    usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+    status, usd = _ledger_entry_cost(entry)
+    dst["calls"] += 1
+    dst["total_tokens"] += _int_or_zero(usage.get("total_tokens"))
+    dst["duration_ms"] += _int_or_zero(entry.get("duration_ms"))
+    if status == "priced":
+        dst["priced_calls"] += 1
+        dst["usd"] += usd
+    else:
+        dst["unpriced_calls"] += 1
+
+
+def summarize_feature_delivery(task):
+    """Read-only summary for rendering. Linked cost sums ONLY the frozen
+    per-call estimates of uniquely linked ledger calls; nothing is inferred."""
+    out = {"delivery_status": "absent", "ledger_status": "absent", "cycles": {}, "features": {},
+           "ledger": None, "conflicting_links": 0, "dangling_links": 0, "late_links": 0}
+    block = task.get("delivery")
+    cycles = {}
+    if block is not None:
+        if _delivery_shape_ok(block):
+            out["delivery_status"] = "active"
+            cycles = _delivery_cycles(block["records"])
+        else:
+            out["delivery_status"] = "unreadable"
+    rows = out["cycles"]
+    for cycle_id, c in cycles.items():
+        started = c["started"]
+        terminal = c["terminal"]
+        start_epoch = _utc_ts_epoch(started.get("occurred_at")) if started else None
+        end_epoch = _utc_ts_epoch(terminal.get("occurred_at")) if terminal else None
+        if terminal is not None:
+            status = terminal.get("event")
+        elif started is not None:
+            status = "in progress"
+        else:
+            status = "no start record"
+        rows[cycle_id] = {
+            "feature_id": c["feature_id"], "status": status, "feature_conflict": c["feature_conflict"],
+            "started_at": started.get("occurred_at") if started else None,
+            "ended_at": terminal.get("occurred_at") if terminal else None,
+            "ended_recorded_at": terminal.get("recorded_at") if terminal else None,
+            "elapsed_ms": (int(round((end_epoch - start_epoch) * 1000))
+                           if start_epoch is not None and end_epoch is not None and end_epoch >= start_epoch
+                           else None),
+            "defects": len({r.get("finding_id") for r in c["defects"]}),
+            "regressions": len({r.get("finding_id") for r in c["regressions"]}),
+            "links": _blank_link_totals(),
+        }
+    fu = task.get("feature_usage")
+    if fu is not None:
+        out["ledger_status"] = "active" if _feature_usage_shape_ok(fu) else "unreadable"
+    if out["ledger_status"] == "active":
+        owners, conflicts = current_call_assignments(fu)
+        out["conflicting_links"] = len(conflicts)
+        ledger = {"since": fu.get("since"), "calls": _blank_link_totals(), "linked": _blank_link_totals(),
+                  "unledgered": {}, "repeated": None, "baseline": fu["baseline"],
+                  "invocations": len(fu["invocations"]),
+                  "invocations_without_stable_ids": _int_or_zero(fu.get("invocations_without_stable_ids"))}
+        for key, entry in fu["calls"].items():
+            if not isinstance(entry, dict):
+                continue
+            _add_ledger_entry_to_totals(ledger["calls"], entry)
+            owner = owners.get(key)
+            if owner is None or key in conflicts:
+                continue
+            _add_ledger_entry_to_totals(ledger["linked"], entry)
+            row = rows.get(owner[1])
+            if row is None:
+                row = rows[owner[1]] = {
+                    "feature_id": owner[0], "status": "no readable delivery record", "feature_conflict": False,
+                    "started_at": None, "ended_at": None, "ended_recorded_at": None, "elapsed_ms": None,
+                    "defects": 0, "regressions": 0, "links": _blank_link_totals()}
+            _add_ledger_entry_to_totals(row["links"], entry)
+        out["dangling_links"] = sum(1 for k in owners if not isinstance(fu["calls"].get(k), dict))
+        for rec in fu["assignments"].values():
+            if not isinstance(rec, dict) or not isinstance(rec.get("cycle_id"), str):
+                continue
+            row = rows.get(rec.get("cycle_id"))
+            ended = row.get("ended_recorded_at") if row else None
+            if isinstance(ended, str) and isinstance(rec.get("recorded_at"), str) and rec["recorded_at"] > ended:
+                out["late_links"] += 1
+        for reason, bucket in fu["unledgered"].items():
+            if isinstance(bucket, dict):
+                ledger["unledgered"][reason] = bucket
+        ledger["repeated"] = fu["repeated_observations"]
+        out["ledger"] = ledger
+    for cycle_id, row in rows.items():
+        feat = out["features"].setdefault(row["feature_id"], {
+            "completed": 0, "in_progress": 0, "cancelled": 0, "other": 0, "defects": 0, "regressions": 0,
+            "links": _blank_link_totals()})
+        key = {"completed": "completed", "cancelled": "cancelled", "in progress": "in_progress"}.get(
+            row["status"], "other")
+        feat[key] += 1
+        feat["defects"] += row["defects"]
+        feat["regressions"] += row["regressions"]
+        for k in feat["links"]:
+            feat["links"][k] += row["links"][k]
+    return out
+
+
+def _md_code(value):
+    """Render an untrusted id/reference as an inline code span: no HTML,
+    links or emphasis can render, and table cells cannot be split."""
+    text = " ".join(("" if value is None else str(value)).split())
+    for ch in ("`", "|", "\\"):
+        text = text.replace(ch, "/")
+    return "`%s`" % text if text else "—"
+
+
+def _fmt_linked_cost(t):
+    if not t["calls"]:
+        return "no linked calls (unknown, not $0)"
+    if not t["priced_calls"]:
+        return "N/A — %d linked call(s), none priced (not $0)" % t["calls"]
+    if t["unpriced_calls"]:
+        return "$%.4f — **PARTIAL**: %d of %d linked calls priced, %d unpriced" % (
+            t["usd"], t["priced_calls"], t["calls"], t["unpriced_calls"])
+    return "$%.4f (all %d linked calls priced)" % (t["usd"], t["calls"])
+
+
+def _fmt_findings(n, delivery_status):
+    if delivery_status != "active":
+        return "unknown"
+    return "%d" % n if n else "none recorded"
+
+
+def _fmt_bucket_usd(usd, priced, unpriced_or_legacy, calls):
+    if not calls:
+        return "—"
+    if not priced:
+        return "N/A — none priced (not $0)"
+    if unpriced_or_legacy:
+        return "$%.4f (partial)" % usd
+    return "$%.4f" % usd
+
+
+def render_feature_delivery_section(task):
+    if not _feature_tracking_present(task):
+        return []
+    s = summarize_feature_delivery(task)
+    lines = ["## Feature Delivery (explicit records and call links — not native telemetry)", ""]
+    lines.append("_Lifecycle and confirmed findings come from `record-delivery`; usage comes only from exact "
+                 "ledger call keys linked with `record-feature-usage` (each call counted once, in one cycle). "
+                 "Nothing is assigned from timestamps, models, agent names, sessions or guesses._")
+    lines.append("")
+    if s["delivery_status"] == "unreadable":
+        lines.append("> ⚠️ This task's delivery block has an unsupported or malformed schema; it is left "
+                     "unchanged and not interpreted.")
+        lines.append("")
+    if s["ledger_status"] == "unreadable":
+        lines.append("> ⚠️ This task's feature-usage ledger has an unsupported or malformed schema; linked usage "
+                     "is unknown.")
+        lines.append("")
+    if s["cycles"]:
+        lines.append("### Delivery cycles")
+        lines.append("")
+        lines.append("| Feature | Cycle | Status | Started (UTC) | Ended (UTC) | Elapsed (wall clock, incl. idle) "
+                     "| Linked calls | Est. USD of linked calls (frozen at ingestion) | Linked model-call time "
+                     "| Confirmed defects | Confirmed regressions |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        for cycle_id, row in sorted(s["cycles"].items(), key=lambda kv: (str(kv[1]["feature_id"]),
+                                                                          str(kv[1]["started_at"] or ""), kv[0])):
+            links = row["links"]
+            elapsed = fmt_duration_ms(row["elapsed_ms"]) if row["elapsed_ms"] is not None else (
+                "unknown (in progress)" if row["status"] == "in progress" else "unknown")
+            status = row["status"] + (" ⚠️ cycle recorded under several features" if row["feature_conflict"] else "")
+            lines.append("| %s | %s | %s | %s | %s | %s | %d | %s | %s | %s | %s |" % (
+                _md_code(row["feature_id"]), _md_code(cycle_id), _md_cell(status), _md_code(row["started_at"]),
+                _md_code(row["ended_at"]), elapsed, links["calls"], _fmt_linked_cost(links),
+                fmt_duration_ms(links["duration_ms"]) if links["calls"] else "—",
+                _fmt_findings(row["defects"], s["delivery_status"]),
+                _fmt_findings(row["regressions"], s["delivery_status"])))
+        lines.append("")
+        lines.append("### Per feature")
+        lines.append("")
+        lines.append("| Feature | Cycles completed / in progress / cancelled | Linked calls | Est. USD of linked "
+                     "calls | Linked model-call time | Confirmed defects | Confirmed regressions |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for feature_id, f in sorted(s["features"].items(), key=lambda kv: str(kv[0])):
+            cycles_cell = "%d / %d / %d" % (f["completed"], f["in_progress"], f["cancelled"])
+            if f["other"]:
+                cycles_cell += " (+%d without a readable lifecycle)" % f["other"]
+            lines.append("| %s | %s | %d | %s | %s | %s | %s |" % (
+                _md_code(feature_id), cycles_cell, f["links"]["calls"], _fmt_linked_cost(f["links"]),
+                fmt_duration_ms(f["links"]["duration_ms"]) if f["links"]["calls"] else "—",
+                _fmt_findings(f["defects"], s["delivery_status"]),
+                _fmt_findings(f["regressions"], s["delivery_status"])))
+        lines.append("")
+    notes = [
+        "Linked cost is a subset of the task's Summary estimate, never added to it again: it sums the per-call "
+        "official estimates frozen when each call was ingested (linking later never reprices). Unpriced linked "
+        "calls make it a lower bound; a feature without linked calls has unknown cost, not $0.",
+        "Elapsed is wall-clock time from the recorded start to the recorded completion/cancellation (includes "
+        "idle and user time). Linked model-call time is the separate sum of the linked calls' span durations.",
+        "Defects/regressions count only explicitly confirmed material findings (critical/high/medium "
+        "correctness, security, safety or data-integrity), each finding id once; a regression requires recorded "
+        "evidence of previously working behavior. \"none recorded\" is not evidence of no defects — coverage is "
+        "limited to what was recorded.",
+    ]
+    if s["late_links"]:
+        notes.append("%d link record(s) were added after their cycle ended (explicit late audit links; the "
+                     "lifecycle is unchanged and their prices are the frozen ingestion estimates)." % s["late_links"])
+    if s["conflicting_links"]:
+        notes.append("⚠️ %d call(s) have conflicting stored links (hand-edited data?) and are excluded from every "
+                     "feature." % s["conflicting_links"])
+    if s["dangling_links"]:
+        notes.append("⚠️ %d linked call key(s) are missing from the ledger and are not counted." % s["dangling_links"])
+    for n in notes:
+        lines.append("- " + n)
+    lines.append("")
+
+    ledger = s["ledger"]
+    if ledger is None:
+        return lines
+    lines.append("### Feature usage ledger coverage")
+    lines.append("")
+    lines.append("_Exclusive buckets that must add up to the Summary totals. Usage recorded before the ledger "
+                 "started (%s) is a historical aggregate that can never be split by feature._"
+                 % _md_cell(ledger["since"] or "unknown"))
+    lines.append("")
+    lines.append("| Bucket | Calls | Total tokens | Priced calls | Unpriced or legacy calls | Est. USD (priced "
+                 "subtotal) |")
+    lines.append("|---|---|---|---|---|---|")
+    base_usage = ledger["baseline"].get("usage") if isinstance(ledger["baseline"].get("usage"), dict) else {}
+    base_cost = (ledger["baseline"].get("official_cost")
+                 if isinstance(ledger["baseline"].get("official_cost"), dict) else {})
+    base_calls = _int_or_zero(base_usage.get("call_count"))
+    base_priced = _int_or_zero(base_cost.get("priced_calls"))
+    base_other = _int_or_zero(base_cost.get("unpriced_calls")) + _int_or_zero(base_cost.get("legacy_calls"))
+    base_usd = _float_or_zero(base_cost.get("usd"))
+    sum_calls = base_calls
+    sum_tokens = _int_or_zero(base_usage.get("total_tokens"))
+    sum_usd = base_usd
+    lines.append("| Pre-ledger baseline (historical, unsplittable) | %d | %d | %d | %d | %s |" % (
+        base_calls, sum_tokens, base_priced, base_other, _fmt_bucket_usd(base_usd, base_priced, base_other,
+                                                                         base_calls)))
+    linked, allc = ledger["linked"], ledger["calls"]
+    unlinked = {k: allc[k] - linked[k] for k in allc}
+    for label, t in (("Ledger — linked to a feature cycle", linked),
+                     ("Ledger — not linked to any feature (unallocated)", unlinked)):
+        lines.append("| %s | %d | %d | %d | %d | %s |" % (
+            label, t["calls"], t["total_tokens"], t["priced_calls"], t["unpriced_calls"],
+            _fmt_bucket_usd(t["usd"], t["priced_calls"], t["unpriced_calls"], t["calls"])))
+    sum_calls += allc["calls"]
+    sum_tokens += allc["total_tokens"]
+    sum_usd += allc["usd"]
+    extra_rows = [("No stable call key — %s" % reason, bucket) for reason, bucket in sorted(ledger["unledgered"].items())]
+    if ledger["repeated"]:
+        extra_rows.append(("Repeated stable key (kept in totals by the existing aggregation; never ledgered or "
+                           "linked twice)", ledger["repeated"]))
+    for label, bucket in extra_rows:
+        usage = bucket.get("usage") if isinstance(bucket.get("usage"), dict) else {}
+        calls = _int_or_zero(usage.get("call_count"))
+        if not calls:
+            continue
+        priced = _int_or_zero(bucket.get("priced_calls"))
+        other = calls - priced
+        usd = _float_or_zero(bucket.get("usd"))
+        lines.append("| %s | %d | %d | %d | %d | %s |" % (
+            _md_cell(label), calls, _int_or_zero(usage.get("total_tokens")), priced, other,
+            _fmt_bucket_usd(usd, priced, other, calls)))
+        sum_calls += calls
+        sum_tokens += _int_or_zero(usage.get("total_tokens"))
+        sum_usd += usd
+    totals = task.get("totals") if isinstance(task.get("totals"), dict) else {}
+    official = summarize_official_cost(task)["totals"]
+    total_calls = _int_or_zero(totals.get("call_count"))
+    total_tokens = _int_or_zero(totals.get("total_tokens"))
+    lines.append("| **Total (Summary)** | %d | %d | %d | %d | %s |" % (
+        total_calls, total_tokens, official["priced_calls"],
+        official["unpriced_calls"] + official["legacy_calls"],
+        _fmt_bucket_usd(official["usd"], official["priced_calls"],
+                        official["unpriced_calls"] + official["legacy_calls"], official["calls"])))
+    lines.append("")
+    reconciled = (sum_calls == total_calls and sum_tokens == total_tokens
+                  and math.isclose(sum_usd, official["usd"], rel_tol=1e-9, abs_tol=1e-6))
+    if not reconciled:
+        lines.append("> ⚠️ Ledger buckets do not reconcile with the Summary totals/estimate; treat feature "
+                     "usage for this task as incomplete.")
+        lines.append("")
+    repeated = ledger["repeated"] or {}
+    diagnostics = []
+    rep_usage = repeated.get("usage") if isinstance(repeated.get("usage"), dict) else {}
+    if _int_or_zero(rep_usage.get("call_count")):
+        rep_priced = _int_or_zero(repeated.get("priced_calls"))
+        rep_calls = _int_or_zero(rep_usage.get("call_count"))
+        diagnostics.append(
+            "%d call observation(s) (%d tokens, %d priced at %s, %d unpriced/not recorded) repeated a call key "
+            "already in the ledger. The existing aggregation keeps them in the Summary totals and estimate, so "
+            "those totals are not a count of unique calls; the ledger and every feature count each key once."
+            % (rep_calls, _int_or_zero(rep_usage.get("total_tokens")), rep_priced,
+               "$%.4f" % _float_or_zero(repeated.get("usd")) if rep_priced else "N/A",
+               rep_calls - rep_priced))
+    if _int_or_zero(repeated.get("conflicting")):
+        diagnostics.append("%d repeated observation(s) of an already-ledgered call key carried different data; "
+                           "the first observation is kept unchanged." % _int_or_zero(repeated.get("conflicting")))
+    if ledger["invocations_without_stable_ids"]:
+        diagnostics.append("%d invoke_agent span(s) had no valid ids and cannot be selected as invocations."
+                           % ledger["invocations_without_stable_ids"])
+    for d in diagnostics:
+        lines.append("- " + d)
+    if diagnostics:
+        lines.append("")
+    return lines
+
+
+# ---- commands ----------------------------------------------------------------
+
+def _record_tracking(record, apply_fn):
+    """Shared locked read-validate-write for record-delivery and
+    record-feature-usage. Both require a task file that ingest already
+    created: they never create a task (no phantom usage/report state).
+    Returns (exit_code, outcome)."""
+    task_id = record["task_id"]
+    with ingest_lock():
+        tpath = task_path(task_id)
+        task, error = _load_task_file_strict(tpath, task_id)
+        if error:
+            print("Error: %s" % error, file=sys.stderr)
+            return 1, None
+        if task is None:
+            print("Error: no recorded usage for task '%s' yet; ingest a session of this task first (delivery and "
+                  "feature-usage records are only added to an existing task)" % task_id, file=sys.stderr)
+            return 1, None
+        try:
+            outcome = apply_fn(task, record)
+        except TrackingRecordError as ex:
+            print("Error: record rejected: %s" % ex, file=sys.stderr)
+            return 1, None
+        if outcome != "duplicate":
+            atomic_write(tpath, json.dumps(task, indent=2))
+    return 0, outcome
+
+
+def cmd_record_delivery(args):
+    """Record one validated delivery lifecycle/finding event. Never ingests,
+    fetches pricing or regenerates the Markdown report."""
+    try:
+        record = load_delivery_record_input(args.input)
+    except TrackingRecordError as ex:
+        print("Error: invalid delivery record: %s" % ex, file=sys.stderr)
+        return 1
+    code, outcome = _record_tracking(record, apply_delivery_record)
+    if code:
+        return code
+    if outcome == "duplicate":
+        print("Delivery record '%s' is already recorded identically for task '%s'; nothing changed."
+              % (record["record_id"], record["task_id"]))
+        return 0
+    print("Recorded delivery event '%s' (%s; task '%s', feature '%s', cycle '%s'). The Markdown report is not "
+          "regenerated by this command; run `copilot-task-report.py report %s` to refresh it."
+          % (record["record_id"], record["event"], record["task_id"], record["feature_id"], record["cycle_id"],
+             record["task_id"]))
+    return 0
+
+
+def cmd_record_feature_usage(args):
+    """Record one validated explicit feature-usage link. Never ingests,
+    fetches pricing or regenerates the Markdown report."""
+    try:
+        record = load_feature_usage_record_input(args.input)
+    except TrackingRecordError as ex:
+        print("Error: invalid feature-usage record: %s" % ex, file=sys.stderr)
+        return 1
+    code, outcome = _record_tracking(record, apply_feature_usage_record)
+    if code:
+        return code
+    if outcome == "duplicate":
+        print("Feature-usage record '%s' is already recorded identically for task '%s'; nothing changed."
+              % (record["record_id"], record["task_id"]))
+        return 0
+    print("Recorded feature-usage link '%s' (%d call(s); task '%s', feature '%s', cycle '%s'). The Markdown report "
+          "is not regenerated by this command; run `copilot-task-report.py report %s` to refresh it."
+          % (record["record_id"], record["expected_call_count"], record["task_id"], record["feature_id"],
+             record["cycle_id"], record["task_id"]))
+    return 0
+
+
+def _parse_cli_selector(value, kind, session_id):
+    parts = value.split("/") if isinstance(value, str) else []
+    if len(parts) != 2:
+        raise TrackingRecordError("--%s must be TRACE_ID/SPAN_ID (got %r)" % (
+            "call" if kind == "call" else "invocation", value))
+    return {"kind": kind, "session_id": session_id, "trace_id": parts[0], "span_id": parts[1]}
+
+
+def cmd_feature_calls(args):
+    """Read-only: list a session's ledger calls/invocations, or (with
+    selectors + --feature-id/--cycle-id) print a ready-to-save
+    record-feature-usage payload. Takes no lock, creates no files or
+    directories, and never ingests, fetches pricing or uses the network."""
+    task_id = normalize_task_id(args.task)
+    if task_id is None:
+        print("Error: '%s' is not a valid task ID/name." % args.task, file=sys.stderr)
+        return 1
+    session_id = args.session_id
+    if not _valid_ledger_session_id(session_id):
+        print("Error: '%s' is not a valid session id." % session_id, file=sys.stderr)
+        return 1
+    task, error = _load_task_file_strict(task_path(task_id), task_id)
+    if error:
+        print("Error: %s" % error, file=sys.stderr)
+        return 1
+    if task is None:
+        print("No recorded usage for task '%s' yet." % task_id, file=sys.stderr)
+        return 1
+    raw_selectors = ([("direct-invocation", v) for v in (args.invocation or [])]
+                     + [("call", v) for v in (args.call or [])])
+    preview_options = (args.feature_id, args.cycle_id, args.record_id, args.basis, args.reference)
+    if not raw_selectors and all(v is None for v in preview_options):
+        print(json.dumps(feature_calls_listing(task, task_id, session_id), indent=2))
+        return 0
+    try:
+        if not raw_selectors or args.feature_id is None or args.cycle_id is None:
+            raise TrackingRecordError("a preview needs --feature-id, --cycle-id and at least one --invocation or "
+                                      "--call selector")
+        feature_id = _tracking_identifier(args.feature_id, "--feature-id")
+        cycle_id = _tracking_identifier(args.cycle_id, "--cycle-id")
+        selectors = _validate_selectors([_parse_cli_selector(v, k, session_id) for k, v in raw_selectors])
+        payload, already = build_feature_usage_preview(
+            task, task_id, feature_id, cycle_id, selectors, record_id=args.record_id,
+            basis=args.basis or "orchestrator-selected", reference=args.reference)
+    except TrackingRecordError as ex:
+        print("Error: preview rejected: %s" % ex, file=sys.stderr)
+        return 1
+    if already:
+        print("Note: %d of the %d selected call(s) are already linked to this cycle; they will be counted once."
+              % (already, payload["expected_call_count"]), file=sys.stderr)
+    print(json.dumps(payload, indent=2))
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -5698,6 +7307,48 @@ def main():
                           help="Path to a review-record JSON file (schema %r, schema_version %d)"
                                % (REVIEW_RECORD_SCHEMA, REVIEW_RECORD_SCHEMA_VERSION))
     p_review.set_defaults(func=cmd_record_review)
+
+    p_delivery = sub.add_parser(
+        "record-delivery",
+        help="Record one validated feature delivery event (started/completed/cancelled or a confirmed "
+             "defect/regression; orchestrator-supplied, not telemetry) in the task JSON; does not ingest, "
+             "fetch pricing or regenerate the report")
+    p_delivery.add_argument("--input", required=True, metavar="JSON_FILE",
+                            help="Path to a delivery-record JSON file (schema %r, schema_version %d)"
+                                 % (DELIVERY_RECORD_SCHEMA, DELIVERY_RECORD_SCHEMA_VERSION))
+    p_delivery.set_defaults(func=cmd_record_delivery)
+
+    p_fcalls = sub.add_parser(
+        "feature-calls",
+        help="Read-only: print a session's call-ledger entries and invoke_agent groups as JSON, or with "
+             "selectors plus --feature-id/--cycle-id a ready-to-save record-feature-usage payload. Writes "
+             "nothing and never ingests, fetches pricing or uses the network")
+    p_fcalls.add_argument("--task", required=True, help="task ID whose ledger to read")
+    p_fcalls.add_argument("--session-id", required=True, help="session whose ledgered calls to show/select")
+    p_fcalls.add_argument("--format", choices=["json"], default="json", help="output format (JSON only)")
+    p_fcalls.add_argument("--invocation", action="append", metavar="TRACE_ID/SPAN_ID",
+                          help="preview: select the ledgered calls whose direct parent is this invoke_agent span "
+                               "(repeatable)")
+    p_fcalls.add_argument("--call", action="append", metavar="TRACE_ID/SPAN_ID",
+                          help="preview: select exactly this ledgered call (repeatable)")
+    p_fcalls.add_argument("--feature-id", default=None, help="preview: feature the calls belong to")
+    p_fcalls.add_argument("--cycle-id", default=None, help="preview: started delivery cycle of that feature")
+    p_fcalls.add_argument("--record-id", default=None,
+                          help="preview: record id (default: derived from feature, cycle and call set)")
+    p_fcalls.add_argument("--basis", default=None, choices=list(FEATURE_USAGE_PROVENANCE_BASES),
+                          help="preview: provenance basis (default orchestrator-selected)")
+    p_fcalls.add_argument("--reference", default=None, help="preview: short provenance reference")
+    p_fcalls.set_defaults(func=cmd_feature_calls, skip_migrations=True)
+
+    p_fusage = sub.add_parser(
+        "record-feature-usage",
+        help="Record one explicit link of exact ledger calls to a started feature cycle, re-checking the "
+             "previewed call count/fingerprint; does not ingest, fetch pricing or regenerate the report")
+    p_fusage.add_argument("--input", required=True, metavar="JSON_FILE",
+                          help="Path to a feature-usage-record JSON file (schema %r, schema_version %d), "
+                               "normally saved from `feature-calls` preview output"
+                               % (FEATURE_USAGE_RECORD_SCHEMA, FEATURE_USAGE_RECORD_SCHEMA_VERSION))
+    p_fusage.set_defaults(func=cmd_record_feature_usage)
 
     p_ctx_update = sub.add_parser(
         "context-update",

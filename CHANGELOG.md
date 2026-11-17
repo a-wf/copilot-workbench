@@ -6,6 +6,84 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — cost-disciplined orchestration (delivery-coordination-20261117-c1)
+
+- `instructions/copilot-instructions.md` gains an *Efficient orchestration*
+  section: the main session answers small questions and follows a single
+  continuous investigation directly, may make genuinely trivial edits
+  itself when the handoff costs more than the edit (main-authored code
+  edits still get the independent reviewer pass), and delegates only
+  substantial context or demonstrable net savings — tiny lookups, status
+  checks and one-line commands are no longer pushed to the built-in `task`
+  route by default. The small/casual `coder` route is now the *default*
+  (not mandatory-for-everything) route; its model/effort/context are
+  unchanged. Implementers get one complete bounded batch, tests run before
+  one broad review of the whole batch, parallelism is limited to
+  independent reads/non-overlapping writes, and only significant
+  correctness/security/safety/data-integrity/regression findings consume
+  fix rounds (optional polish is deferred unless requested).
+- Budget exhaustion keeps the existing 1 + 3 limits per work item across
+  sessions and now produces one actionable escalation with explicit choices
+  (accept as-is, authorize a targeted extension, stop), then waits: no extra
+  round, automatic new cycle, budget reset or reminder loop without explicit
+  user authorization, and no completion claim while waiting.
+- Delivery is judged by completion, cost, elapsed time and confirmed
+  material defects/regressions, not agent count or self-reported quality.
+  The handoff manifest gains an optional `Feature:` field and a new
+  *Recording feature delivery* subsection applies to meaningful
+  multi-agent features only.
+- Agent role bodies (no frontmatter change) reflect batching, required vs
+  optional finding triage, regression evidence, and single escalation.
+  `config/agent-routing.yaml` adds a policy-only
+  `task_routing.orchestration_policy` block; every model/effort/context
+  mapping is unchanged.
+
+### Added — feature delivery tracking and per-call ledger (delivery-coordination-20261117-c1)
+
+- Ingest now also keeps an additive, versioned per-call ledger in the task
+  JSON (`feature_usage`, schema v1) keyed by session id + `traceId` + the
+  chat span's own `spanId`, with minimal usage data and the official price
+  result frozen at ingestion (or the unpriced reason); `invoke_agent` spans
+  are kept as observed invocations. Calls without stable ids are counted
+  per reason, repeated keys are never ledgered twice, and usage already on
+  a task is frozen as an unsplittable pre-ledger baseline (no backfill).
+  Existing totals, cost, attribution and review semantics are unchanged.
+- New `copilot-task-report.py record-delivery --input FILE`
+  (`copilot-task-report.delivery-record` v1): started / completed /
+  cancelled lifecycle per feature cycle plus confirmed material
+  `defect-confirmed` / `regression-confirmed` findings with stable ids.
+- New read-only `copilot-task-report.py feature-calls --task T --session-id S`
+  (JSON listing of ledgered calls and invocation groups; with selectors and
+  `--feature-id/--cycle-id` it prints a ready-to-save payload) and
+  `record-feature-usage --input FILE`
+  (`copilot-task-report.feature-usage-record` v1), which links exact call
+  keys or direct-invocation groups to one started cycle after re-checking
+  the previewed count and sha256.
+- Reports gain a *Feature Delivery* section (only when such records exist):
+  per-cycle/per-feature status, wall-clock elapsed, linked calls and their
+  frozen estimate (partial/unpriced labeled), linked model-call time,
+  recorded confirmed defects/regressions, and a ledger coverage table that
+  reconciles with the Summary. Legacy reports are unchanged. No new
+  executable is installed; the existing helper carries the commands.
+- `record-delivery` and `record-feature-usage` only add to a task file that
+  an ingest already created; they never create a task.
+- Ingest no longer aborts on a usage attribute it cannot convert
+  (NaN/Infinity, non-numeric strings, oversized values) or on non-finite
+  span times. OTEL and events.jsonl line readers now skip any malformed
+  line (including integers too long for Python's JSON parser, invalid
+  UTF-8 and excessively nested JSON) instead of failing the whole ingest
+  and leaving the cursor stuck. Newly ingested calls whose raw usage count is present but not
+  a strict count (boolean, numeric string, fraction, negative, unsafe huge,
+  NaN/Infinity, non-numeric) are now recorded as unpriced with the new
+  reason "a usage count in telemetry is not a valid count …" instead of
+  being priced from a guessed value, and are not ledgered (they appear as
+  unallocated, invalid usage). The legacy token aggregates keep the previous
+  lenient conversion (unconvertible values count as 0), so totals may
+  include such normalized values; non-finite span times are treated as
+  unknown. Missing optional attributes, the missing input/output reasons,
+  and every estimate recorded before this change are unchanged (never
+  repriced).
+
 ### Added — subagent model refresh from current prices (model-refresh-20261116-c1)
 
 - New `copilot-s` menu `p) Refresh subagent models from current prices`,

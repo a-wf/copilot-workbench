@@ -11,7 +11,9 @@ Pure prose/documentation changes (including agent instructions) and
 mechanical git-only operations are normally exempt unless the user
 explicitly asks for a review.
 Use the task tiers and routing rules below and briefly tell the user which
-optional stages were skipped.
+optional stages were skipped. Delegation is a cost tool, not a ritual:
+follow [Efficient orchestration](#efficient-orchestration) to decide when a
+handoff is worth its cost.
 
 ## Mandatory stage communication
 
@@ -230,36 +232,50 @@ or the refresh state yourself; changes go through `/subagents` or
 The built-in `task` subagent is not one of this toolkit's seven custom
 agents; it is provided by the Copilot CLI, has no
 `agents/task.agent.md`, and does not appear as an eighth custom agent in
-`/agent`. When a routine shell/git operation is safe and can be stated as
-a bounded command, delegate its execution to this built-in instead of
-spending the main session's more expensive reasoning on the mechanics.
-This is a cost-saving operation even when no coding-agent stage is needed;
-do not skip it just because the change is simple.
+`/agent`. When a routine shell/git operation is safe, can be stated as a
+bounded command, and is substantial enough that the handoff pays for
+itself (for example a long build/test run, a verbose formatter pass, or an
+authorized multi-file commit), delegate its execution to this built-in
+instead of spending the main session's more expensive reasoning on the
+mechanics. This can be a cost-saving operation even when no coding-agent
+stage is needed. Do not delegate tiny lookups, status checks, or one-line
+commands by default: running them directly is cheaper than the handoff.
 
 | Built-in role | Model | Reasoning effort | Context tier |
 |---|---|---|---|
 | `task` — mechanical shell task executor | `gpt-6-luna` | `low` | `default` |
 
-### Mandatory route — small/casual implementation
+### Default route — small/casual implementation
 
 For small or casual implementation/edit requests, delegate implementation
 using the `task` tool to invoke the named custom agent `coder`, passing
 `model: gpt-6.1-terra`, `reasoning_effort: low`, and
-`context_tier: default`. This is a mandatory implementation delegation,
-not a route to the built-in `task` shell executor. The main session defines
+`context_tier: default`. This is the default implementation delegation
+for meaningful small/casual work, not a route to the built-in `task`
+shell executor. The main session defines
 the scope, coordinates the work, and retains oversight of the result.
 `coder` implements only; it does not test or review its own changes.
 Every code batch then receives independent review; only pure prose/docs
 and mechanical git-only changes are exempt. Invoke `tester` only when
 behavior warrants testing.
 
+Genuinely trivial edits are the exception: when the handoff would cost
+more than the edit itself (a typo, a one-line doc/comment fix, or a single
+obvious value the user named), the main session may make the edit
+directly and say so. A source/code edit made this way is main-authored
+and still gets the independent `reviewer` pass; the main session never
+reviews its own change. Anything beyond that keeps the `coder` /
+`senior-coder` route.
+
 Simple informational questions should be answered directly in the main
 session. Routine shell/git and other mechanical command execution remains
 the built-in `task` route described above; do not use `coder` for mechanics.
 
-Use it for bounded command execution such as checking git status/diffs,
-running an already-selected formatter, build, or test command, and
-performing an explicitly requested mechanical commit. Keep its assignment
+Use the built-in route for bounded command execution that is worth a
+handoff, such as running an already-selected formatter, build, or test
+command, or performing an explicitly requested mechanical commit; quick
+checks such as `git status` or a short diff stay in the main session.
+Keep its assignment
 to the exact operation and scope; it must not expand the request, do broad
 codebase discovery, implement or review code, or start another agent.
 `discovery` is a read-only codebase-mapping role, not a shell runner, and
@@ -270,7 +286,8 @@ an Opus/senior-coder call on command execution when the built-in Task
 route is available.
 
 Never commit or push unless the user explicitly asks for that action. For
-an authorized commit, route the mechanical git work to `task` by default,
+an authorized commit, the main session may run a simple single commit
+directly or route larger mechanical git work to `task`; either way,
 limit staging to the requested changes, and preserve unrelated dirty
 edits. Do not delegate destructive operations or unreviewed changes
 without authorization. If the Task tool is unavailable, or a command
@@ -292,7 +309,8 @@ stage already did:
   while writing the change, but it may never review, approve, or test
   its own work — that always requires handing off to `reviewer`/`tester`.
 - The main session may delegate bounded mechanical shell/git execution to
-  the built-in `task` subagent using the route above. The main session
+  the built-in `task` subagent using the route above when it is worth the
+  handoff. The main session
   initiates that delegation and retains oversight; `task` executes only
   the assigned operation and does not delegate further.
 - `reviewer` reviews the complete coherent source/code batch, including
@@ -312,6 +330,73 @@ for an adjusted route before substituting main-session work, unless active
 autopilot permits the routing-only adjustment above. Do not silently replace
 an approved delegation.
 
+## Efficient orchestration
+
+Each handoff costs a full context load, so delegate only when it pays for
+itself. These rules refine every route below; they do not change any
+model, effort, or context value.
+
+1. **Direct work.** Answer small questions and follow a single continuous
+   investigation (one trace through code, logs, or docs) in the main
+   session. Delegate when the work needs substantial separate context or
+   has a demonstrable net cost benefit — not tiny lookups, status checks,
+   or one-line commands by default. Genuinely trivial edits follow the
+   exception under the small/casual route; meaningful implementation keeps
+   the `coder` / `senior-coder` route.
+2. **Batch handoffs.** Give an implementer one complete, bounded batch
+   (all files of the work item and its acceptance criteria), then have
+   `tester` (or the existing test command) run before **one** broad
+   `reviewer` pass over the whole source-and-test batch. Do not hand off
+   per file, split one change into micro-handoffs, or repeat a stage that
+   already covered the same content.
+3. **Parallelism.** Run stages in parallel only when they are independent
+   reads or work with non-overlapping writes. Never run two writers on the
+   same files, and never run dependent stages (implement → test → review)
+   concurrently. Running something in the background is not useful
+   parallelism by itself.
+4. **Finding triage.** Fix significant correctness, security, safety,
+   data-integrity, and regression findings. Defer optional polish and style
+   (record it as deferred in the summary) unless the user directly asks for
+   it; never spend a fix/verification round on style alone.
+5. **Budget exhaustion.** The existing per-work-item budgets stay hard
+   limits across all sessions. When one runs out, escalate once with
+   explicit choices, wait, and resume only with the permission actually
+   granted — no extra round, automatic new cycle, budget reset, or reminder
+   loop without explicit user authorization (details in
+   [Budget exhaustion](#budget-exhaustion-one-escalation-then-wait)).
+6. **Delivery metrics.** Judge delivery by completion, cost, elapsed time,
+   and confirmed material defects/regressions — never by how many agents
+   ran or by an agent's self-reported quality. Cost is spend, not a
+   measure of effectiveness. For meaningful multi-agent features, record
+   start, completion, and confirmed findings as described in
+   [Recording feature delivery](#recording-feature-delivery); trivial
+   questions and one-line operations need no tracking and no extra tool
+   calls.
+
+### Budget exhaustion: one escalation, then wait
+
+The per-work-item budgets (reviewer and test-reviewer: 1 broad + up to 3
+focused; tester: 1 initial + up to 3 fix/retest) are hard limits across all
+sessions. When one is exhausted with required findings or failures still
+open:
+
+- Stop the loop and do not report the work as complete. Send **one** clear,
+  actionable escalation: the open findings (numbered, with severity), what
+  was tried, and explicit choices — for example accept as-is with the
+  known findings, authorize a targeted budget override for named findings,
+  or stop. Use the blocking `ask_user` pattern above (`🛑 **NEEDS YOUR
+  APPROVAL**`) and wait for the answer.
+- No extra round runs unless the user explicitly authorizes it, either as a
+  targeted extension of the same work item (scope and number of rounds as
+  stated by the user) or as new, separate work the user confirms. Never
+  offer or start a new cycle id as an automatic budget reset.
+- Resume only with the permission actually granted. Do not re-send the
+  escalation, add reminder loops, or open repeated forms; a decline or no
+  answer leaves the work paused.
+- `record-review` cannot record rounds beyond 3: record the escalation
+  (verdict `escalated`) and report any authorized extension rounds in the
+  final summary instead of minting a new cycle id for them.
+
 ## Task tiers and stage-selection matrix
 
 Classify the task first, then use this matrix as the default. Deviate
@@ -319,7 +404,7 @@ when the specifics warrant it, but state the deviation to the user.
 
 | Tier | Examples | discovery | planner | coder | senior-coder | reviewer | tester | test-reviewer |
 |---|---|---|---|---|---|---|---|---|
-| **Trivial** | typo/docs/comment fix, non-behavior-affecting config/copy change, formatting-only diff | skip | skip | ✅ | escalation only | ✅ for all source/code changes (including tests and configuration); exempt pure prose/docs and mechanical git-only | skip | skip |
+| **Trivial** | typo/docs/comment fix, non-behavior-affecting config/copy change, formatting-only diff | skip | skip | ✅, or the main session directly when the handoff costs more than the edit | escalation only | ✅ for all source/code changes (including tests and configuration); exempt pure prose/docs and mechanical git-only | skip | skip |
 | **Small** | small well-scoped change in familiar code, obvious approach, no meaningful behavior to test | skip | skip | ✅ | escalation only | ✅ for every code change | skip unless behavior changed | skip |
 | **Standard** | routine feature/bug fix, familiar codebase area, CRUD/UI/standard logic, clear approach | skip unless area is unfamiliar | skip if approach is obvious, else ✅ | ✅ | escalation only | ✅ (one pass) for every code change | ✅ if behavior changed | skip |
 | **Complex** | multi-file architecture, async/state management, schema/data-model changes, deep structural bug, new service | ✅ if area is broad/unfamiliar | ✅ | — | ✅ | ✅ (one pass + up to 3 verification rounds) | ✅ | recommended |
@@ -435,8 +520,13 @@ Per task, reviewer performs exactly one comprehensive review
   budget. If that budget is exhausted while newly authored code remains
   unchecked, stop and escalate; do not approve it.
 - If issues remain unresolved after the 3rd verification round, stop
-  looping and escalate to the user with a clear summary instead of
-  continuing indefinitely.
+  looping and escalate to the user once, as described in
+  [Budget exhaustion](#budget-exhaustion-one-escalation-then-wait),
+  instead of continuing indefinitely.
+- Only required findings (significant correctness, security, safety,
+  data-integrity or regression issues) block approval and consume fix
+  rounds; optional polish/style is listed as deferred and is not sent back
+  for fixes unless the user directly asks for it.
 
 ### 5. `tester` — only when behavior merits testing (initial run + up to 3 fix/retest rounds, max 4 invocations)
 
@@ -454,7 +544,8 @@ fixes implementation bugs itself.
   run + up to 3 fix/retest rounds), the same budget shape as `reviewer`'s
   1 broad review + up to 3 verification rounds.
 - If failures persist after the 3rd fix/retest round, stop and escalate
-  to the user.
+  to the user once (see
+  [Budget exhaustion](#budget-exhaustion-one-escalation-then-wait)).
 
 ### 6. `test-reviewer` — complex/high-risk tasks only
 
@@ -463,7 +554,9 @@ Invoke `test-reviewer` only for complex or high-risk tier tasks, after
 writes or runs tests, and never implements. Same bounded discipline as
 `reviewer`: one broad test-quality review, then up to 3 focused
 verification rounds on whatever gaps/fixes came back (never a fresh broad
-review), then escalate to the user if unresolved after round 3.
+review), then escalate to the user once if unresolved after round 3.
+Optional coverage polish is reported as deferred, not sent back as a
+blocking gap.
 
 - Missing coverage goes back to `tester`.
 - A defect in a tester-authored test goes back to `tester`; a production
@@ -516,12 +609,15 @@ Hand each review/test stage a compact manifest instead of narration or a
 per-file walkthrough:
 
 ```text
-Task: ABC-123 | Cycle: abc-123-c1 | Batch: 1 | Requested: reviewer broad (round 0)
+Task: ABC-123 | Feature: abc-123-export | Cycle: abc-123-c1 | Batch: 1 | Requested: reviewer broad (round 0)
 Changed files: bin/tool.py (senior-coder); tests/test_tool.py (tester); config/x.yaml (senior-coder)
 Tests: python3 -m unittest tests.test_tool -> 42 passed
 Unresolved findings: none
 ```
 
+Include `Feature:` only when the work item is a tracked feature cycle (see
+[Recording feature delivery](#recording-feature-delivery)); omit it
+otherwise.
 Later fix handoffs list only the files changed since the previous round and
 the numbered findings being addressed; they never request a repeat broad
 review.
@@ -596,6 +692,70 @@ where the input file contains exactly:
   `report`/ingest. Missing records for historical work are not a compliance
   failure.
 
+### Recording feature delivery
+
+Use this only for meaningful multi-agent features (standard tier or above
+with delegated stages); skip it for questions, trivial edits, and one-line
+operations. The main session records; agents stay read-only. A feature
+(`feature_id`) may span several work-item cycles; each `cycle_id` is the
+same id used for its review records and belongs to exactly one feature.
+
+1. When work on the cycle starts, and again when it completes or is
+   cancelled, record one event (`record-delivery --input FILE`):
+
+   ```json
+   {
+     "schema": "copilot-task-report.delivery-record",
+     "schema_version": 1,
+     "record_id": "abc-123-c1-started",
+     "task_id": "ABC-123",
+     "feature_id": "abc-123-export",
+     "cycle_id": "abc-123-c1",
+     "event": "started",
+     "occurred_at": "2026-11-17T14:05:00Z",
+     "provenance": {
+       "source": "orchestrator-supplied",
+       "basis": "orchestrator-observed",
+       "reference": "routing approved; senior-coder batch 1 handed off"
+     }
+   }
+   ```
+
+   `event` is `started`, `completed`, or `cancelled` (one start, at most one
+   end, no reopen). `basis` is `orchestrator-observed`, `agent-response`, or
+   `user-supplied`. Use real UTC times; never guess them. Both record
+   commands only add to a task that an ingest already created; if the task
+   has never been ingested yet, record the start after its first ingest
+   with the real start time as `occurred_at`.
+2. Record a confirmed **material** finding (critical/high/medium
+   correctness, security, safety, or data-integrity — never optional
+   polish) once, with `event` `defect-confirmed` or `regression-confirmed`
+   plus `finding_id` (stable across rounds; a finding is recorded once),
+   `severity`, `category`, and `evidence_reference`. A regression also
+   needs `previous_working_reference` pointing to recorded evidence that
+   the behavior worked before (for example a previously passing test);
+   never infer a regression from the fact that a fix was needed. Late
+   findings against a completed cycle are allowed.
+3. To attribute cost, list the session's ledgered calls and pick them by
+   exact id — never by time, model, agent name, or whole session:
+
+   ```sh
+   python3 "$HOME/.local/bin/copilot-task-report.py" feature-calls --task ABC-123 --session-id SESSION
+   python3 "$HOME/.local/bin/copilot-task-report.py" feature-calls --task ABC-123 --session-id SESSION \
+     --feature-id abc-123-export --cycle-id abc-123-c1 --invocation TRACE_ID/SPAN_ID > /tmp/fu.json
+   python3 "$HOME/.local/bin/copilot-task-report.py" record-feature-usage --input /tmp/fu.json
+   ```
+
+   `--invocation` selects only the calls whose direct parent is that
+   `invoke_agent` span; use `--call TRACE_ID/SPAN_ID` when one invocation
+   served several features. Recording re-checks the previewed call count
+   and fingerprint and refuses a changed selection or a call already linked
+   to another cycle.
+
+These commands reject malformed input, unknown fields, and conflicting
+records; an identical replay is a no-op. They do not ingest or regenerate
+the report. Unlinked calls simply stay unallocated; that is not an error.
+
 ## Rules
 
 - Conditional stages may be skipped when the tier/matrix above says to,
@@ -615,9 +775,14 @@ where the input file contains exactly:
   change, unless the fix itself genuinely needs the other tier's scope —
   in that case say so explicitly when escalating.
 - Review/fix and test/fix loops are bounded to 3 focused rounds each; stop
-  and escalate to the user rather than looping indefinitely.
+  and escalate to the user once rather than looping indefinitely, and run
+  no extra round without explicit user authorization.
 - Use the compact handoff manifest for stage handoffs and keep narration
   short; do not narrate or request per-file reviews.
+- Apply [Efficient orchestration](#efficient-orchestration): direct work
+  when a handoff would not pay for itself, complete batches, parallelism
+  only for independent non-overlapping work, and fixes for significant
+  findings only.
 - Keep the user informed at each stage transition with a short status
   update (e.g., "Routine change, routing to coder", "Reviewer found 2
   issues, sending to senior-coder for round 1 verification", "Skipping
