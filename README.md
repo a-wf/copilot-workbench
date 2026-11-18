@@ -97,6 +97,14 @@ sessions may need a reload or restart.
   token counts, model-call time, reasoning-effort intent, and an estimated
   USD cost to a cumulative Markdown report for the task associated with
   your current git branch (or a free-form task name/ID you provide).
+- **Per-launch session reports and opt-in RTK mode** — every `copilot-s`
+  launch gets a metadata-only run record (exact session link or `unknown`,
+  exit status, wall clock, OTEL calls/tokens, a frozen estimated cost);
+  `copilot-s --rtk` runs one launch with a session-local
+  [RTK](https://github.com/rtk-ai/rtk) 1.2.0 hook for simple test/build
+  commands, with isolated per-launch RTK statistics, so normal and RTK runs
+  can be compared (observationally). See
+  [Per-launch session reports and RTK mode](#per-launch-session-reports-and-rtk-mode---rtk).
 - **7-role agent pipeline** — `discovery`, `planner`, `coder`,
   `senior-coder`, `reviewer`, `tester`, `test-reviewer`, wired together by
   an orchestrator with explicit task tiers; all source/code changes,
@@ -176,6 +184,8 @@ synthetic data for documentation purposes.)
 - [GitHub Copilot CLI](https://github.com/github/copilot-cli) (`copilot`)
   installed and on `PATH`.
 - `git` (for task-key-from-branch detection, and for `scripts/update.sh`).
+- Optional, only for `copilot-s --rtk`: [RTK](https://github.com/rtk-ai/rtk)
+  **1.2.0** on `PATH` (other versions are refused).
 
 ## Quick install
 
@@ -190,7 +200,8 @@ This installs:
 
 | What | Installed to | Method |
 |---|---|---|
-| `copilot-s`, `copilot-task-report.py`, `copilot-session-cleanup.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
+| `copilot-s`, `copilot-task-report.py`, `copilot-session-cleanup.py`, `copilot-model-refresh.py`, `copilot-session-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
+| Session-local RTK hook plugin (`copilot-s --rtk` only) | `~/.local/bin/copilot-s-rtk-plugin/` | symlink (or copy with `--copy`), file by file; loaded per launch with `--plugin-dir`, **never** installed as a Copilot plugin |
 | 7 agent definitions | `~/.copilot/agents/` | symlink (or copy with `--copy`) |
 | Orchestrator instructions | `~/.copilot/copilot-instructions.md` | symlink (or copy with `--copy`) |
 | Legacy pricing table (inactive) | `~/.copilot/task-reports/model-pricing.json` | **copied once, only if absent** — your edits are never overwritten; no longer used by the report |
@@ -223,6 +234,8 @@ copilot-s --task ABC-123      # alias for --report (kept for convenience; --repo
                                # the canonical/documented flag name for this toolkit)
 copilot-s --help               # show usage/features and exit (safe: never launches copilot)
 copilot-s --version | -v       # print the copilot-s version and exit (safe: never launches copilot)
+copilot-s --rtk                # this one launch in RTK mode (opt-in, never remembered)
+copilot-s --session-report ID  # read-only per-launch report for a session (never launches copilot)
 ```
 
 From the session list you can resume, rename, or delete sessions
@@ -515,6 +528,154 @@ enrolled session is resumed and stopped; the list reads only that file. If
 `events.jsonl` is missing/unreadable the count is shown as unknown, and
 corrupt or truncated lines are reported (`>=N`, "log incomplete") rather
 than hidden. No per-task summary is generated.
+
+### Per-launch session reports and RTK mode (`--rtk`)
+
+Every `copilot` launch made by `copilot-s` — new or resumed — gets one run
+record with a fresh random run id, in one of two modes:
+
+- **normal** (default, unchanged behavior): the baseline;
+- **RTK** (`copilot-s --rtk`, opt-in **for that one launch**, never
+  remembered): a session-local hook rewrites a small allowlist of simple
+  test/build commands to [`rtk <command>`](https://github.com/rtk-ai/rtk)
+  so their output is compacted before it reaches the model.
+
+```bash
+copilot-s --rtk                        # this launch in RTK mode (menu shows [RTK mode])
+copilot-s --session-report SESSION_ID  # read-only: every copilot-s launch of a session, by mode
+copilot-session-report.py launch --run-id RUN_ID [--format json]
+copilot-session-report.py session --session-id SESSION_ID [--format json]
+copilot-session-report.py compare [--format json]   # all runs grouped by mode
+copilot-session-report.py mark-outcome --run-id RUN_ID --outcome completed|abandoned|unknown
+```
+
+**What a run record holds** (`~/.copilot/session-reports/runs/<run-id>/run.json`,
+directories `0700`, files `0600`, atomic writes): mode, state
+(`incomplete` until finalized, then `completed` / `copilot-error` /
+`interrupted`, or `report-failure`), exit code, launch/end time and wall
+clock (1 s resolution), the exact session link or `unknown` with a reason,
+versions (copilot-s, Copilot from the session's own start event, RTK),
+model calls/tokens and summed model-call time from the launch's **own** OTEL
+file, an estimated cost, and in RTK mode the hook decision counts and RTK's
+numeric aggregates. It never contains prompts, commands, arguments, tool
+output or work file paths. `completed` only means Copilot exited with 0 —
+whether the *task* was done is a separate, explicit `task_outcome`
+(`unknown` until you run `mark-outcome`). Time-to-first-token is reported
+as unknown (not captured). A token field the spans did not report (e.g.
+reasoning or cache tokens) is `null` with per-field coverage, never a
+measured 0; pricing keeps the task report's rule that an absent
+cache/reasoning attribute costs nothing, while a missing input/output
+count leaves the call unpriced and the usage `partial`.
+
+**Exact session linking, never "the latest".** The resumed session, or the
+single new session directory the existing strict detection found, is
+cross-checked against the hook's own `session_id` (RTK mode) and the
+conversation ids in the launch's OTEL file; with no launcher candidate, a
+single conversation id in the launch's own OTEL file is used. Each launch
+now writes a unique `~/.copilot/otel/copilot-otel-<timestamp>-<run-id>.jsonl`
+(same `copilot-otel-*` pattern as before), so concurrent launches never
+share a file. Any conflict or ambiguity leaves the session `unknown`.
+Session reports group only exact run ids; earlier launches and launches
+outside `copilot-s` are not covered and are never backfilled.
+
+**Cost and savings are estimates.** Calls are priced once, at the end of
+the launch, with the same validated official GitHub per-token snapshot the
+task report uses (cache only, no network), frozen with its snapshot id and
+fetch date, and never repriced. Unpriceable calls make the figure
+`partial`, never $0. In RTK mode, the approximate value of the tokens RTK
+avoided is RTK's own token estimate × the official input rate of this
+run's priced calls — counted **once** as fresh input (cached or repeated
+context is not accounted); several models give a min–max range, an
+unknown rate gives `unknown`, and if some of the run's calls used a model
+without a known rate the value is marked `partial` and names those models
+(the range then covers only the priced models). If RTK made output *larger*, that growth is
+shown, never turned into a saving. `$0.00` appears only for a true zero;
+tiny positive values show as `<$0.01`. None of this is a bill or a credit
+deduction, and normal-vs-RTK comparisons are observational (different
+tasks and prompts), not causal.
+
+Copilot's own end-of-session summary is also requested with
+`--usage-output-file` into the run's private folder (only numeric fields
+are read; it is shown separately and never added to the OTEL figures;
+invalid values such as NaN, negative or overlong numbers are discarded and
+listed, making it `partial`, or `unavailable` if nothing valid remains). If
+you pass your own `--usage-output-file`, `copilot-s` leaves it alone and
+records the native summary as unavailable.
+
+#### RTK mode details
+
+- **Exactly RTK 1.2.0** (official release; verified end to end with Copilot
+  CLI 1.0.114). Other versions are refused rather than assumed compatible.
+- **Refuses to launch** (nothing is started, and the offending paths are
+  listed) if RTK user configuration could change results: `config.toml`,
+  `filters.toml` or the trust store `trusted_filters.json` in RTK's user
+  directories (`~/Library/Application Support/rtk` on macOS,
+  `$XDG_CONFIG_HOME|~/.config` and `$XDG_DATA_HOME|~/.local/share` `/rtk`
+  on Linux, `%APPDATA%`/`%LOCALAPPDATA%` `\rtk` on Windows), or any Copilot
+  hook configuration that already runs `rtk hook` (project
+  `.github/hooks/*.json`, `.github/copilot/settings*.json` and
+  `.claude/settings*.json` of every directory the session may run in or
+  add — both its path as given and its real path, and their git roots —
+  `~/.copilot` settings and user hooks, and every file of every installed plugin — inline `plugin.json`
+  hooks and custom hook paths included) — or any such candidate that cannot
+  be verified (a symlink, which is never followed, a non-regular,
+  unreadable or over-1 MiB file, a missing project directory, or an
+  installed-plugins tree too large or too deep to scan).
+  The session directories checked are the launch directory plus, for a
+  menu resume or `--resume=ID`/`--session-id ID` of an existing session,
+  its recorded directory, an explicit `-C DIR`, and every `--add-dir`
+  (relative ones resolved against the `-C` target or launch directory of a
+  new session). If copilot-s cannot tell where the session will run or
+  what it adds (`--worktree`, `--connect`, `--continue`, `--resume` without
+  an id, a resumed session with no readable recorded directory, or a
+  relative `--add-dir` with a resumed/selected session), RTK mode refuses
+  rather than guess, and a normal-mode run notes that it may not be an
+  RTK-free baseline. Symlinked `.github`, `.github/copilot` or `.claude`
+  directories in those roots are refused too (never followed). A project `.rtk/` folder
+  is accepted: without a trust store its filters/pipelines are never
+  loaded. Static checks run before the menu (for the launch directory);
+  right before launch they run again for the session's actual directories,
+  together with a smoke test of the real `rtk hook copilot`. `copilot-s`
+  never edits RTK or Copilot configuration and never runs `rtk init`.
+- **Isolation.** All inherited `RTK_*` variables are cleared for the launch;
+  `RTK_DB_PATH`, `RTK_TEE_DIR`, `RTK_RECALL_DB` and `RTK_CONFIG_DIR` point
+  into the run's private `raw/rtk/` folder (an empty pipeline directory, so
+  no user pipelines or LLM delegation tasks), telemetry is disabled, no
+  proxy is started and `HOME` is unchanged. Statistics come only from
+  `rtk gain --format json` on that private database — never the global one
+  and never a before/after diff.
+- **Allowlist.** Only one plain command with plain arguments is eligible:
+  `cargo test|build|check`, `go test|build`, `make test|check|build`,
+  `mvn test|compile`, `dotnet build`, `playwright test`, `bun test`,
+  `npm|pnpm run test|build`, `pytest`, `jest`, `tsc`, `ctest`, `phpunit`,
+  `rspec`. Anything with pipes, `;`/`&&`, redirects, quotes, `$`, globs,
+  environment assignments or a path as the program — and review or
+  exact-output tools such as `git`, `diff`, `grep`, `cat` — runs unchanged.
+  A rewrite is accepted only if RTK answers exactly `rtk <original command>`.
+- **Permissions unchanged.** The hook never approves anything; Copilot
+  checks the rewritten `rtk ...` command against your normal rules, so an
+  allowlist like `shell(git:*)`/`shell(cargo:*)` may now prompt (or deny in
+  `-p` mode). `copilot-s` deliberately does not add `shell(rtk:*)`, which
+  would also allow `rtk run`/`rtk bypass`.
+- **Fails closed.** If RTK disappears, errors, answers in an unexpected
+  shape or asserts its own permission decision (allow or deny) during the
+  session, an allowlisted command is **denied** with a clear message (never
+  run unfiltered, never approved); exit and relaunch without `--rtk`.
+- **Your own `--plugin-dir` plugins** are passed through unchanged and are
+  never modified, but in RTK mode each one is inspected read-only first:
+  the launch is refused if any file in it mentions `rtk hook`, or if it
+  cannot be fully verified (missing, symlinked or non-regular entries,
+  files over 1 MiB, unreadable or too large/deep trees, the copilot-s RTK
+  plugin itself, or a relative path combined with `-C`, `--worktree` or a
+  resumed/selected session — use an absolute path).
+- **RTK's raw data stays private and is disclosed.** RTK's history
+  database stores raw command lines and project paths, and tee/recall keep
+  raw output; they live only in the run's `raw/` folder (with Copilot's
+  usage file), are never copied into reports, and are **never deleted
+  automatically** — remove old `~/.copilot/session-reports/runs/*` folders
+  yourself when you no longer need them.
+- If `copilot-s` itself is killed while Copilot runs, the record stays
+  `incomplete` (no outcome is invented).
 
 ## Task usage reporting
 
@@ -1061,6 +1222,9 @@ Verify the pipeline is loaded:
 | Install method | `scripts/install.sh --copy` | symlink |
 | Subagent model refresh (menu `p`) | `copilot-model-refresh.py`; state, backups and your `user-config.json` in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated catalog `~/.copilot/model-role-catalog.json` | no overrides; replacements need your verified `available_models` list |
 | Model refresh helper path | `COPILOT_MODEL_REFRESH_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-model-refresh.py` |
+| Per-launch session reports | `COPILOT_SESSION_REPORTS_DIR` env var | `~/.copilot/session-reports` (never pruned automatically) |
+| Session report helper path | `COPILOT_SESSION_REPORT_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-session-report.py` |
+| RTK hook plugin directory (`--rtk`) | `COPILOT_S_RTK_PLUGIN_DIR` env var (absolute path) | `copilot-s-rtk-plugin/` next to `copilot-s` |
 
 ## Security & privacy
 
@@ -1076,6 +1240,13 @@ Verify the pipeline is loaded:
   nothing is transmitted or shared by these scripts.
 - The pricing cache contains only GitHub's public list prices — no
   account, billing, or credential data.
+- Per-launch session reports (`~/.copilot/session-reports`) hold metadata
+  only (ids, versions, states, times, counts, token totals, estimated
+  costs). Each run's private `raw/` folder (`0700`) holds data owned
+  by other tools: Copilot's usage summary file (may list modified file
+  paths) and, in RTK mode, RTK's own history database (raw command lines,
+  project paths) and tee/recall output. It is never copied into reports,
+  never sent anywhere, and never deleted automatically.
 - See [`SECURITY.md`](SECURITY.md) for how to report a vulnerability.
 
 ## Uninstall / update

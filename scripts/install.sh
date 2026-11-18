@@ -267,6 +267,18 @@ install_one "$REPO_ROOT/bin/copilot-s" "$BIN_PREFIX/copilot-s" true
 install_one "$REPO_ROOT/bin/copilot-task-report.py" "$BIN_PREFIX/copilot-task-report.py" true
 install_one "$REPO_ROOT/bin/copilot-session-cleanup.py" "$BIN_PREFIX/copilot-session-cleanup.py" true
 install_one "$REPO_ROOT/bin/copilot-model-refresh.py" "$BIN_PREFIX/copilot-model-refresh.py" true
+install_one "$REPO_ROOT/bin/copilot-session-report.py" "$BIN_PREFIX/copilot-session-report.py" true
+
+# --- Session-local RTK hook plugin (used only by `copilot-s --rtk`) ---
+# Installed file-by-file next to copilot-s so a --copy install finds it via
+# its own directory (a symlink install resolves the repo copy). It is only
+# ever loaded per launch with `copilot --plugin-dir`; it is NOT installed as
+# a Copilot plugin, and nothing here touches Copilot or RTK configuration.
+RTK_PLUGIN_SRC="$REPO_ROOT/bin/copilot-s-rtk-plugin"
+RTK_PLUGIN_DEST="$BIN_PREFIX/copilot-s-rtk-plugin"
+install_one "$RTK_PLUGIN_SRC/.claude-plugin/plugin.json" "$RTK_PLUGIN_DEST/.claude-plugin/plugin.json"
+install_one "$RTK_PLUGIN_SRC/hooks/hooks.json" "$RTK_PLUGIN_DEST/hooks/hooks.json"
+install_one "$RTK_PLUGIN_SRC/hooks/copilot-s-rtk-hook.py" "$RTK_PLUGIN_DEST/hooks/copilot-s-rtk-hook.py" true
 
 # --- Remove a stale pre-2.0 copilot-jira-report.py helper, if present ---
 # Only ever touches it when it's clearly this toolkit's own doing (see

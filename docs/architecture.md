@@ -27,9 +27,21 @@ flowchart TB
         GHDOCS["docs.github.com\nModels and pricing for GitHub Copilot\n(official per-token rates)"]
         PRICECACHE["~/.copilot/task-reports/\nofficial-pricing-cache.json (24h TTL)"]
         REPORTS["Task usage reports (Markdown)\ndefault: ~/Desktop/CopilotTaskReports\noverride: $COPILOT_TASK_REPORTS_DIR"]
+        SR["bin/copilot-session-report.py\n(per-launch run records)"]
+        RUNS["~/.copilot/session-reports/runs/<run-id>/\nrun.json + private raw/ (0700/0600)"]
+        RTKPLUG["bin/copilot-s-rtk-plugin\n(session-local PreToolUse hook, --rtk only)"]
+        RTK["rtk 1.2.0\n(isolated per-launch RTK_* paths)"]
     end
 
     CS -->|"launches, sets COPILOT_OTEL_* env"| COPILOT
+    CS -->|"start / finish (run id)"| SR
+    SR --> RUNS
+    OTEL -->|"own launch file only"| SR
+    SR -->|"imports cache-only official pricing"| HELPER
+    CS -.->|"--rtk: --plugin-dir"| RTKPLUG
+    COPILOT -.->|"Bash PreToolUse"| RTKPLUG
+    RTKPLUG -.->|"rtk hook copilot"| RTK
+    RTK -.->|"history.db / tee / recall"| RUNS
     COPILOT -->|writes spans| OTEL
     COPILOT -->|writes events| EVENTS
     CS -->|"on exit: ingest --session-id --task KEY"| HELPER
@@ -73,8 +85,34 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
 - **OTEL wiring** — before launching `copilot`, it sets
   `COPILOT_OTEL_ENABLED=true`, `COPILOT_OTEL_EXPORTER_TYPE=file`, and a
   fresh per-invocation `COPILOT_OTEL_FILE_EXPORTER_PATH` under
-  `~/.copilot/otel/`. This is what makes the task usage reporter possible —
-  see below.
+  `~/.copilot/otel/` named `copilot-otel-<YYYYMMDD-HHMMSS>-<run-id>.jsonl`
+  (the run id makes concurrent launches collision-free while keeping the
+  `copilot-otel-*.jsonl` pattern every reader globs). This is what makes
+  the task usage reporter possible — see below.
+- **Per-launch session reports** — each launch also gets a random run id
+  and a run record from `bin/copilot-session-report.py` (`start` before
+  launch, `finish` after the task ingest and before the keep/rename/delete
+  prompt). The record links the launch to its session only on exact
+  evidence (resumed id or the strict single-new-directory detection,
+  cross-checked with the hook's `session_id` and the launch's own OTEL
+  conversation ids) and prices that session's chat spans from the launch's
+  own OTEL file once, with the task reporter's cache-only official pricing
+  functions (imported, bytecode writing disabled). `--usage-output-file`
+  is added into the run's private folder unless the caller passed one.
+- **RTK mode (`--rtk`)** — a per-invocation flag (never persisted).
+  `copilot-session-report.py preflight` (read-only) runs before the menu;
+  `start` repeats it, smoke-tests the real `rtk hook copilot` against an
+  isolated preflight database, and returns the run's isolated `RTK_*`
+  paths. `copilot-s` then clears every inherited `RTK_*` variable, exports
+  only those paths (plus `COPILOT_S_RUN_DIR` and the pinned
+  `COPILOT_S_RTK_BIN`) and adds `--plugin-dir bin/copilot-s-rtk-plugin`.
+  The plugin's Claude-compatible `PreToolUse`/`Bash` hook
+  (`hooks/copilot-s-rtk-hook.py`) rewrites only allowlisted plain test/build
+  commands, accepts RTK's answer only if it is exactly `rtk <command>`,
+  never emits a permission decision for a rewrite, denies (fail closed) when
+  RTK fails, and appends a content-free decision line (with the hook's
+  `session_id`) to the run folder. Any RTK-mode setup failure exits before
+  `copilot` starts.
 - **Task ID resolution** — on session start/resume/exit, it tries to
   extract a conservative `KEY-123`-style ID (`[A-Z][A-Z0-9]+-[0-9]+`) from
   the current git branch, falling back to the resumed session's stored

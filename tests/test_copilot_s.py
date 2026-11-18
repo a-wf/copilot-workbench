@@ -54,6 +54,21 @@ def run(cmd, env=None, timeout=15, **kwargs):
     )
 
 
+def without_generated_usage_file(case, args, home):
+    """Keep legacy argv assertions focused while validating the new native
+    usage argument. Caller-owned usage paths must never be stripped."""
+    args = list(args)
+    if "--usage-output-file" in args:
+        index = args.index("--usage-output-file")
+        path = args[index + 1]
+        root = os.path.join(home, ".copilot", "session-reports", "runs") + os.sep
+        if path.startswith(root):
+            case.assertTrue(path.endswith("/raw/copilot-usage.json"), path)
+            case.assertEqual(args.count("--usage-output-file"), 1)
+            del args[index:index + 2]
+    return args
+
+
 class BaseHomeTestCase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="copilot-s-test-home-")
@@ -809,7 +824,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
 
     def _copilot_args(self):
         with open(self.copilot_log, encoding="utf-8") as f:
-            return json.load(f)
+            return without_generated_usage_file(self, json.load(f), self.home)
 
     def _native_name(self, session_id):
         with open(
@@ -1119,7 +1134,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertEqual(status, 0, output)
         self.assertEqual(actions, 2, output)
         with open(self.copilot_log, encoding="utf-8") as f:
-            copilot_args = json.load(f)
+            copilot_args = without_generated_usage_file(self, json.load(f), self.home)
         self.assertEqual(
             copilot_args,
             [
@@ -1695,7 +1710,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertEqual(actions, 2, output)
         self.assertNotIn("Session name (Enter for automatic):", output)
         with open(self.copilot_log, encoding="utf-8") as f:
-            copilot_args = json.load(f)
+            copilot_args = without_generated_usage_file(self, json.load(f), self.home)
         self.assertIn("--resume=legacy-session", copilot_args)
         self.assertEqual(
             copilot_args,
@@ -1711,6 +1726,37 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertFalse(os.path.exists(os.path.join(
             self.state_dir, "legacy-session", "copilot-s-context.json"
         )))
+
+    def test_rtk_all_menu_resume_checks_other_project_then_allows_clean_project(self):
+        import test_copilot_session_report as fixture
+        other = os.path.join(self.home, "other-project")
+        os.makedirs(os.path.join(other, ".git"))
+        directory = self._session("foreign-menu-session", name="Foreign session", cwd=other)
+        hook = os.path.join(other, ".github", "hooks", "filter.json")
+        fixture.write(hook, json.dumps({"version": 1, "hooks": {
+            "preToolUse": [{"type": "command", "bash": "rtk hook copilot"}]}}))
+        fixture.write(os.path.join(self.fake_bin, "rtk"),
+                      "#!%s\n%s" % (sys.executable, fixture.FAKE_RTK), True)
+        env = self._env({
+            "COPILOT_SESSION_REPORT_HELPER": str(fixture.HELPER),
+            "COPILOT_S_RTK_PLUGIN_DIR": str(fixture.PLUGIN),
+            "FAKE_COPILOT_MODE": "idle",
+        })
+        status, output, actions = self._run_tty(
+            env, actions=[("Select session to resume", "1\n")],
+            copilot_s_args=["--all", "--rtk"])
+        self.assertEqual(status, 1, output)
+        self.assertEqual(actions, 1, output)
+        self.assertIn("RTK mode refused", output)
+        self.assertFalse(os.path.exists(self.copilot_log))
+        os.unlink(hook)
+        status, output, actions = self._run_tty(
+            env, actions=[("Select session to resume", "1\n"), ("[K/r/d]:", "k\n")],
+            copilot_s_args=["--all", "--rtk"])
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 2, output)
+        self.assertIn("--resume=foreign-menu-session", self._copilot_args())
+        self.assertTrue(os.path.isfile(os.path.join(directory, "workspace.yaml")))
 
     def test_resumed_launch_forces_auto_and_preserves_non_model_arguments(self):
         self._session("resumed-auto-session")
@@ -1733,7 +1779,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertEqual(status, 0, output)
         self.assertEqual(actions, 2, output)
         with open(self.copilot_log, encoding="utf-8") as f:
-            copilot_args = json.load(f)
+            copilot_args = without_generated_usage_file(self, json.load(f), self.home)
         self.assertEqual(
             copilot_args,
             [
@@ -2165,7 +2211,8 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         ])
         self.assertEqual(status, 0, out)
         with open(self.copilot_log, encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle), ["--model", "auto", "--auto-tier", "balance"])
+            self.assertEqual(without_generated_usage_file(self, json.load(handle), self.home),
+                             ["--model", "auto", "--auto-tier", "balance"])
         self.assertEqual(self._calls(), [])
 
     def test_help_never_calls_refresh_or_copilot(self):

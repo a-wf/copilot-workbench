@@ -24,7 +24,14 @@
 #     ~/.copilot/instructions/copilot-toolkit-model-routing.instructions.md).
 #     Run `copilot-model-refresh.py reset --yes` BEFORE uninstalling to
 #     remove the tool's own overrides safely (your own pins are kept).
+#   - Per-launch session reports (~/.copilot/session-reports or
+#     $COPILOT_SESSION_REPORTS_DIR), including each launch's private raw/
+#     folder (RTK's own history DB/tee/recall and Copilot usage files).
 #   - Any other user data.
+#
+# The session-local RTK hook plugin files (copilot-s-rtk-plugin/ next to
+# copilot-s) are manifest-managed and removed like any other tool file; its
+# directories are then removed only if they are left empty.
 #
 # Two retired paths are handled by scripts/install.sh instead of here:
 #   - A stale pre-2.0 copilot-jira-report.py helper.
@@ -87,8 +94,14 @@ latest_backup_for() {
 }
 
 removed_count=0
+rtk_plugin_roots=()
 while IFS= read -r path; do
   [[ -z "$path" ]] && continue
+  case "$path" in
+    */copilot-s-rtk-plugin/*)
+      rtk_plugin_roots+=("${path%%/copilot-s-rtk-plugin/*}/copilot-s-rtk-plugin")
+      ;;
+  esac
   if [[ -L "$path" || -e "$path" ]]; then
     if $DRY_RUN; then
       log "${DIM}[dry-run]${RESET} rm $path"
@@ -116,13 +129,29 @@ while IFS= read -r path; do
   fi
 done < "$MANIFEST_FILE"
 
+# Remove the RTK hook plugin's directories only if they are now empty
+# (rmdir never deletes anything a user put there). Skipped when backups
+# were restored into them.
+if [[ ${#rtk_plugin_roots[@]} -gt 0 ]] && ! $RESTORE; then
+  for root in "${rtk_plugin_roots[@]}"; do
+    for dir in "$root/hooks" "$root/.claude-plugin" "$root"; do
+      [[ -d "$dir" && ! -L "$dir" ]] || continue
+      if $DRY_RUN; then
+        log "${DIM}[dry-run]${RESET} rmdir $dir (only if empty)"
+      elif rmdir "$dir" 2>/dev/null; then
+        log "  ${GREEN}removed${RESET} empty directory $dir"
+      fi
+    done
+  done
+fi
+
 log ""
 if $DRY_RUN; then
   log "${YELLOW}Dry run complete — no changes were made.${RESET}"
 else
   log "${GREEN}Uninstall complete.${RESET} Removed $removed_count toolkit-managed path(s)."
   rm -f "$MANIFEST_FILE"
-  log "Note: Task reports, task state, session state, quarantined sessions, and your pricing config were left untouched."
+  log "Note: Task reports, task state, session state, per-launch session reports (incl. their private raw folders), quarantined sessions, and your pricing config were left untouched."
   if [[ -f "$HOME/.copilot/model-refresh/state.json" ]]; then
     log "${YELLOW}Note:${RESET} subagent model-refresh state remains in $HOME/.copilot/model-refresh. If you applied overrides, restore them from the checkout with: python3 bin/copilot-model-refresh.py reset --yes"
   fi

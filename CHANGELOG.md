@@ -6,6 +6,65 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Added — per-launch session reports and opt-in RTK mode (rtk-session-reports-20261118-c1)
+
+- New `bin/copilot-session-report.py` (stdlib): every `copilot-s` launch,
+  normal or RTK, gets a metadata-only run record under
+  `~/.copilot/session-reports/runs/<run-id>/run.json` (0700/0600, atomic,
+  per-run lock): mode, state (`incomplete` → `completed` / `copilot-error`
+  / `interrupted`, or `report-failure`), exit code, wall clock, exact
+  session link or `unknown` with a reason, versions, OTEL calls/tokens and
+  summed model time from the launch's own OTEL file (deduplicated by
+  trace/span id), an estimated cost priced once with the existing
+  cache-only official snapshot and frozen, Copilot's own
+  `--usage-output-file` summary (numeric fields only, shown separately), and
+  an explicit `task_outcome` (`mark-outcome`; never inferred from exit 0).
+  Read-only `launch`, `session` and `compare` commands (text/json) and
+  `copilot-s --session-report SESSION_ID`. Task reports, their CLI and
+  schema are unchanged; no historical backfill.
+- `copilot-s --rtk` (per launch, never persisted): exactly RTK 1.2.0; refuses
+  to launch when RTK user config/filters/trust store or an existing
+  `rtk hook` Copilot configuration could alter results; clears inherited
+  `RTK_*` variables and isolates RTK's database, tee, recall and pipeline
+  directory in the run's private folder; loads the session-local
+  `bin/copilot-s-rtk-plugin` hook via `--plugin-dir` (never installed as a
+  Copilot plugin). The hook rewrites only allowlisted plain test/build
+  commands to exactly `rtk <command>`, never approves anything (Copilot
+  permissions unchanged), and denies an allowlisted command if RTK fails.
+  RTK statistics come only from the run's own database; the value of
+  avoided tokens is an explicitly approximate one-exposure estimate at
+  the run's official input rate(s) (range for several models, `unknown`
+  without a priced call; output growth is disclosed, never a saving).
+- Token fields a span did not report are recorded as unknown with per-field
+  coverage (never a measured 0); the RTK value estimate is `partial` and
+  names unpriced models when some calls have no known rate; RTK-mode
+  preflight also refuses hook-configuration candidates it cannot verify
+  (symlinks — never followed —, non-regular, unreadable or oversized
+  files); a malformed RTK hook answer denies the command; an invalid or
+  deeply nested Copilot usage file is reported unavailable without
+  affecting the rest of the run record.
+- RTK mode also inspects (never modifies) caller `--plugin-dir` plugins and
+  refuses ones that run `rtk hook` or cannot be verified; the hook denies an
+  allowlisted command when RTK asserts its own permission decision; invalid
+  native usage values make that summary `partial`/`unavailable`.
+- RTK-mode preflight checks every file of installed plugins (bounded,
+  symlink-safe, depth/size caps refuse) and the project hook configuration
+  of the directories the session will actually run in (menu/`--resume=ID`
+  recorded directory, `-C DIR`, launch directory); it refuses when that
+  directory cannot be determined (`--worktree`, `--connect`, `--continue`,
+  bare `--resume`), and normal mode then records a baseline note. Project
+  checks also cover `.github/copilot/settings*.json`, every `--add-dir`
+  directory, and the real path (and its git root) of symlinked directories.
+- OTEL export files are now named
+  `copilot-otel-<YYYYMMDD-HHMMSS>-<run-id>.jsonl` (same `copilot-otel-*`
+  pattern), so concurrent launches never share a file.
+- Normal launches now also pass `--usage-output-file` into the run's
+  private folder unless the caller supplied one (then left untouched).
+- `scripts/install.sh` installs the helper and the plugin files
+  (symlink/copy, manifest-managed); `scripts/uninstall.sh` removes them,
+  prunes the plugin directories only if empty, and never touches session
+  reports or their private raw folders (no automatic retention/deletion).
+
 ### Changed — cost-disciplined orchestration (delivery-coordination-20261117-c1)
 
 - `instructions/copilot-instructions.md` gains an *Efficient orchestration*

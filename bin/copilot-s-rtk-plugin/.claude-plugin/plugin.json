@@ -1,0 +1,5 @@
+{
+  "name": "copilot-s-rtk",
+  "version": "1.0.0",
+  "description": "Session-local RTK rewrite hook loaded only by `copilot-s --rtk` via --plugin-dir (never installed as a Copilot plugin). Rewrites a small allowlist of simple test/build commands to `rtk <command>`; everything else runs unchanged."
+}

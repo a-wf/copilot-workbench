@@ -14,18 +14,41 @@ FILTERED_FILE=""
 
 COPILOT_OTEL_DIR="$HOME/.copilot/otel"
 
+# --- Per-launch run id (session reports) ---
+# A random RFC 4122 v4 UUID from /dev/urandom (no python/uuidgen needed;
+# bash 3.2 compatible). Empty if no randomness is available, in which case
+# no session report is recorded for this launch.
+COPILOT_S_RUN_ID=""
+gen_run_id() {
+  local hex
+  hex=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n') || return 1
+  [[ "$hex" =~ ^[0-9a-f]{32}$ ]] || return 1
+  local variant
+  variant=$(printf '%x' $(( (16#${hex:16:1} & 3) | 8 )))
+  echo "${hex:0:8}-${hex:8:4}-4${hex:13:3}-${variant}${hex:17:3}-${hex:20:12}"
+}
+
 # Set up OTEL export (creates $COPILOT_OTEL_DIR and exports env vars used by
 # `copilot` for telemetry). Deliberately NOT called at script load time: it
 # has filesystem side effects (mkdir), so it must only run once we know
 # we're past --help/--version handling and are actually about to do
 # session-manager work (list sessions, launch `copilot`, etc). This keeps
 # `copilot-s --help`/`--version` side-effect-free.
+# The file name keeps the copilot-otel-*.jsonl pattern every reader globs,
+# plus this launch's run id, so two launches started in the same second
+# never share (or race on) one OTEL file and a session report can read its
+# own launch's file exactly, without guessing from timestamps.
 setup_otel() {
   mkdir -p "$COPILOT_OTEL_DIR"
   export COPILOT_OTEL_ENABLED=true
   export COPILOT_OTEL_EXPORTER_TYPE=file
   COPILOT_OTEL_RUN_TS="$(date +%Y%m%d-%H%M%S)"
-  export COPILOT_OTEL_FILE_EXPORTER_PATH="$COPILOT_OTEL_DIR/copilot-otel-$COPILOT_OTEL_RUN_TS.jsonl"
+  COPILOT_S_RUN_ID="$(gen_run_id)" || COPILOT_S_RUN_ID=""
+  if [[ -n "$COPILOT_S_RUN_ID" ]]; then
+    export COPILOT_OTEL_FILE_EXPORTER_PATH="$COPILOT_OTEL_DIR/copilot-otel-$COPILOT_OTEL_RUN_TS-$COPILOT_S_RUN_ID.jsonl"
+  else
+    export COPILOT_OTEL_FILE_EXPORTER_PATH="$COPILOT_OTEL_DIR/copilot-otel-$COPILOT_OTEL_RUN_TS.jsonl"
+  fi
 }
 
 # --- Locate this script's own real (symlink-resolved) directory ---
@@ -70,6 +93,99 @@ else
   SESSION_CLEANUP_HELPER="$HOME/.local/bin/copilot-session-cleanup.py"
 fi
 SESSION_QUARANTINE_DIR="$HOME/.copilot-s-quarantine"
+# --- Per-launch session report helper ---
+# Same resolution order as the task report helper above.
+if [[ -n "${COPILOT_SESSION_REPORT_HELPER:-}" ]]; then
+  SESSION_REPORT_HELPER="$COPILOT_SESSION_REPORT_HELPER"
+elif [[ -f "$SCRIPT_DIR/copilot-session-report.py" ]]; then
+  SESSION_REPORT_HELPER="$SCRIPT_DIR/copilot-session-report.py"
+else
+  SESSION_REPORT_HELPER="$HOME/.local/bin/copilot-session-report.py"
+fi
+# --- Session-local RTK hook plugin (`--rtk` only) ---
+# Loaded for one launch via `copilot --plugin-dir`, never installed as a
+# Copilot plugin. Lives next to this script's real location (repo checkout
+# for symlink installs, the install prefix for --copy installs).
+if [[ -n "${COPILOT_S_RTK_PLUGIN_DIR:-}" ]]; then
+  RTK_PLUGIN_DIR="$COPILOT_S_RTK_PLUGIN_DIR"
+else
+  RTK_PLUGIN_DIR="$SCRIPT_DIR/copilot-s-rtk-plugin"
+fi
+# Launch mode: set only by --rtk on THIS invocation; never persisted.
+RTK_MODE=false
+# Display only — copilot-session-report.py enforces the exact RTK version.
+SUPPORTED_RTK_LABEL="1.2.0"
+# Per-launch report state (filled by start_run_report / run_copilot).
+RUN_REPORT_PENDING=false
+RUN_REPORT_DIR=""
+RUN_USAGE_FILE=""
+RTK_RUN_BIN=""
+RTK_ENV_KEYS=()
+RTK_ENV_VALS=()
+REPORT_EXIT_CODE=""
+REPORT_SESSION_ID=""
+REPORT_LAUNCHED_EPOCH=""
+REPORT_ENDED_EPOCH=""
+# RTK mode: caller-supplied extra plugin directories (raw operands, in
+# order) and whether Copilot may resolve relative ones against a session
+# directory other than $PWD (-C, --worktree, or any resume/session selector).
+CALLER_PLUGIN_DIRS=()
+CALLER_SESSION_CWD_UNCERTAIN=false
+# Directories the launched session may run in (project hook configurations
+# there are checked: RTK mode refuses, normal mode notes contamination), and
+# why it cannot be determined, if so (RTK mode then refuses to launch).
+SESSION_PROJECT_DIRS=()
+SESSION_PROJECT_UNKNOWN=""
+
+# Recorded working directory of an existing session (its workspace.yaml
+# `cwd:`), printed only if it is an absolute path; nothing otherwise.
+session_recorded_cwd() {
+  local sid="${1:-}" cwd=""
+  [[ "$sid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 0
+  [[ -f "$SESSION_STATE_DIR/$sid/workspace.yaml" ]] || return 0
+  cwd=$(grep -m 1 '^cwd:' "$SESSION_STATE_DIR/$sid/workspace.yaml" 2>/dev/null | sed 's/^cwd: *//') || true
+  if [[ "$cwd" == /* ]]; then
+    echo "$cwd"
+  fi
+  return 0
+}
+
+# A session the caller resumes by id: Copilot switches to its recorded
+# directory, which must be known.
+note_resumed_session_dir() {
+  local dir
+  dir=$(session_recorded_cwd "${1:-}")
+  if [[ -n "$dir" ]]; then
+    SESSION_PROJECT_DIRS+=("$dir")
+  else
+    SESSION_PROJECT_UNKNOWN="resumed session ${1:-?} has no recorded directory copilot-s can read"
+  fi
+  return 0
+}
+
+# --session-id: an EXISTING session (its state directory exists in any
+# form) resumes in its recorded directory, which must then be readable and
+# absolute — otherwise the session directory is unknown (RTK mode refuses,
+# normal mode notes it). Only an id whose state directory is truly absent
+# starts a new session in the launch directory (already listed). An id that
+# is not a safe identifier cannot be checked and is unknown too.
+note_selected_session_dir() {
+  local sid="${1:-}" dir
+  if [[ ! "$sid" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    SESSION_PROJECT_UNKNOWN="--session-id ${sid:-?} is not a session id copilot-s can check"
+    return 0
+  fi
+  if [[ ! -e "$SESSION_STATE_DIR/$sid" && ! -L "$SESSION_STATE_DIR/$sid" ]]; then
+    return 0
+  fi
+  dir=$(session_recorded_cwd "$sid")
+  if [[ -n "$dir" ]]; then
+    SESSION_PROJECT_DIRS+=("$dir")
+  else
+    SESSION_PROJECT_UNKNOWN="existing session $sid (--session-id) has no recorded directory copilot-s can read"
+  fi
+  return 0
+}
 # --- Subagent model refresh helper (menu option p) ---
 # Same resolution order as the task report helper above.
 if [[ -n "${COPILOT_MODEL_REFRESH_HELPER:-}" ]]; then
@@ -362,6 +478,180 @@ update_task_report() {
     echo -e "${YELLOW}${out}${RESET}" >&2
   fi
   return 0
+}
+
+# --- Per-launch session reports (normal and --rtk launches) ---
+# start_run_report MODE-INDEPENDENT ARGS:
+#   $1 = resumed session id (empty for a new session)
+#   $2 = "true" if the caller's own options select a session
+#   $3 = "true" if the caller passed its own --usage-output-file
+# Normal mode: any failure is a warning and the launch continues without a
+# report. RTK mode: any failure (or a preflight refusal) stops BEFORE
+# `copilot` is launched — RTK mode never silently falls back to normal.
+start_run_report() {
+  local session_id="${1:-}" caller_selects="${2:-false}" caller_usage="${3:-false}"
+  local mode="normal"
+  [[ "$RTK_MODE" == "true" ]] && mode="rtk"
+  RUN_REPORT_PENDING=false
+  RUN_REPORT_DIR=""
+  RUN_USAGE_FILE=""
+  RTK_RUN_BIN=""
+  RTK_ENV_KEYS=()
+  RTK_ENV_VALS=()
+
+  local problem=""
+  if [[ -z "$COPILOT_S_RUN_ID" ]]; then
+    problem="no run id could be generated (no /dev/urandom)"
+  elif [[ ! -f "$SESSION_REPORT_HELPER" ]]; then
+    problem="session report helper not found at $SESSION_REPORT_HELPER (set COPILOT_SESSION_REPORT_HELPER or re-run the installer)"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    problem="python3 not found"
+  fi
+  if [[ -n "$problem" ]]; then
+    if [[ "$mode" == "rtk" ]]; then
+      echo -e "${RED}RTK mode not started: ${problem}. Nothing was launched.${RESET}" >&2
+      exit 1
+    fi
+    echo -e "${YELLOW}Warning: ${problem} — no session report for this launch.${RESET}" >&2
+    return 0
+  fi
+
+  local -a args=(start --run-id "$COPILOT_S_RUN_ID" --mode "$mode" --cwd "$PWD" --copilot-s-version "$COPILOT_S_VERSION")
+  if [[ -n "$session_id" ]]; then
+    args+=(--launch-kind resume --resume-session-id "$session_id")
+  else
+    args+=(--launch-kind new)
+  fi
+  [[ "$caller_selects" == "true" ]] && args+=(--caller-selects-session)
+  if [[ "$caller_usage" == "true" ]]; then
+    args+=(--usage-file-owner caller)
+  else
+    args+=(--usage-file-owner owned)
+  fi
+  [[ -n "${COPILOT_OTEL_FILE_EXPORTER_PATH:-}" ]] && args+=(--otel-file "$COPILOT_OTEL_FILE_EXPORTER_PATH")
+  local project_dir
+  for project_dir in "${SESSION_PROJECT_DIRS[@]+"${SESSION_PROJECT_DIRS[@]}"}"; do
+    args+=("--project-dir=$project_dir")
+  done
+  if [[ -n "$SESSION_PROJECT_UNKNOWN" ]]; then
+    args+=("--project-dir-unknown=$SESSION_PROJECT_UNKNOWN")
+  fi
+  if [[ "$mode" == "rtk" ]]; then
+    args+=(--plugin-dir "$RTK_PLUGIN_DIR")
+    local extra_dir
+    for extra_dir in "${CALLER_PLUGIN_DIRS[@]+"${CALLER_PLUGIN_DIRS[@]}"}"; do
+      args+=("--extra-plugin-dir=$extra_dir")
+    done
+    if [[ "$CALLER_SESSION_CWD_UNCERTAIN" == "true" ]]; then
+      args+=(--session-cwd-uncertain)
+    fi
+  fi
+
+  local out="" rc=0
+  out=$(python3 "$SESSION_REPORT_HELPER" "${args[@]}") || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    if [[ "$mode" == "rtk" ]]; then
+      if [[ $rc -eq 3 ]]; then
+        echo -e "${RED}RTK mode refused (see above). Nothing was launched.${RESET}" >&2
+      else
+        echo -e "${RED}RTK mode not started: the session report helper failed (exit $rc). Nothing was launched.${RESET}" >&2
+      fi
+      exit 1
+    fi
+    echo -e "${YELLOW}Warning: session report not started (exit $rc) — launching without a report.${RESET}" >&2
+    return 0
+  fi
+
+  local key value tab=$'\t'
+  while IFS="$tab" read -r key value; do
+    case "$key" in
+      RUN_DIR) RUN_REPORT_DIR="$value" ;;
+      USAGE_FILE) RUN_USAGE_FILE="$value" ;;
+      RTK_BIN) RTK_RUN_BIN="$value" ;;
+      RTK_DB_PATH|RTK_TEE_DIR|RTK_RECALL_DB|RTK_CONFIG_DIR|RTK_TELEMETRY_DISABLED)
+        RTK_ENV_KEYS+=("$key")
+        RTK_ENV_VALS+=("$value")
+        ;;
+    esac
+  done <<< "$out"
+
+  if [[ -z "$RUN_REPORT_DIR" ]]; then
+    if [[ "$mode" == "rtk" ]]; then
+      echo -e "${RED}RTK mode not started: the session report helper returned no run folder. Nothing was launched.${RESET}" >&2
+      exit 1
+    fi
+    echo -e "${YELLOW}Warning: session report helper returned no run folder — launching without a report.${RESET}" >&2
+    return 0
+  fi
+  if [[ "$mode" == "rtk" && ( -z "$RTK_RUN_BIN" || ${#RTK_ENV_KEYS[@]} -ne 5 ) ]]; then
+    echo -e "${RED}RTK mode not started: incomplete RTK isolation settings from the helper. Nothing was launched.${RESET}" >&2
+    exit 1
+  fi
+  RUN_REPORT_PENDING=true
+  return 0
+}
+
+# RTK mode only: drop every inherited RTK_* variable (names only — values
+# are never printed) and export this launch's isolated RTK paths plus the
+# pinned binary and run folder the session-local hook reads. HOME and all
+# other variables are left untouched. No eval: names come from a fixed case.
+apply_rtk_env() {
+  local name i=0
+  for name in $(compgen -e); do
+    case "$name" in
+      RTK_*) unset "$name" ;;
+    esac
+  done
+  while [[ $i -lt ${#RTK_ENV_KEYS[@]} ]]; do
+    case "${RTK_ENV_KEYS[$i]}" in
+      RTK_DB_PATH|RTK_TEE_DIR|RTK_RECALL_DB|RTK_CONFIG_DIR|RTK_TELEMETRY_DISABLED)
+        export "${RTK_ENV_KEYS[$i]}=${RTK_ENV_VALS[$i]}"
+        ;;
+    esac
+    i=$((i + 1))
+  done
+  export COPILOT_S_RUN_DIR="$RUN_REPORT_DIR"
+  export COPILOT_S_RTK_BIN="$RTK_RUN_BIN"
+}
+
+# Finalize this launch's run record exactly once (state, exact session link,
+# OTEL usage, frozen estimated cost, RTK aggregates). Called right after the
+# task ingest (so the official pricing cache is as fresh as the ingest left
+# it, and before a possible session delete), and again as a no-op safety net
+# after the stop flow. Never fatal.
+finalize_run_report() {
+  [[ "$RUN_REPORT_PENDING" == "true" ]] || return 0
+  RUN_REPORT_PENDING=false
+  local -a args=(finish --run-id "$COPILOT_S_RUN_ID" --exit-code "${REPORT_EXIT_CODE:-1}" --session-state-dir "$SESSION_STATE_DIR")
+  [[ -n "$REPORT_LAUNCHED_EPOCH" ]] && args+=(--launched-epoch "$REPORT_LAUNCHED_EPOCH")
+  [[ -n "$REPORT_ENDED_EPOCH" ]] && args+=(--ended-epoch "$REPORT_ENDED_EPOCH")
+  [[ -n "$REPORT_SESSION_ID" ]] && args+=(--session-id "$REPORT_SESSION_ID")
+  local out="" rc=0 line
+  out=$(python3 "$SESSION_REPORT_HELPER" "${args[@]}" 2>&1) || rc=$?
+  if [[ -n "$out" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && echo -e "  ${DIM}${line}${RESET}"
+    done <<< "$out"
+  fi
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${YELLOW}Warning: session report finalization had problems (exit $rc); the session itself is unaffected.${RESET}" >&2
+  fi
+  return 0
+}
+
+# Read-only: print the session report for one session id and exit.
+show_session_report() {
+  local sid="${1:-}"
+  if [[ -z "$sid" ]]; then
+    echo -e "${RED}Usage:${RESET} copilot-s --session-report SESSION_ID" >&2
+    return 1
+  fi
+  if [[ ! -f "$SESSION_REPORT_HELPER" ]]; then
+    echo -e "${RED}session report helper not found:${RESET} $SESSION_REPORT_HELPER" >&2
+    return 1
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo -e "${RED}python3 not found.${RESET}" >&2; return 1; }
+  python3 "$SESSION_REPORT_HELPER" session --session-id "$sid"
 }
 
 # --- Session name resolution ---
@@ -789,6 +1079,9 @@ post_session() {
   # disk — this must run regardless of whether the user then keeps, renames,
   # or deletes the session below, and must never abort this script.
   update_task_report "$session_id" "$task_id"
+  # Finalize this launch's session report (no-op if none is pending) while
+  # the session's files still exist and right after the task ingest.
+  finalize_run_report
 
   local created_at cwd
   created_at=$(grep '^created_at:' "$session_dir/workspace.yaml" 2>/dev/null | sed 's/^created_at: *//' || true)
@@ -889,12 +1182,111 @@ run_copilot() {
   # appending the forced values before --, so caller options cannot override
   # them. Keep the end marker and its positional remainder untouched.
   local -a copilot_args=() positional_args=()
-  local caller_names_session=false caller_selects_session=false
+  local caller_names_session=false caller_selects_session=false caller_usage_file=false
+  CALLER_PLUGIN_DIRS=()
+  CALLER_SESSION_CWD_UNCERTAIN=false
+  SESSION_PROJECT_DIRS=()
+  SESSION_PROJECT_UNKNOWN=""
+  local caller_c_dir="" add_dir
+  local -a caller_add_dirs=()
+  [[ -n "$session_id" ]] && CALLER_SESSION_CWD_UNCERTAIN=true
   while [[ $# -gt 0 ]]; do
+    # Options that decide which directory the session runs in (recorded
+    # only; every option is still handled unchanged by the case below).
+    case "$1" in
+      -C)
+        CALLER_SESSION_CWD_UNCERTAIN=true
+        if [[ $# -gt 1 && "$2" != "--" && -n "$2" ]]; then
+          caller_c_dir="$2"
+        else
+          SESSION_PROJECT_UNKNOWN="-C without a directory"
+        fi
+        ;;
+      -C?*)
+        CALLER_SESSION_CWD_UNCERTAIN=true
+        caller_c_dir="${1#-C}"
+        caller_c_dir="${caller_c_dir#=}"
+        if [[ -z "$caller_c_dir" ]]; then
+          SESSION_PROJECT_UNKNOWN="-C without a directory"
+        fi
+        ;;
+      --worktree|--worktree=*)
+        CALLER_SESSION_CWD_UNCERTAIN=true
+        SESSION_PROJECT_UNKNOWN="--worktree: the session runs in a worktree copilot-s does not inspect"
+        ;;
+      --resume=*)
+        note_resumed_session_dir "${1#--resume=}"
+        ;;
+      -r?*)
+        note_resumed_session_dir "${1#-r}"
+        ;;
+      --resume|-r|--continue)
+        SESSION_PROJECT_UNKNOWN="$1 without a session id: copilot-s cannot tell which session, and so which directory, Copilot will open"
+        ;;
+      --connect|--connect=*)
+        SESSION_PROJECT_UNKNOWN="--connect: the session runs in a directory copilot-s cannot inspect"
+        ;;
+      --session-id)
+        if [[ $# -gt 1 && "$2" != "--" ]]; then
+          note_selected_session_dir "$2"
+        fi
+        ;;
+      --session-id=*)
+        note_selected_session_dir "${1#--session-id=}"
+        ;;
+      --add-dir)
+        # Additional directories also feed Copilot's hook discovery. The
+        # operand (consumed unchanged by the case below) is recorded raw;
+        # a missing one is recorded empty and makes the directory unknown.
+        if [[ $# -gt 1 && "$2" != "--" ]]; then
+          caller_add_dirs+=("$2")
+        else
+          caller_add_dirs+=("")
+        fi
+        ;;
+      --add-dir=*)
+        caller_add_dirs+=("${1#--add-dir=}")
+        ;;
+    esac
     case "$1" in
       --)
         positional_args=("$@")
         break
+        ;;
+      --plugin-dir|--plugin-dir=*)
+        # Caller plugins pass through untouched; in RTK mode they are
+        # inspected (never modified) by the preflight before launch.
+        if [[ "$1" == "--plugin-dir" ]]; then
+          copilot_args+=("$1")
+          shift
+          if [[ $# -gt 0 && "$1" != "--" ]]; then
+            CALLER_PLUGIN_DIRS+=("$1")
+            copilot_args+=("$1")
+            shift
+          else
+            CALLER_PLUGIN_DIRS+=("")
+          fi
+          continue
+        fi
+        CALLER_PLUGIN_DIRS+=("${1#--plugin-dir=}")
+        copilot_args+=("$1")
+        shift
+        ;;
+      --usage-output-file|--usage-output-file=*)
+        # Caller-owned usage file: passed through untouched; copilot-s then
+        # neither adds its own nor reads/overrides the caller's path.
+        caller_usage_file=true
+        if [[ "$1" == "--usage-output-file" ]]; then
+          copilot_args+=("$1")
+          shift
+          if [[ $# -gt 0 && "$1" != "--" ]]; then
+            copilot_args+=("$1")
+            shift
+          fi
+          continue
+        fi
+        copilot_args+=("$1")
+        shift
         ;;
       --model|--auto-tier)
         shift
@@ -923,6 +1315,7 @@ run_copilot() {
         # These can select an existing session. Leave them untouched and
         # never add a prompted new-session name to a caller-selected session.
         caller_selects_session=true
+        CALLER_SESSION_CWD_UNCERTAIN=true
         if [[ "$1" == "--session-id" ]]; then
           copilot_args+=("$1")
           shift
@@ -950,6 +1343,48 @@ run_copilot() {
     esac
   done
   copilot_args+=(--model auto --auto-tier balance)
+
+  # Directories the session may run in: a menu-resumed session's recorded
+  # directory (Copilot switches to it on resume), an explicit -C target, and
+  # always the launch directory itself (conservative union).
+  if [[ -n "$session_id" ]]; then
+    note_resumed_session_dir "$session_id"
+  fi
+  if [[ -n "$caller_c_dir" ]]; then
+    if [[ "$caller_c_dir" != /* ]]; then
+      caller_c_dir="$PWD/$caller_c_dir"
+    fi
+    SESSION_PROJECT_DIRS+=("$caller_c_dir")
+  fi
+  SESSION_PROJECT_DIRS+=("$PWD")
+  # --add-dir operands (every occurrence, both spellings). Copilot resolves a
+  # relative one against the SESSION working directory: that is the -C
+  # target or the launch directory for a new session, but for a resumed or
+  # selected session it is the session's own directory, so a relative
+  # operand there is unknown (use an absolute path) rather than guessed.
+  for add_dir in "${caller_add_dirs[@]+"${caller_add_dirs[@]}"}"; do
+    if [[ -z "$add_dir" ]]; then
+      SESSION_PROJECT_UNKNOWN="--add-dir without a directory"
+    elif [[ "$add_dir" == /* ]]; then
+      SESSION_PROJECT_DIRS+=("$add_dir")
+    elif [[ -n "$session_id" || "$caller_selects_session" == "true" ]]; then
+      SESSION_PROJECT_UNKNOWN="relative --add-dir $add_dir with a resumed or selected session: Copilot resolves it against that session's directory; pass an absolute path"
+    elif [[ -n "$caller_c_dir" ]]; then
+      SESSION_PROJECT_DIRS+=("$caller_c_dir/$add_dir")
+    else
+      SESSION_PROJECT_DIRS+=("$PWD/$add_dir")
+    fi
+  done
+
+  # Per-launch session report (both modes). In RTK mode this also runs the
+  # full RTK preflight and exits before any prompt or launch if it fails.
+  start_run_report "$session_id" "$caller_selects_session" "$caller_usage_file"
+  if [[ "$RUN_REPORT_PENDING" == "true" && -n "$RUN_USAGE_FILE" ]]; then
+    copilot_args+=(--usage-output-file "$RUN_USAGE_FILE")
+  fi
+  if [[ "$RTK_MODE" == "true" ]]; then
+    copilot_args+=(--plugin-dir "$RTK_PLUGIN_DIR")
+  fi
 
   # Use Copilot's native name-on-launch option, not a wrapper-only alias
   # written after exit. Copilot owns persistence and any later /rename.
@@ -985,12 +1420,22 @@ run_copilot() {
   local started_epoch
   started_epoch=$(date +%s)
 
-  echo -e "${CYAN}Starting copilot...${RESET}\n"
-  if [[ -n "$session_id" ]]; then
-    copilot --resume="$session_id" "${copilot_args[@]}" || true
+  if [[ "$RTK_MODE" == "true" ]]; then
+    apply_rtk_env
+    echo -e "${YELLOW}Mode: RTK${RESET} ${DIM}— rtk ${SUPPORTED_RTK_LABEL} hook for this launch only; allowlisted test/build commands become \`rtk <command>\` (Copilot permissions unchanged). Run ${COPILOT_S_RUN_ID}${RESET}"
   else
-    copilot "${copilot_args[@]}" || true
+    echo -e "${DIM}Mode: normal${RESET}"
   fi
+  echo -e "${CYAN}Starting copilot...${RESET}\n"
+  local copilot_rc=0
+  if [[ -n "$session_id" ]]; then
+    copilot --resume="$session_id" "${copilot_args[@]}" || copilot_rc=$?
+  else
+    copilot "${copilot_args[@]}" || copilot_rc=$?
+  fi
+  REPORT_EXIT_CODE="$copilot_rc"
+  REPORT_LAUNCHED_EPOCH="$started_epoch"
+  REPORT_ENDED_EPOCH="$(date +%s)"
 
   flush_stdin
 
@@ -1019,6 +1464,14 @@ run_copilot() {
   fi
   rm -f "$before_file"
 
+  # Session report link: the resumed id (helper side), or ONLY the strictly
+  # detected single new session directory — never the looser detection
+  # above. The helper cross-checks it against hook/OTEL evidence and records
+  # "unknown" on any ambiguity.
+  if [[ -z "$session_id" && $enroll_rc -eq 0 && -n "$enroll_id" ]]; then
+    REPORT_SESSION_ID="$enroll_id"
+  fi
+
   local final_id="${detected_id:-$session_id}"
   # detect_new_session only attributes a new directory whose cwd is $PWD, so
   # a new session with a mismatched (or missing) workspace cwd leaves no id
@@ -1028,6 +1481,9 @@ run_copilot() {
     warn_context_not_enrolled
   fi
   post_session "${final_id:-}" "$task_id" "$metrics_mode" "$started_epoch"
+  # Safety net: finalize the run report even when the stop flow had no
+  # session to show (no-op if post_session already finalized it).
+  finalize_run_report
   exit 0
 }
 
@@ -1424,6 +1880,10 @@ ${BOLD}Usage:${RESET}
   copilot-s --all | -a          List every session, across all directories
   copilot-s --report TASK_ID    Print/regenerate the usage report for a task
   copilot-s --task TASK_ID      Alias for --report
+  copilot-s --rtk [...]         Launch this one session in RTK mode (see below)
+  copilot-s --session-report SESSION_ID
+                                Print the per-launch report for a session
+                                (read-only; normal and RTK launches by mode)
   copilot-s --help | -h         Show this help and exit
   copilot-s --version | -v      Show the version and exit
 
@@ -1451,12 +1911,37 @@ ${BOLD}Features:${RESET}
   - Per-task usage reports (\`--report\`/\`--task\`), attributed via the current
     git branch (KEY-123-style IDs only) or an interactive prompt that also
     accepts free-form task names
+  - Per-launch session reports for EVERY launch (normal and RTK): exact
+    session link or "unknown", exit status, wall clock, model calls/tokens
+    from the own OTEL file of the launch, an estimated cost frozen with official
+    list prices, and RTK aggregates. Metadata only (no prompts, commands or
+    output), under ~/.copilot/session-reports (0700/0600). Inspect with
+    \`copilot-s --session-report SESSION_ID\` or copilot-session-report.py
+    launch|session|compare|mark-outcome.
+
+${BOLD}RTK mode (--rtk):${RESET}
+  Opt-in per launch, never remembered. Requires rtk ${SUPPORTED_RTK_LABEL} exactly
+  and refuses to launch if RTK user config/filters/trust store or an
+  existing \`rtk hook\` Copilot configuration could alter results. A
+  session-local hook (--plugin-dir, never installed) rewrites only simple
+  test/build commands (e.g. \`cargo test\`, \`pytest\`, \`npm run build\`) to
+  \`rtk <command>\`; anything with pipes, redirects, quotes, variables or
+  other shell syntax, and review/exact-output tools (git, diff, grep, cat),
+  runs unchanged. Copilot permissions are NOT widened: the rewritten
+  \`rtk ...\` command is checked by your normal rules and may prompt. If RTK
+  fails during the session the command is denied (never run unfiltered).
+  Raw RTK data (its history DB stores command lines; tee/recall keep
+  output) stays in the private raw/ folder of the launch and is never deleted
+  automatically.
 
 ${BOLD}Environment:${RESET}
   COPILOT_TASK_REPORTS_DIR       Override where task usage reports are written
   COPILOT_TASK_REPORT_HELPER     Override the path to copilot-task-report.py
   COPILOT_SESSION_CLEANUP_HELPER Override the path to copilot-session-cleanup.py
   COPILOT_MODEL_REFRESH_HELPER   Override the path to copilot-model-refresh.py
+  COPILOT_SESSION_REPORT_HELPER  Override the path to copilot-session-report.py
+  COPILOT_SESSION_REPORTS_DIR    Override where per-launch run records are kept
+  COPILOT_S_RTK_PLUGIN_DIR       Override the RTK hook plugin directory (absolute)
 
 Verify install with: copilot-s --help
 EOF
@@ -1484,7 +1969,15 @@ main() {
   # Never prompts, never touches session/marker state, never launches
   # `copilot`.
   local arg skip_operand=false
+  local want_session_report_value=false found_session_report=false session_report_id=""
   for arg in "$@"; do
+    if [[ "$want_session_report_value" == "true" ]]; then
+      want_session_report_value=false
+      if [[ "$arg" != -* ]]; then
+        session_report_id="$arg"
+        continue
+      fi
+    fi
     if [[ "$skip_operand" == "true" ]]; then
       skip_operand=false
       [[ "$arg" != "--" ]] && continue
@@ -1493,11 +1986,19 @@ main() {
       --) break ;;
       --help|-h) show_help; exit 0 ;;
       --version|-v) echo "copilot-s ${COPILOT_S_VERSION}"; exit 0 ;;
+      --session-report) found_session_report=true; want_session_report_value=true; continue ;;
+      --session-report=*) found_session_report=true; session_report_id="${arg#--session-report=}"; continue ;;
     esac
     if copilot_option_takes_value "$arg"; then
       skip_operand=true
     fi
   done
+
+  # --session-report SESSION_ID: read-only, before any setup side effect.
+  if [[ "$found_session_report" == "true" ]]; then
+    show_session_report "$session_report_id"
+    exit $?
+  fi
 
   # Past informational-argument handling: this is a real session-manager
   # invocation, so set up OTEL telemetry (has filesystem side effects) now.
@@ -1562,6 +2063,10 @@ main() {
     elif [[ "$arg" == "--all" || "$arg" == "-a" ]]; then
       SHOW_ALL=true
       continue
+    elif [[ "$arg" == "--rtk" ]]; then
+      # Wrapper-only, per-launch flag: consumed here, never passed to copilot.
+      RTK_MODE=true
+      continue
     fi
     remaining+=("$arg")
   done
@@ -1571,11 +2076,30 @@ main() {
     exit $?
   fi
 
+  # RTK mode: read-only preflight before the menu, so a refusal happens
+  # before any session choice or prompt (the full check, including a smoke
+  # test of the real `rtk hook copilot`, runs again right before launch).
+  if [[ "$RTK_MODE" == "true" ]]; then
+    if [[ ! -f "$SESSION_REPORT_HELPER" ]] || ! command -v python3 >/dev/null 2>&1; then
+      echo -e "${RED}RTK mode needs python3 and copilot-session-report.py ($SESSION_REPORT_HELPER). Nothing was launched.${RESET}" >&2
+      exit 1
+    fi
+    if ! python3 "$SESSION_REPORT_HELPER" preflight --mode rtk --cwd "$PWD" --plugin-dir "$RTK_PLUGIN_DIR" >/dev/null; then
+      echo -e "${RED}RTK mode refused (see above). Nothing was launched.${RESET}" >&2
+      exit 1
+    fi
+  fi
+
   set -- "${remaining[@]+"${remaining[@]}"}"
 
   echo -e "${BOLD}${CYAN}┌──────────────────────────────┐${RESET}"
   echo -e "${BOLD}${CYAN}│  Copilot Session Manager     │${RESET}"
   echo -e "${BOLD}${CYAN}└──────────────────────────────┘${RESET}"
+  if [[ "$RTK_MODE" == "true" ]]; then
+    echo -e "  ${BOLD}${YELLOW}[RTK mode]${RESET} ${DIM}this launch only — rtk ${SUPPORTED_RTK_LABEL} hook for simple test/build commands${RESET}"
+  else
+    echo -e "  ${DIM}[normal mode]${RESET}"
+  fi
 
   if list_sessions; then
     select_session "$@"
