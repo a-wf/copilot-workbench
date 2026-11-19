@@ -17,6 +17,14 @@
 #   - Quarantined empty sessions (~/.copilot-s-quarantine) — restore them
 #     with copilot-session-cleanup.py restore --batch <batch> before
 #     uninstalling if you still want them back in session-state.
+#   - Quarantined run reports (~/.copilot/copilot-s-report-quarantine) —
+#     restore them with copilot-report-cleanup.py restore --batch <batch>
+#     --yes before uninstalling if you still want them back.
+#   - The purge journals in either quarantine's private .purge/ folder
+#     (compact records of permanent purges). Uninstalling never purges a
+#     quarantine; to free that space, purge batches (copilot-s menu `x` or
+#     `r` -> 4, or `purge --batch <batch>`) BEFORE uninstalling, because the
+#     purge engine copilot_quarantine_purge.py is removed with the tools.
 #   - Subagent model-refresh state (~/.copilot/model-refresh: confirmed
 #     overrides, your user-config.json pins/availability list, backups) and
 #     what an applied refresh wrote outside it (the /subagents values in
@@ -151,7 +159,7 @@ if $DRY_RUN; then
 else
   log "${GREEN}Uninstall complete.${RESET} Removed $removed_count toolkit-managed path(s)."
   rm -f "$MANIFEST_FILE"
-  log "Note: Task reports, task state, session state, per-launch session reports (incl. their private raw folders), quarantined sessions, and your pricing config were left untouched."
+  log "Note: Task reports, task state, session state, per-launch session reports (incl. their private raw folders), quarantined sessions and run reports (incl. their purge journals), and your pricing config were left untouched. Quarantines are never purged by uninstall."
   if [[ -f "$HOME/.copilot/model-refresh/state.json" ]]; then
     log "${YELLOW}Note:${RESET} subagent model-refresh state remains in $HOME/.copilot/model-refresh. If you applied overrides, restore them from the checkout with: python3 bin/copilot-model-refresh.py reset --yes"
   fi

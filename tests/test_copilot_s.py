@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COPILOT_S = os.path.join(REPO_ROOT, "bin", "copilot-s")
@@ -73,14 +74,15 @@ class BaseHomeTestCase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="copilot-s-test-home-")
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        environment = mock.patch.dict(os.environ, self.env(), clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def env(self, extra=None):
-        e = dict(os.environ)
-        e["HOME"] = self.home
-        for key in list(e):
-            if not key.startswith(("COPILOT_", "XDG_")):
-                continue
-            e.pop(key, None)
+        e = {"HOME": self.home, "TMPDIR": self.home,
+             "XDG_CONFIG_HOME": os.path.join(self.home, "xdg-config"),
+             "XDG_DATA_HOME": os.path.join(self.home, "xdg-data"),
+             "LANG": "en_US.UTF-8", "TERM": "dumb"}
         # Any real task-report helper reached by a shell subprocess must
         # remain network-free, even if the ambient environment enables
         # automatic official-price refreshes.
@@ -1937,6 +1939,110 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
         self.assertIn("Bye!", output)
         self.assertFalse(os.path.exists(self.copilot_log))
         self.assertEqual(self._commands("context-update"), [])
+
+
+class TestRTKAutomaticPublication(BaseHomeTestCase):
+    """Real launcher/helper/worker, but only synthetic Copilot and RTK."""
+
+    CONTEXT_SUMMARY = TestContextMetricsSessionManager.CONTEXT_SUMMARY
+    _run_tty = TestContextMetricsSessionManager._run_tty
+    _env = TestContextMetricsSessionManager._env
+    _session = TestContextMetricsSessionManager._session
+
+    def setUp(self):
+        TestContextMetricsSessionManager.setUp(self)
+        from pathlib import Path
+        import test_copilot_session_report as fixture
+        self.fixture = fixture
+        fixture.write(Path(self.fake_bin) / "rtk",
+                      "#!%s\n%s" % (sys.executable, fixture.FAKE_RTK), True)
+        (Path(self.fake_bin) / "python3").symlink_to(sys.executable)
+        self.observed = Path(self.home) / "reporter-events.jsonl"
+        self.publisher_pid = Path(self.home) / "publisher-pid"
+        self.release_copilot = Path(self.home) / "release-copilot"
+        self.reporter = Path(self.home) / "observed-session-report.py"
+        fixture.write(self.reporter, (
+            "import json,os,pathlib,runpy,sys\n"
+            "command=sys.argv[1]\n"
+            "pidfile=pathlib.Path(os.environ['TEST_PUBLISHER_PID'])\n"
+            "if command=='rtk-publisher': pidfile.write_text(str(os.getpid()))\n"
+            "living=None\n"
+            "if command=='finish' and pidfile.exists():\n"
+            "    try: os.kill(int(pidfile.read_text()),0); living=True\n"
+            "    except ProcessLookupError: living=False\n"
+            "with open(os.environ['TEST_REPORTER_EVENTS'],'a') as f:\n"
+            "    f.write(json.dumps({'command':command,'publisher_alive_at_finish':living})+'\\n')\n"
+            "runpy.run_path(%r,run_name='__main__')\n" % str(fixture.HELPER)))
+        # The synthetic Copilot writes its private DB, waits for the real
+        # launch-scoped worker's first active publication, then lets the PTY
+        # observer release it. It cannot run any installed CLI.
+        with (Path(self.fake_bin) / "copilot").open("a") as out:
+            out.write(
+                "\nimport time\n"
+                "if os.environ.get('RTK_DB_PATH'):\n"
+                "    pathlib.Path(os.environ['RTK_DB_PATH']).write_text(%r)\n"
+                "    rid=pathlib.Path(os.environ['COPILOT_S_RUN_DIR']).name\n"
+                "    pub=pathlib.Path(os.environ['HOME'])/'.copilot/copilot-s-rtk-export/v1/runs'/(rid+'.json')\n"
+                "    deadline=time.monotonic()+10\n"
+                "    while not pub.exists() and time.monotonic()<deadline: time.sleep(.025)\n"
+                "    assert pub.exists(), 'no automatic active publication'\n"
+                "    print('FAKE_AUTO_ACTIVE',flush=True)\n"
+                "    while not pathlib.Path(os.environ['TEST_RELEASE_COPILOT']).exists() and time.monotonic()<deadline:\n"
+                "        time.sleep(.025)\n" % json.dumps(fixture.GAIN))
+        self._session("automatic-session")
+
+    def automatic_env(self, **extra):
+        return self._env(dict({
+            "COPILOT_SESSION_REPORT_HELPER": str(self.reporter),
+            "COPILOT_S_RTK_PLUGIN_DIR": str(self.fixture.PLUGIN),
+            "TEST_PUBLISHER_PID": str(self.publisher_pid),
+            "TEST_REPORTER_EVENTS": str(self.observed),
+            "TEST_RELEASE_COPILOT": str(self.release_copilot),
+            "FAKE_COPILOT_MODE": "idle",
+        }, **extra))
+
+    def events(self):
+        return [json.loads(s) for s in self.observed.read_text().splitlines()] if self.observed.exists() else []
+
+    def test_rtk_worker_publishes_without_action_and_is_reaped_before_finalization(self):
+        from pathlib import Path
+        def observe_active():
+            paths = list((Path(self.home) / ".copilot/copilot-s-rtk-export/v1/runs").glob("*.json"))
+            self.assertEqual(len(paths), 1)
+            publication = json.loads(paths[0].read_bytes())
+            self.assertEqual(publication["run"]["record_state"], "active-unfinalized")
+            self.assertEqual(publication["run"]["session"]["id"], "automatic-session")
+            self.assertEqual(publication["run"]["rtk"]["stats"]["total_commands"], 2)
+            self.assertTrue(self.publisher_pid.exists())
+            self.release_copilot.write_text("exit synthetic Copilot")
+            return ""
+        status, output, actions = self._run_tty(
+            self.automatic_env(),
+            actions=[("Select session to resume", "1\n"), ("FAKE_AUTO_ACTIVE", observe_active), ("[K/r/d]:", "k\n")],
+            timeout=25, copilot_s_args=["--rtk"])
+        self.assertEqual(status, 0, output)
+        self.assertEqual(actions, 3, output)
+        events = self.events()
+        self.assertEqual(sum(e["command"] == "rtk-publisher" for e in events), 1)
+        finishes = [e for e in events if e["command"] == "finish"]
+        self.assertEqual(len(finishes), 1)
+        self.assertIs(finishes[0]["publisher_alive_at_finish"], False, "finish must follow worker reap")
+        path = next((Path(self.home) / ".copilot/copilot-s-rtk-export/v1/runs").glob("*.json"))
+        self.assertEqual(json.loads(path.read_bytes())["run"]["record_state"], "finalized")
+        self.assertFalse((Path(self.home) / ".copilot/copilot-s-rtk-export/v1.json").exists())
+
+    def test_normal_and_failed_rtk_preflight_never_start_worker(self):
+        status, output, _ = self._run_tty(
+            self.automatic_env(),
+            actions=[("Select session to resume", "1\n"), ("[K/r/d]:", "k\n")])
+        self.assertEqual(status, 0, output)
+        self.assertNotIn("rtk-publisher", [e["command"] for e in self.events()])
+        status, output, _ = self._run_tty(
+            self.automatic_env(TEST_RTK_VERSION="0.0.0"), copilot_s_args=["--rtk"],
+            actions=[("Select session to resume", "1\n")])
+        self.assertNotEqual(status, 0, output)
+        self.assertIn("RTK mode refused", output)
+        self.assertNotIn("rtk-publisher", [e["command"] for e in self.events()])
 
 
 class TestModelRefreshMenu(BaseHomeTestCase):

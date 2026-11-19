@@ -200,7 +200,7 @@ This installs:
 
 | What | Installed to | Method |
 |---|---|---|
-| `copilot-s`, `copilot-task-report.py`, `copilot-session-cleanup.py`, `copilot-model-refresh.py`, `copilot-session-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
+| `copilot-s`, `copilot-task-report.py`, `copilot-session-cleanup.py`, `copilot-report-cleanup.py`, `copilot-model-refresh.py`, `copilot-session-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
 | Session-local RTK hook plugin (`copilot-s --rtk` only) | `~/.local/bin/copilot-s-rtk-plugin/` | symlink (or copy with `--copy`), file by file; loaded per launch with `--plugin-dir`, **never** installed as a Copilot plugin |
 | 7 agent definitions | `~/.copilot/agents/` | symlink (or copy with `--copy`) |
 | Orchestrator instructions | `~/.copilot/copilot-instructions.md` | symlink (or copy with `--copy`) |
@@ -307,7 +307,9 @@ removed.
   delete is cancelled) rather than rewritten without the lock.
 
 Restore a batch (asks for `yes`; refuses ID collisions and changed
-quarantined contents; re-adds a recorded session-list row only if missing):
+quarantined contents; re-adds a recorded session-list row only if missing;
+moves under the session-list lock; refuses any batch whose permanent purge
+was started):
 
 ```bash
 copilot-session-cleanup.py list
@@ -318,8 +320,188 @@ Limitations: Copilot's own session history/index (for example
 `session-store.db`) is never read or modified, so native history views may
 still list quarantined sessions; the activity check narrows but cannot
 eliminate a race with a Copilot process starting at the same moment.
-Quarantine is never purged automatically — remove old batches yourself once
-you are sure you do not need them.
+Quarantine is never purged automatically — purge a batch explicitly (menu
+`x`, see [Permanently purging a quarantine batch](#permanently-purging-a-quarantine-batch-menu-x-and-r--4-irreversible))
+once you are sure you do not need it.
+
+### Cleaning run reports and private RTK data (menu `r`, recoverable)
+
+Menu option `r) Clean run reports and private RTK data (recoverable)` — in
+the session list **and** in the "No saved sessions found" menu, so old
+reports can be managed even without saved sessions — opens a small submenu:
+
+1. **Preview, then quarantine.** First asks `Also include run reports
+   finalized within the last 24h? [y/N]` (default No), then runs the
+   read-only `copilot-report-cleanup.py preview`. Only after you type
+   exactly `yes` are the **exact previewed** runs (run id + fingerprint, same
+   recent-runs choice) passed to `apply`.
+2. **List quarantine batches** (read-only).
+3. **Restore a quarantine batch:** pick a batch, read the read-only restore
+   plan, type exactly `yes`.
+4. **Permanently purge ONE quarantine batch** (frees disk space;
+   IRREVERSIBLE) — see
+   [Permanently purging a quarantine batch](#permanently-purging-a-quarantine-batch-menu-x-and-r--4-irreversible).
+   Listed in the submenu but deliberately not in its short `Choose [...]`
+   prompt.
+
+Enter/`b` returns to the session menu. Cancelling, a helper failure or a
+success always returns to the menu — Copilot is never launched from here.
+The helper is found next to `copilot-s` (falling back to
+`~/.local/bin/copilot-report-cleanup.py`); override it with
+`COPILOT_REPORT_CLEANUP_HELPER`.
+
+- **Scope — all workspaces:** every per-launch run report under
+  `~/.copilot/session-reports/runs/<run-id>/` (run records do not store the
+  working directory, so there is no current-directory filter), each moved as
+  a whole folder: `run.json`, the hook log and the private `raw/` folder
+  (Copilot's usage file; for RTK launches RTK's own history DB, tee/recall
+  stores, config and preflight folders) — plus, for RTK launches, the run's
+  own publication `~/.copilot/copilot-s-rtk-export/v1/runs/<run-id>.json`.
+- **Never touched:** the global RTK database/config, Copilot's
+  session-state, logs and OTEL files (paths recorded inside `run.json` are
+  never used), publications without a run report, and reports under a
+  custom `COPILOT_SESSION_REPORTS_DIR` (preview/apply refuse to run while it
+  points elsewhere than the default root). Each launch is handled on its
+  own; other launches and resumes of the same session are never touched.
+- **Eligible only if all hold (fail closed):** a finalized launch —
+  `completed`, `copilot-error` or `interrupted` — whose record has schema
+  `copilot-s.session-run` with integer `schema_version` 1, the folder's run
+  id, a known mode/launch kind, a state/outcome/state-reason consistent
+  with an integer exit code, and valid, ordered `created_at` ≤
+  `launched_at` ≤ `ended_at` ≤ `finalized_at`; finalized **and** every file
+  last changed more than 24h ago (the opt-in only waives this minimum age;
+  nothing may be in the future); plain private files and folders only (no
+  symlink, hard link, FIFO/socket/device, foreign owner, group/world-writable
+  entry or other filesystem; bounded size and depth); an RTK publication, if
+  present, is a private regular file of schema `copilot-s.rtk-launch` v1 for
+  the same RTK run; the run id is not in the current environment; and a
+  system `lsof` (macOS/Linux) positively reports that nothing has the run
+  folder, any file/folder inside it, or its publication open. Incomplete
+  (active), `report-failure`, RTK-preflight-failed, unknown or malformed
+  runs are **always** kept, whatever their age. The preview shows kept runs
+  counted by reason; at most 100 runs per batch.
+- **Moves, never deletes:** after re-validating each run under its locks
+  (fingerprint must still match the preview), its publication and then its
+  run folder are moved with an atomic no-replace rename on the same
+  filesystem into `~/.copilot/copilot-s-report-quarantine/<batch>/`
+  (`runs/`, `publications/`, `manifest.json`; `0700`). The manifest records
+  every step durably, so a crash part-way is recoverable with `restore`.
+  **No disk space is freed** by the quarantine — the data stays on disk until
+  you purge that batch explicitly (submenu `4`); nothing is ever purged
+  automatically.
+- **Coordination with the report producer:** cleanup and restore take the
+  quarantine's own transaction lock, then the RTK publication
+  reconciliation lock, each run's own lock and the global publication
+  capacity lock (in that order), so `finish`, the live publisher and
+  start-up reconciliation can never write into a moved run folder or
+  republish a moved run. Preview and list create no files, folders or locks.
+- **Moved launches disappear from reports** (`copilot-s --session-report`,
+  `compare`) and from viewers of the publication until restored.
+
+Command-line equivalent:
+
+```bash
+copilot-report-cleanup.py preview [--include-recent]        # read-only
+copilot-report-cleanup.py list                              # read-only
+copilot-report-cleanup.py restore --batch <batch>           # read-only plan
+copilot-report-cleanup.py restore --batch <batch> --yes     # restore
+```
+
+`apply` reads the preview's `CANDIDATE` lines on stdin exactly as printed
+(`CANDIDATE<TAB><run-id><TAB><fingerprint>[<TAB>include-recent]`; no other
+format is accepted — the menu forwards them unmodified). Restore never overwrites or merges: it refuses a run whose id (or
+publication) already exists at the original place and any quarantined data
+whose fingerprint changed; a publication is restored only after its run
+folder and only while the publication folder is below its 256-file cap.
+
+### Permanently purging a quarantine batch (menu `x` and `r` → `4`, irreversible)
+
+Quarantine (menus `c` and `r`) never frees disk space. To release it, purge
+**one** quarantine batch at a time, explicitly:
+
+- **Quarantined empty sessions:** menu `x) Permanently purge a
+  quarantined-session batch (irreversible)` — in the session list and in the
+  "No saved sessions found" menu (listed there but not in the short prompt).
+- **Quarantined run reports and private RTK data:** submenu `r` → `4`.
+
+Each lists the batches with their purge status (read-only `purge-list`),
+lets you pick one by number (Enter cancels), then runs the helper's
+interactive `purge`, which first prints the **exact inventory** (each
+session / run report with its file and folder counts and allocated size,
+plus the batch's own manifest and folders), the total, the **estimated
+reclaimable space** and a snapshot id. It deletes only after you type, on
+the terminal, exactly the phrase it shows:
+
+```text
+PURGE sessions 20261113-184600-1a2b3c4d 3f9a1c2b7e4d      # or: PURGE reports ...
+```
+
+Anything else, Enter alone, or no answer within 120 seconds cancels;
+typed-ahead input is discarded; there is no `yes`/`--force` bypass and
+`purge` refuses to run without a real terminal. No lock is held while it
+waits for you. Afterwards it takes the quarantine's existing lock, rebuilds
+the whole plan and deletes only if the snapshot is **identical** to the one
+you confirmed.
+
+- **Eligible batches only (fail closed):** no purge was ever started for the
+  batch; its manifest is valid and **fully settled** — every entry `moved`
+  or `skipped`, at least one `moved` (batches still being applied or
+  restored, partly restored, `failed`, `pending` or with an unfinished
+  session-list update are refused); every moved session / run folder /
+  publication is present and still matches the fingerprint recorded when it
+  was quarantined (the same checks `restore` uses), skipped entries left
+  nothing in the batch, and nothing else is in it; every file and folder is
+  plain, yours, single-link, not group/world-writable, without
+  setuid/setgid/sticky bits or immutable/append-only flags, on the batch's
+  own mount (macOS: `fstatfs` mount identity; Linux: `mnt_id` plus no mount
+  point at or inside the batch in `/proc/self/mountinfo` — bind mounts
+  included), within 20,000 entries and 24 levels; and a system `lsof`
+  positively reports that nothing has any of it open. Unknown is refused.
+- **Estimate, not a promise:** the reclaimable space is the sum of every
+  entry's allocated blocks (`st_blocks` × 512). APFS clones and snapshots
+  (including Time Machine local snapshots), files still open elsewhere,
+  compression and filesystem metadata can make the real figure differ.
+  Deletion is **not** secure erasure.
+- **How it deletes:** before the first deletion it durably writes a compact
+  journal `<quarantine>/.purge/<batch>.json` (`started`), then removes only
+  the inventoried entries, bottom-up, each relative to its parent folder's
+  descriptor after re-checking (without following symlinks) that the entry
+  and every parent folder are still exactly the confirmed ones: payload
+  first, then the manifest, then the batch folder. It never lists new
+  targets, never changes permissions and never uses a recursive delete.
+  The journal then says `complete` and is kept.
+- **Partial purges:** the first discrepancy, I/O error, time limit (5 min)
+  or Ctrl-C stops it; the journal says `partial` (or stays `started` after a
+  crash) and the output reports what is left. A batch with any journal can
+  no longer be restored and is never purged or retried automatically —
+  `list`/`purge-list` mark it; review what is left yourself.
+- **Locks:** sessions use the existing session-list lock
+  (`~/.copilot-sessions.lock`), which `restore` now also holds while moving;
+  run reports use the quarantine's `.transaction.lock`, which `apply` and
+  `restore` hold for their whole run. A purge never opens or creates
+  anything at the live session or report locations.
+- **Limitations:** macOS and Linux only; a hostile process running as you
+  that swaps a file between the final check and the unlink cannot be ruled
+  out portably (the copilot-s tools are excluded by the locks, everything
+  else must be quiescent, checked with `lsof`); Linux `chattr +i` and ACLs
+  denying deletion are not inspected and would stop the purge part-way.
+
+Command-line equivalents (path options for the session helper go before
+the subcommand, as for its other commands):
+
+```bash
+copilot-session-cleanup.py purge-list                      # read-only
+copilot-session-cleanup.py purge-preview --batch <batch>   # read-only
+copilot-session-cleanup.py purge --batch <batch> [--snapshot <digest>]
+copilot-report-cleanup.py  purge-list | purge-preview --batch <batch> | purge --batch <batch>
+```
+
+`purge-preview` prints `PURGE_SNAPSHOT<TAB><kind><TAB><batch><TAB><digest>`
+(or `PURGE_INELIGIBLE<TAB><batch>`, exit 1); passing that digest to
+`purge --snapshot` makes it refuse unless the batch is still exactly what you
+previewed. `purge-list` prints one `PURGEABLE<TAB><batch>` line per
+candidate. Exit status of `purge`: 0 purged or cancelled, 1 refused, error
+or partial, 130 interrupted.
 
 ### Refreshing subagent models from current prices (menu `p`)
 
@@ -676,6 +858,166 @@ records the native summary as unavailable.
   yourself when you no longer need them.
 - If `copilot-s` itself is killed while Copilot runs, the record stays
   `incomplete` (no outcome is invented).
+
+#### Automatic RTK publication for external viewers
+
+`copilot-s --rtk` keeps RTK statistics in each launch's **private** database,
+so tools that read RTK's default/global history (such as the optional global
+RTK card in the [Agentic Watcher](https://github.com/a-wf/agentic-watcher)
+macOS app) never see them. copilot-s therefore publishes a small numeric
+file per RTK launch **automatically** — there is no export command to run.
+The optional copilot-s per-launch card in Agentic Watcher reads these files
+on its own (off by default in its Settings; once enabled it stays current).
+This project is public at <https://github.com/a-wf/copilot-workbench>.
+
+- **Location:** `~/.copilot/copilot-s-rtk-export/v1/runs/<run-id>.json`,
+  one file per launch (parallel, resumed and multi-launch sessions each keep
+  their own run id and file; nothing overwrites another launch). New
+  folders are created `0700`, files are written `0600` atomically (temp
+  file + `os.replace`) after exact-contract validation (at most 16 KiB per
+  file). A symlinked, foreign-owned or group/world-writable `~/.copilot` or
+  publication folder, or an existing publication that is not a private
+  regular single-link file, is refused and never repaired. The `--rtk`
+  launch itself is never affected by a publication failure. The retired
+  manual `~/.copilot/copilot-s-rtk-export/v1.json` is ignored.
+- **While a launch runs:** right before Copilot starts, copilot-s starts
+  that launch's own background publisher (`copilot-session-report.py
+  rtk-publisher`, internal — not a user command, never a daemon). It first
+  publishes after ~2 s, then about **every 30 s**, runs at most one
+  `rtk gain --format json` at a time (RTK calls never overlap) with the RTK
+  binary recorded at launch (re-validated, never looked up on `PATH`:
+  absolute real path, regular executable owned by you or root, not
+  group/world-writable, no setuid/setgid, supported version), against that
+  launch's private database only (inherited `RTK_*` variables removed),
+  with a 15 s timeout and 1 MiB of stdout read incrementally. RTK may create
+  or modify that private database. If RTK has recorded nothing yet the file
+  says so (`none-recorded`); if a measurement fails, the previous file is
+  left untouched — its `published_at` is not refreshed, so viewers see it
+  age (Agentic Watcher stops counting it after 2 minutes) — and nothing
+  fresher is invented. The publisher leads its own process group, ignores
+  Ctrl-C meant for Copilot, checks every second that its parent is still
+  this launcher (`getppid`, robust to PID reuse) and exits on SIGTERM/SIGHUP;
+  a running `rtk gain` is cancelled and reaped. Right after Copilot exits —
+  and always before the run is finalized — copilot-s stops it (SIGTERM to
+  its group, up to 5 s, then SIGKILL) and reaps it, so no late active
+  result can replace the final figures; each write is also re-checked under
+  the run lock against the record's finalization.
+- **When a launch finalizes:** `finish` publishes the statistics it stored
+  at finalization (RTK is not run again) while still holding the run lock,
+  replacing the active file. A failure there never changes the run record,
+  report or exit status; it is retried by the next reconciliation.
+- **Historical and missed launches (reconciliation):** every copilot-s
+  launch with a session report (any mode) runs one bounded, resumable
+  reconciliation slice before Copilot starts: at most 256 run folders probed
+  (metadata only) in run-id order after a small persisted cursor
+  (`v1/reconcile-cursor`, wrapping around), at most 32 records loaded, a
+  ~1 s time budget (checked between runs), skipped when another slice holds
+  its non-waiting lock. Finalized
+  RTK-mode runs finalized within the last **14 days** are (re)published from
+  their stored records when the publication is missing or older than the
+  record/hook log (no RTK is ever run for this); backfill never evicts and
+  adds new files only below 128. **Capacity:** at most 256 files; when a
+  running launch's publisher or `finish` needs a new file at the cap, the
+  oldest *finalized* publications (by `finalized_at`; only files that pass
+  the full publication contract) are evicted from this sanitized cache to
+  make room — run records and reports are untouched. Active publications
+  are never evicted: if all 256 are active, the new write fails closed.
+  All writes are serialized by a capacity lock (`v1/.capacity.lock`).
+  Publications
+  not rewritten for 14 days, whose record is no longer a publishable
+  RTK-mode run, or (default reports root only) whose run folder was deleted
+  are withdrawn; stale temp files older than 1 h are removed. Nothing is
+  published for normal-mode or never-launched (failed preflight) runs, and
+  folders are created only once an RTK-mode run exists.
+- **Upgrading:** launches already running from an older copilot-s have no
+  publisher; reopen or resume them through the updated launcher for live
+  updates. Their final figures are published automatically once finalized
+  (at the latest by reconciliation at a later launch).
+- **Contents (numbers and labels only):** schema `copilot-s.rtk-launch`
+  version 1, producer and helper version, `published_at` (last successful
+  write), and for the launch: run id, mode `rtk`,
+  `record_state` (`finalized` / `active-unfinalized`), launch kind, creation
+  and finalization times, the session link and its proof, and RTK's
+  availability (`available` / `none-recorded` / `unavailable`), measurement
+  kind (`measured-while-active` / `stored-at-finalization`) and
+  `measured_at` (distinct from `published_at`) plus, only when
+  available, `total_commands`, `total_input`, `total_output`, `total_saved`
+  (signed: may be negative when RTK made output larger), `total_time_ms`,
+  `avg_time_ms`, `oversized_excluded` and `avg_savings_pct` (finite, may be
+  negative, or `null`). Missing data is `unavailable`, never 0. Never
+  included: commands, prompts, output, file or private-folder paths, error
+  text, costs or billing data. Run records, reports and accounting are
+  never changed.
+- **Session link (publication only, stricter than the run record's link):**
+  evaluated from this run's own explicit evidence only, and
+  confirmed solely by: `launcher-selected-resume` — the launcher recorded a
+  resume of exactly that session, and no session id in the run's own hook
+  log and no conversation id in its own per-run OTEL file names another
+  session — or `single-conversation-id-in-own-otel-file` — a new launch
+  whose own OTEL file names exactly one conversation id, with every hook
+  session id equal to it. Directory discovery (the run record's
+  `unique-new-session-dir` basis), times, cwd and "the latest" never yield
+  a link. While a run is **not finalized yet**, its publisher reads its own
+  per-run OTEL file and hook log incrementally (only what was appended since
+  the previous cycle; only complete lines — an unterminated last line that
+  is still being written is read once complete). A **finalized** run (whose
+  record no longer holds the OTEL path) is linked only if its stored link is
+  confirmed with exactly one of the two proofs above and its stored
+  evidence agrees: strict, valid counters showing at most one hook session
+  id and one conversation id and no ignored other id; OTEL diagnostics with
+  no malformed line, no chat span without or with another conversation id,
+  and exactly one conversation id when chat spans exist (a new launch needs
+  a present OTEL file with that one id; an explicit resume may have no OTEL
+  file); a stored hook summary without malformed lines; and a fresh secure
+  scan of the hook log that names that session as many times as stored and
+  no other. Missing, boolean or invalid counters are never read as 0.
+  Conflicting or several ids, a malformed or overlong record, an
+  over-64 MiB, replaced, truncated or removed evidence file, a symlinked,
+  hard-linked, foreign-owned or group/world-writable evidence file, or a
+  hook record without a session id make the link `unknown` (an ambiguity is
+  never resolved in favour of another candidate); a previously confirmed
+  link that becomes unknown is withdrawn by republishing the launch as
+  `unknown`. The evidence files are read
+  with a publication-specific bounded reader: opened relative to their parent
+  directories without following symlinks, then checked on the open
+  descriptor (regular, single link, owned by you, not group/world-writable;
+  never repaired). For finalized runs, the original OTEL file cannot be
+  revalidated because its path is no longer stored: that part of the proof
+  trusts the canonical diagnostics saved at finalization, whose original
+  scan did not enforce these publication-specific ownership/mode/size
+  checks. The fresh hook scan still enforces them. **Known limitation:** a
+  new (non-resume) launch whose canonical record stores
+  `unique-new-session-dir` as its basis (the usual case when the launcher
+  detects the new session directory) is published as `unknown` once
+  finalized, even if its active publications were linked through its own
+  OTEL file. The run record's own link and reports are unchanged. A
+  link says that **this launch** used RTK
+  mode in that session — not that the whole session, other launches of it,
+  or its sub-agents did, and not that any process is still running: the
+  publication carries no sub-agent → launch proof.
+  Several launches (RTK or not, parallel or resumed) can belong to one
+  session; each keeps its own run id and file, and figures are never summed
+  into a session or global total.
+
+```json
+{
+  "schema": "copilot-s.rtk-launch",
+  "schema_version": 1,
+  "producer": {"name": "copilot-session-report.py", "helper_version": "1.0.0", "supported_rtk_version": "1.2.0"},
+  "published_at": "2026-01-02T09:40:01Z",
+  "run": {
+    "run_id": "11111111-2222-4333-8444-555555555555",
+    "mode": "rtk", "record_state": "finalized", "launch_kind": "resume",
+    "created_at": "2026-01-02T09:00:00Z", "finalized_at": "2026-01-02T09:40:00Z",
+    "session": {"link": "confirmed", "id": "synthetic-session-id", "proof": "launcher-selected-resume",
+                "corroborated_by": ["rtk-hook"]},
+    "rtk": {"availability": "available", "measurement": "stored-at-finalization",
+            "measured_at": "2026-01-02T09:40:00Z",
+            "stats": {"total_commands": 4, "total_input": 12000, "total_output": 3000, "total_saved": 9000,
+                      "total_time_ms": 900, "avg_time_ms": 225, "oversized_excluded": 0, "avg_savings_pct": 75.0}}
+  }
+}
+```
 
 ## Task usage reporting
 
@@ -1224,6 +1566,8 @@ Verify the pipeline is loaded:
 | Model refresh helper path | `COPILOT_MODEL_REFRESH_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-model-refresh.py` |
 | Per-launch session reports | `COPILOT_SESSION_REPORTS_DIR` env var | `~/.copilot/session-reports` (never pruned automatically) |
 | Session report helper path | `COPILOT_SESSION_REPORT_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-session-report.py` |
+| Run-report cleanup helper path (menu `r`) | `COPILOT_REPORT_CLEANUP_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-report-cleanup.py`; quarantine is fixed at `~/.copilot/copilot-s-report-quarantine` (never purged automatically; explicit one-batch purge via submenu `4`) |
+| Permanent quarantine purge (menus `x`, `r` → `4`) | `copilot_quarantine_purge.py`, installed next to the cleanup helpers and loaded from their real directory; journals in `<quarantine>/.purge/` | never automatic; one batch per run, exact phrase typed on the terminal |
 | RTK hook plugin directory (`--rtk`) | `COPILOT_S_RTK_PLUGIN_DIR` env var (absolute path) | `copilot-s-rtk-plugin/` next to `copilot-s` |
 
 ## Security & privacy
@@ -1247,6 +1591,12 @@ Verify the pipeline is loaded:
   paths) and, in RTK mode, RTK's own history database (raw command lines,
   project paths) and tee/recall output. It is never copied into reports,
   never sent anywhere, and never deleted automatically.
+  Menu `r` can move finalized run reports with that raw data into a private
+  recoverable quarantine (`~/.copilot/copilot-s-report-quarantine`, `0700`)
+  only after an explicit `yes`; that never deletes anything and frees no disk
+  space. Only the separate permanent purge (submenu `4`, one batch, exact
+  phrase typed on the terminal) deletes a quarantine batch; it is not secure
+  erasure (blocks are unlinked, not overwritten).
 - See [`SECURITY.md`](SECURITY.md) for how to report a vulnerability.
 
 ## Uninstall / update
@@ -1260,8 +1610,13 @@ scripts/update.sh                        # git pull --ff-only, then re-run the i
 ```
 
 Uninstalling never touches usage reports, task/session ingest state,
-your pricing configs/cache, Copilot session state, or quarantined sessions
-(`~/.copilot-s-quarantine`) — only the symlinks/copies this toolkit created.
+your pricing configs/cache, Copilot session state, quarantined sessions
+(`~/.copilot-s-quarantine`) or quarantined run reports
+(`~/.copilot/copilot-s-report-quarantine`), including their `.purge/`
+journals — only the symlinks/copies this toolkit created. Uninstalling never
+purges a quarantine: purge the batches you no longer need (menu `x` /
+`r` → `4`) **before** uninstalling, since the purge engine
+`copilot_quarantine_purge.py` is removed with the tools.
 It also leaves the subagent model-refresh state and anything an applied
 refresh wrote (`/subagents` values in `~/.copilot/settings.json`, the
 generated `~/.copilot/instructions/copilot-toolkit-model-routing.instructions.md`);

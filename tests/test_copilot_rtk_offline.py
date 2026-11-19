@@ -94,9 +94,16 @@ class LocalModel(BaseHTTPRequestHandler):
 @unittest.skipUnless(os.environ.get("COPILOT_TEST_OFFLINE_INTEGRATION") == "1",
                      "requires explicitly selected real CLIs; loopback fake-model integration")
 class TestRealOfflineRTK(fixture.ReportHome):
+    def setUp(self):
+        # Capture only the explicitly opted-in executable paths before the
+        # common fixture scrubs all inherited environment for auto-publishing.
+        self.selected_binaries = {key: os.environ.get(key) for key in
+                                  ("COPILOT_TEST_BINARY", "COPILOT_TEST_RTK_BINARY")}
+        super().setUp()
+
     def test_real_plugin_executes_rewrite_permissions_fail_closed_and_reports_actual_session(self):
-        copilot = Path(os.environ["COPILOT_TEST_BINARY"]).resolve()
-        rtk = Path(os.environ["COPILOT_TEST_RTK_BINARY"]).resolve()
+        copilot = Path(self.selected_binaries["COPILOT_TEST_BINARY"]).resolve()
+        rtk = Path(self.selected_binaries["COPILOT_TEST_RTK_BINARY"]).resolve()
         self.assertTrue(copilot.is_absolute() and copilot.is_file())
         self.assertTrue(rtk.is_absolute() and rtk.is_file())
         self.rtk.unlink()
@@ -168,6 +175,8 @@ class TestRealOfflineRTK(fixture.ReportHome):
                 self.assertTrue((self.states / rec["session"]["id"]).is_dir())
                 self.assertNotIn("Run the single synthetic fixture", json.dumps(rec))
                 if mode == "rtk":
+                    publication = self.home / ".copilot/copilot-s-rtk-export/v1/runs" / (run_id + ".json")
+                    self.assertEqual(json.loads(publication.read_bytes())["run"]["record_state"], "finalized")
                     events = [json.loads(s) for s in (rdir / "hook-events.jsonl").read_text().splitlines()]
                     self.assertEqual({e["sid"] for e in events}, {rec["session"]["id"]})
                     if missing:

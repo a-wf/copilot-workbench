@@ -6,6 +6,153 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Added — permanent purge of one quarantine batch (menus `x` and `r` → `4`, quarantine-purge-c1)
+
+- New shared stdlib engine `bin/copilot_quarantine_purge.py` (a library,
+  installed next to the cleanup helpers by `scripts/install.sh` for both
+  symlink and `--copy` installs; removed by `uninstall.sh` with the other
+  managed files). Both helpers load it lazily from their own real
+  directory; existing subcommands do not need it.
+- New subcommands in `copilot-session-cleanup.py` and
+  `copilot-report-cleanup.py`: `purge-list` (read-only;
+  `PURGEABLE<TAB><batch>`), `purge-preview --batch B` (read-only exact
+  inventory, estimated reclaimable space = Σ `st_blocks`×512, snapshot;
+  `PURGE_SNAPSHOT<TAB><kind><TAB><batch><TAB><digest>` or
+  `PURGE_INELIGIBLE<TAB><batch>`), and `purge --batch B [--snapshot D]`
+  (interactive, `/dev/tty` only, exact phrase
+  `PURGE <sessions|reports> <batch> <12-hex snapshot>`, 120 s, no
+  yes/force bypass). Existing commands, flags and machine lines are
+  unchanged.
+- Only fully settled batches (every entry `moved`/`skipped`, ≥1 moved,
+  payload fingerprints unchanged, nothing extra) of plain private single-link
+  files on one mount, with nothing open per a system `lsof`, can be purged.
+  The plan is rebuilt under the quarantine's existing lock (session-list
+  lock / `.transaction.lock`) and must match the confirmed snapshot before
+  the first deletion; a journal `<quarantine>/.purge/<batch>.json`
+  (`started` → `complete`/`partial`) is written first and kept.
+  Bottom-up descriptor-relative deletion of inventoried entries only, with
+  identity and parent-binding re-checks; stops at the first discrepancy.
+- `copilot-s`: new menu `x) Permanently purge a quarantined-session batch
+  (irreversible)` in the session list and the no-sessions menu (listed, not
+  in the short prompt), and `4)` in the `r` submenu (prompt unchanged). Never
+  launches Copilot.
+- Changed: session `restore` now performs its moves under the session-list
+  lock; both `restore` commands refuse a batch with a purge journal (checked
+  before the plan and again under the lock); both `list` commands append
+  `[permanent purge started: not restorable]` to such batches (machine
+  lines unchanged).
+- Limitations: macOS and Linux only; estimate only (APFS clones/snapshots,
+  open files); not secure erasure; a hostile same-user swap between the
+  final check and `unlink(2)` cannot be excluded portably; Linux
+  `chattr +i`/ACLs are not inspected (would stop the purge part-way).
+
+### Added — recoverable cleanup of run reports and private RTK data (menu `r`, rtk-report-cleanup-c1)
+
+- New `copilot-s` menu option `r) Clean run reports and private RTK data
+  (recoverable)`, in the session list and in the "No saved sessions found"
+  menu. Its submenu previews then quarantines, lists batches, or restores a
+  batch; every outcome returns to the menu and never launches Copilot.
+  Existing `n`, `p`, `c`, `q` are unchanged.
+- New helper `bin/copilot-report-cleanup.py` (stdlib only; installed next
+  to `copilot-s`; override with `COPILOT_REPORT_CLEANUP_HELPER`):
+  `preview [--include-recent]` (read-only; creates no file, folder or
+  lock), `apply [--include-recent]` (exact previewed `CANDIDATE` lines on
+  stdin), `list`, `restore --batch B [--yes]` (read-only plan without
+  `--yes`). No purge command in that cycle (added later by
+  quarantine-purge-c1, above).
+- Scope: finalized per-launch run reports of ALL workspaces under
+  `~/.copilot/session-reports/runs/<run-id>/` — whole folder, including the
+  private `raw/` data (RTK history DB, tee/recall, Copilot usage file) —
+  and, for RTK launches, the matching publication
+  `~/.copilot/copilot-s-rtk-export/v1/runs/<run-id>.json`. Never touches the
+  global RTK database, Copilot session-state/logs/OTEL files, orphan
+  publications or a custom `COPILOT_SESSION_REPORTS_DIR` (refused).
+- Strict eligibility: `completed`/`copilot-error`/`interrupted` with a
+  consistent state/outcome/exit code, schema v1 (integer), valid ordered
+  timestamps, finalized and unchanged for 24h (explicit opt-in for recent
+  runs); incomplete, report-failure, preflight-failed, unknown and malformed
+  runs are always kept. Plain private bounded trees only; a system `lsof`
+  must report every file/folder and the publication closed.
+- Apply re-validates under the transaction → reconcile → run → capacity
+  locks, then moves (atomic no-replace rename, same filesystem) the
+  publication and the run folder into
+  `~/.copilot/copilot-s-report-quarantine/<batch>/` with a durable
+  manifest. Nothing is deleted and **no disk space is freed**.
+- Restore requires unchanged quarantined data and absent original paths
+  (no overwrite or merge); the run folder returns before its publication.
+
+### Changed
+
+- `copilot-session-report.py`: start-up reconciliation re-lists run folders
+  while holding its lock before sweeping publications whose run folder is
+  gone, so a run restored meanwhile keeps its publication. No change to
+  records, publication schema, cadence or capacity eviction.
+- Installer installs `copilot-report-cleanup.py`; the uninstaller leaves
+  `~/.copilot/copilot-s-report-quarantine` untouched.
+
+### Added — automatic per-launch RTK publication for external viewers (copilot-s-rtk-c1)
+
+- `copilot-s --rtk` launches now publish a small numeric file per launch
+  automatically to `~/.copilot/copilot-s-rtk-export/v1/runs/<run-id>.json`
+  (schema `copilot-s.rtk-launch` v1; ≤ 16 KiB; `0700` folders, `0600` files,
+  atomic replace after exact-contract validation; unsafe folders/files are
+  refused, never repaired). One independent file per launch, so parallel,
+  resumed and multi-launch sessions never overwrite each other; nothing is
+  merged or summed. Run ids, record state (`active-unfinalized` /
+  `finalized`), launch kind, timestamps (`published_at` distinct from
+  `measured_at`), the session link with its proof label or `unknown`, and RTK
+  availability/measurement kind/numeric statistics only (signed
+  `total_saved`, finite `avg_savings_pct` that may be negative). No commands,
+  prompts, output, paths, error text or costs. Replaces the unreleased manual
+  `export-rtk` command and its fixed `v1.json` (removed; an existing file is
+  ignored).
+- **While a launch runs:** copilot-s starts the launch's own background
+  publisher (`copilot-session-report.py rtk-publisher`, internal) right
+  before Copilot and stops it (SIGTERM to its process group, ≤ 5 s, then
+  SIGKILL) and reaps it right after Copilot exits, before finalization and
+  on exit. It republishes about every 30 s (first after ~2 s) with at most
+  one bounded `rtk gain --format json` at a time (re-validated recorded
+  binary, private `RTK_*` paths only, 15 s / 1 MiB, cancellable), exits when
+  its parent is no longer the launcher (`getppid`), ignores Ctrl-C meant for
+  Copilot, and writes under the run lock only while the record is not
+  finalized. A failed measurement leaves the previous file untouched (no
+  fresher timestamp is invented). Not started for normal-mode launches or
+  when the RTK start/preflight fails; the existing environment isolation,
+  binary identity checks and launch cleanup are unchanged.
+- **At finalization:** `finish` publishes the statistics it stored (no extra
+  RTK run) while still holding the run lock; failures never change the run
+  record, output or exit status.
+- **Historical backfill:** every launch with a report runs one bounded,
+  resumable reconciliation slice at `start` (≤ 256 run folders probed by
+  metadata after a persisted cursor, ≤ 32 records loaded, ~1 s, non-waiting
+  lock; never runs RTK): finalized RTK runs from the last 14 days are
+  (re)published from stored records (backfill never evicts and adds files
+  only below 128); publications not rewritten for 14 days, of non-publishable
+  records or (default reports root) of deleted run folders are withdrawn.
+- **Capacity:** at most 256 publication files, all writes serialized by a
+  capacity lock. A live publisher or `finish` write that needs a new file at
+  the cap evicts the oldest contract-valid finalized publication(s) (by
+  `finalized_at`) from the sanitized cache; active publications are never
+  evicted (all 256 active: the write fails closed). Run records and reports
+  are never touched.
+- Session links are stricter than run-record links: only
+  `launcher-selected-resume` or `single-conversation-id-in-own-otel-file`.
+  Active runs: the run's own hook log and own per-run OTEL file, read
+  incrementally (no-follow, descriptor-checked, not group/world-writable,
+  ≤ 64 MiB, complete lines only; an unusable file stays unusable).
+  Finalized runs: the stored confirmed link with one of those bases, its
+  stored evidence counters and OTEL/hook diagnostics (strict, never
+  defaulted to 0) and a fresh secure hook-log scan must all agree; a stored
+  `unique-new-session-dir` basis is published as `unknown` (known
+  limitation). A confirmed link that becomes unknown is republished as
+  `unknown`.
+- Launches already running from an older copilot-s have no publisher
+  (reopen or resume them through the updated launcher); they are published
+  once finalized.
+- Internal: the RTK gain summary parser is shared by finalization and the
+  publisher (`parse_gain_summary`); `run_lock` takes an optional wait;
+  finalization output is unchanged.
+
 ### Added — per-launch session reports and opt-in RTK mode (rtk-session-reports-20261118-c1)
 
 - New `bin/copilot-session-report.py` (stdlib): every `copilot-s` launch,

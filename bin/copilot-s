@@ -93,6 +93,15 @@ else
   SESSION_CLEANUP_HELPER="$HOME/.local/bin/copilot-session-cleanup.py"
 fi
 SESSION_QUARANTINE_DIR="$HOME/.copilot-s-quarantine"
+# --- Run-report cleanup helper (menu option r) ---
+# Same resolution order as the task report helper above.
+if [[ -n "${COPILOT_REPORT_CLEANUP_HELPER:-}" ]]; then
+  REPORT_CLEANUP_HELPER="$COPILOT_REPORT_CLEANUP_HELPER"
+elif [[ -f "$SCRIPT_DIR/copilot-report-cleanup.py" ]]; then
+  REPORT_CLEANUP_HELPER="$SCRIPT_DIR/copilot-report-cleanup.py"
+else
+  REPORT_CLEANUP_HELPER="$HOME/.local/bin/copilot-report-cleanup.py"
+fi
 # --- Per-launch session report helper ---
 # Same resolution order as the task report helper above.
 if [[ -n "${COPILOT_SESSION_REPORT_HELPER:-}" ]]; then
@@ -126,6 +135,10 @@ REPORT_EXIT_CODE=""
 REPORT_SESSION_ID=""
 REPORT_LAUNCHED_EPOCH=""
 REPORT_ENDED_EPOCH=""
+# RTK mode: PID of this launch's own background RTK publisher (empty when
+# none is running). Started right before `copilot`, stopped and reaped right
+# after it (always before the run is finalized).
+RTK_PUBLISHER_PID=""
 # RTK mode: caller-supplied extra plugin directories (raw operands, in
 # order) and whether Copilot may resolve relative ones against a session
 # directory other than $PWD (-C, --worktree, or any resume/session selector).
@@ -290,6 +303,9 @@ RED='\033[31m'
 RESET='\033[0m'
 
 cleanup() {
+  if [[ -n "${RTK_PUBLISHER_PID:-}" ]]; then
+    stop_rtk_publisher
+  fi
   registry_unlock
   if [[ -n "${FILTERED_FILE:-}" ]] && [[ -f "$FILTERED_FILE" ]]; then
     rm -f "$FILTERED_FILE"
@@ -614,12 +630,58 @@ apply_rtk_env() {
   export COPILOT_S_RTK_BIN="$RTK_RUN_BIN"
 }
 
+# RTK mode only, after a successful start/preflight: start this launch's own
+# RTK publisher in the background (one per launch, never a daemon). It
+# republishes ~/.copilot/copilot-s-rtk-export/v1/runs/<run-id>.json about
+# every 30 s with one bounded `rtk gain` at a time on the launch's private
+# database, leads its own process group, ignores SIGINT, and exits on
+# SIGTERM/SIGHUP, once the run is finalized, or as soon as its parent is no
+# longer this shell ($$ — run_copilot is never called from a subshell).
+# No output reaches the terminal. Failing to start it never affects the
+# launch.
+start_rtk_publisher() {
+  RTK_PUBLISHER_PID=""
+  [[ "$RTK_MODE" == "true" && "$RUN_REPORT_PENDING" == "true" && -n "$COPILOT_S_RUN_ID" ]] || return 0
+  python3 "$SESSION_REPORT_HELPER" rtk-publisher --run-id "$COPILOT_S_RUN_ID" --parent-pid "$$" \
+    </dev/null >/dev/null 2>&1 &
+  RTK_PUBLISHER_PID=$!
+  return 0
+}
+
+# Stop and REAP this launch's RTK publisher (no-op if none): SIGTERM to its
+# process group (it and any running `rtk gain` child) and to the PID itself,
+# up to 5 s for it to exit, then SIGKILL to the group and PID, then `wait`.
+# Called right after `copilot` returns and again (no-op) before the run is
+# finalized and on exit, so a late active result can never be published
+# after the final figures.
+stop_rtk_publisher() {
+  local pid="${RTK_PUBLISHER_PID:-}"
+  [[ -n "$pid" ]] || return 0
+  RTK_PUBLISHER_PID=""
+  kill -TERM -- "-$pid" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  local tries=0
+  while kill -0 "$pid" 2>/dev/null && [[ $tries -lt 50 ]]; do
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
 # Finalize this launch's run record exactly once (state, exact session link,
 # OTEL usage, frozen estimated cost, RTK aggregates). Called right after the
 # task ingest (so the official pricing cache is as fresh as the ingest left
 # it, and before a possible session delete), and again as a no-op safety net
 # after the stop flow. Never fatal.
 finalize_run_report() {
+  # The launch's publisher must be gone (stopped and reaped) before the
+  # final figures are written and published.
+  stop_rtk_publisher
   [[ "$RUN_REPORT_PENDING" == "true" ]] || return 0
   RUN_REPORT_PENDING=false
   local -a args=(finish --run-id "$COPILOT_S_RUN_ID" --exit-code "${REPORT_EXIT_CODE:-1}" --session-state-dir "$SESSION_STATE_DIR")
@@ -1058,6 +1120,8 @@ list_sessions() {
   echo -e "  ${BOLD}${GREEN}n)${RESET} New session"
   echo -e "  ${BOLD}${YELLOW}d)${RESET} Delete a session"
   echo -e "  ${BOLD}${YELLOW}c)${RESET} Clean up empty sessions (recoverable)"
+  echo -e "  ${BOLD}${YELLOW}r)${RESET} Clean run reports and private RTK data (recoverable)"
+  echo -e "  ${BOLD}${RED}x)${RESET} Permanently purge a quarantined-session batch (irreversible)"
   echo -e "  ${BOLD}${CYAN}p)${RESET} Refresh subagent models from current prices"
   echo -e "  ${BOLD}q)${RESET} Quit"
   echo ""
@@ -1427,6 +1491,7 @@ run_copilot() {
     echo -e "${DIM}Mode: normal${RESET}"
   fi
   echo -e "${CYAN}Starting copilot...${RESET}\n"
+  start_rtk_publisher
   local copilot_rc=0
   if [[ -n "$session_id" ]]; then
     copilot --resume="$session_id" "${copilot_args[@]}" || copilot_rc=$?
@@ -1436,6 +1501,7 @@ run_copilot() {
   REPORT_EXIT_CODE="$copilot_rc"
   REPORT_LAUNCHED_EPOCH="$started_epoch"
   REPORT_ENDED_EPOCH="$(date +%s)"
+  stop_rtk_publisher
 
   flush_stdin
 
@@ -1668,6 +1734,80 @@ cleanup_empty_sessions() {
   return 0
 }
 
+# --- Permanent purge of ONE quarantine batch (menu x; run reports: r -> 4) ---
+# quarantine_purge_pick LABEL HELPER [HELPER ARGS...]
+# Shows the helper's read-only `purge-list` (fills the choices from its
+# PURGEABLE lines only), lets you pick ONE batch by number (Enter cancels),
+# then runs the helper's interactive `purge --batch <batch>` directly on the
+# terminal (output not captured): it prints the exact inventory and the
+# estimated reclaimable space and deletes only after YOU type, on the
+# terminal, the exact phrase it shows (kind, full batch name, snapshot id).
+# copilot-s never answers for you; there is no yes/force bypass. Every
+# outcome returns to the caller; nothing launches Copilot.
+quarantine_purge_pick() {
+  local label="$1"
+  shift
+  local out="" rc=0 line tab=$'\t'
+  local -a batches=()
+  out=$(python3 "$@" purge-list) || rc=$?
+  echo ""
+  while IFS= read -r line; do
+    if [[ "$line" == "PURGEABLE${tab}"* ]]; then
+      batches+=("${line#"PURGEABLE${tab}"}")
+    else
+      echo "$line"
+    fi
+  done <<< "$out"
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${RED}Listing ${label} quarantine batches failed (exit $rc) — nothing was deleted.${RESET}" >&2
+    return 0
+  fi
+  if [[ ${#batches[@]} -eq 0 ]]; then
+    echo "No ${label} quarantine batch can be purged right now. Nothing was deleted."
+    return 0
+  fi
+  echo ""
+  local i=1 b
+  for b in "${batches[@]}"; do
+    echo -e "  ${BOLD}${i})${RESET} $b"
+    i=$((i + 1))
+  done
+  echo -ne "${BOLD}Batch to purge PERMANENTLY (number; Enter cancels): ${RESET}"
+  local pick=""
+  prompt_read pick
+  if [[ ! "$pick" =~ ^[0-9]+$ ]] || [[ "$pick" -lt 1 ]] || [[ "$pick" -gt ${#batches[@]} ]]; then
+    echo "Cancelled. Nothing was deleted."
+    return 0
+  fi
+  local batch="${batches[$((pick - 1))]}"
+  if [[ ! "$batch" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$ ]]; then
+    echo -e "${RED}Unexpected batch name — nothing was deleted.${RESET}" >&2
+    return 0
+  fi
+  echo ""
+  rc=0
+  python3 "$@" purge --batch "$batch" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${YELLOW}Warning: the purge did not complete (exit $rc) — see above. If it says the batch is PARTIALLY deleted, it can no longer be restored and is never retried automatically.${RESET}" >&2
+  fi
+  return 0
+}
+
+# Menu x (session list and "No saved sessions found" menu): permanent purge
+# of one quarantined empty-session batch in ~/.copilot-s-quarantine. The
+# recoverable `c` flow is unchanged and never deletes.
+purge_session_quarantine() {
+  if [[ ! -f "$SESSION_CLEANUP_HELPER" ]]; then
+    echo -e "${RED}Session cleanup helper not found at $SESSION_CLEANUP_HELPER — nothing was deleted. Set COPILOT_SESSION_CLEANUP_HELPER or re-run the installer.${RESET}" >&2
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo -e "${RED}python3 not found — nothing was deleted.${RESET}" >&2; return 0; }
+  echo -e "\n${BOLD}Quarantined empty sessions — PERMANENT purge (frees disk space; IRREVERSIBLE)${RESET}"
+  local -a path_args=(--session-state-dir "$SESSION_STATE_DIR" --sessions-file "$SESSIONS_FILE" --quarantine-dir "$SESSION_QUARANTINE_DIR")
+  quarantine_purge_pick "session" "$SESSION_CLEANUP_HELPER" "${path_args[@]}"
+  return 0
+}
+
 # --- Subagent model refresh (menu option p) ---
 # Fetches CURRENT official GitHub Copilot prices via copilot-model-refresh.py,
 # shows the current/proposed routing table, and applies the frozen proposal
@@ -1746,21 +1886,200 @@ refresh_model_routing() {
   return 0
 }
 
+# --- Recoverable cleanup of run reports and private RTK data (menu option r) ---
+# Shells out to copilot-report-cleanup.py. Scope: every finalized per-launch
+# run report under ~/.copilot/session-reports/runs (ALL workspaces — run
+# records do not store the working directory), each with its private raw/
+# data and, for RTK launches, its matching publication. The preview is
+# read-only; only the exact previewed CANDIDATE lines (run id + fingerprint,
+# same --include-recent choice) are passed to `apply` after an exact `yes`.
+# Runs are MOVED to ~/.copilot/copilot-s-report-quarantine/<batch>/ — never
+# deleted, and no disk space is freed. The submenu also lists batches and
+# restores one (read-only plan, then exact `yes`). Every outcome (cancel,
+# helper failure, success) returns to the menu; nothing launches Copilot.
+report_cleanup_preview_apply() {
+  local -a policy_args=()
+  local include_recent=""
+  echo -ne "${YELLOW}Also include run reports finalized within the last 24h? [y/N]: ${RESET}"
+  prompt_read include_recent
+  case "$include_recent" in
+    y|Y|yes|YES|Yes)
+      policy_args=(--include-recent)
+      echo -e "${YELLOW}Recently finalized runs included (no minimum age). Active, unfinalized or uncertain runs are still always kept; quarantine is recoverable.${RESET}"
+      ;;
+  esac
+
+  local out="" rc=0 line tab=$'\t'
+  local -a candidates=()
+  out=$(python3 "$REPORT_CLEANUP_HELPER" preview "${policy_args[@]+"${policy_args[@]}"}") || rc=$?
+  echo ""
+  while IFS= read -r line; do
+    if [[ "$line" == "CANDIDATE${tab}"* ]]; then
+      # Forwarded to `apply` exactly as printed (tag, id, fingerprint and
+      # any include-recent marker) — the helper accepts only this format.
+      candidates+=("$line")
+    else
+      echo "$line"
+    fi
+  done <<< "$out"
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${RED}Run-report cleanup preview failed (exit $rc) — nothing was changed.${RESET}" >&2
+    return 0
+  fi
+  [[ ${#candidates[@]} -eq 0 ]] && return 0
+
+  echo -ne "${YELLOW}Type 'yes' to move ${#candidates[@]} run report(s) to quarantine (no disk space is freed; anything else cancels): ${RESET}"
+  local confirm=""
+  prompt_read confirm
+  if [[ "$confirm" != "yes" ]]; then
+    echo "Cancelled. Nothing was changed."
+    return 0
+  fi
+
+  rc=0
+  printf '%s\n' "${candidates[@]}" | python3 "$REPORT_CLEANUP_HELPER" apply \
+    "${policy_args[@]+"${policy_args[@]}"}" || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${YELLOW}Warning: run-report cleanup finished with problems (exit $rc) — see above. Nothing was deleted.${RESET}" >&2
+  fi
+  return 0
+}
+
+# Prints the helper's batch list (without machine lines) and fills
+# REPORT_CLEANUP_BATCHES. Returns 1 if the helper failed.
+REPORT_CLEANUP_BATCHES=()
+report_cleanup_list() {
+  local out="" rc=0 line tab=$'\t'
+  REPORT_CLEANUP_BATCHES=()
+  out=$(python3 "$REPORT_CLEANUP_HELPER" list) || rc=$?
+  echo ""
+  while IFS= read -r line; do
+    if [[ "$line" == "BATCH${tab}"* ]]; then
+      REPORT_CLEANUP_BATCHES+=("${line#"BATCH${tab}"}")
+    else
+      echo "$line"
+    fi
+  done <<< "$out"
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${RED}Listing report quarantine batches failed (exit $rc).${RESET}" >&2
+    return 1
+  fi
+  return 0
+}
+
+report_cleanup_restore() {
+  report_cleanup_list || return 0
+  [[ ${#REPORT_CLEANUP_BATCHES[@]} -eq 0 ]] && return 0
+  echo ""
+  local i=1 b
+  for b in "${REPORT_CLEANUP_BATCHES[@]}"; do
+    echo -e "  ${BOLD}${i})${RESET} $b"
+    i=$((i + 1))
+  done
+  echo -ne "${BOLD}Batch to restore (number; Enter cancels): ${RESET}"
+  local pick=""
+  prompt_read pick
+  if [[ ! "$pick" =~ ^[0-9]+$ ]] || [[ "$pick" -lt 1 ]] || [[ "$pick" -gt ${#REPORT_CLEANUP_BATCHES[@]} ]]; then
+    echo "Cancelled. Nothing was changed."
+    return 0
+  fi
+  local batch="${REPORT_CLEANUP_BATCHES[$((pick - 1))]}"
+  if [[ ! "$batch" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$ ]]; then
+    echo -e "${RED}Unexpected batch name — nothing was changed.${RESET}" >&2
+    return 0
+  fi
+
+  local out="" rc=0 line tab=$'\t' restorable=""
+  out=$(python3 "$REPORT_CLEANUP_HELPER" restore --batch "$batch") || rc=$?
+  echo ""
+  while IFS= read -r line; do
+    if [[ "$line" == "RESTORABLE${tab}"* ]]; then
+      restorable="${line#"RESTORABLE${tab}"}"
+    else
+      echo "$line"
+    fi
+  done <<< "$out"
+  if [[ $rc -ne 0 || ! "$restorable" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}Restore plan failed (exit $rc) — nothing was changed.${RESET}" >&2
+    return 0
+  fi
+  [[ "$restorable" -eq 0 ]] && return 0
+
+  echo -ne "${YELLOW}Type 'yes' to restore ${restorable} run report(s) from batch $batch (nothing is overwritten; anything else cancels): ${RESET}"
+  local confirm=""
+  prompt_read confirm
+  if [[ "$confirm" != "yes" ]]; then
+    echo "Cancelled. Nothing was changed."
+    return 0
+  fi
+  rc=0
+  python3 "$REPORT_CLEANUP_HELPER" restore --batch "$batch" --yes || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo -e "${YELLOW}Warning: restore finished with problems (exit $rc) — see above. Nothing was overwritten or deleted.${RESET}" >&2
+  fi
+  return 0
+}
+
+cleanup_run_reports() {
+  if [[ ! -f "$REPORT_CLEANUP_HELPER" ]]; then
+    echo -e "${RED}Run-report cleanup helper not found at $REPORT_CLEANUP_HELPER — nothing was changed. Set COPILOT_REPORT_CLEANUP_HELPER or re-run the installer.${RESET}" >&2
+    pause_for_menu
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo -e "${RED}python3 not found — nothing was changed.${RESET}" >&2
+    pause_for_menu
+    return 0
+  fi
+  while true; do
+    echo -e "\n${BOLD}Run reports and private RTK data — recoverable quarantine (no disk space is freed)${RESET}"
+    echo -e "  ${BOLD}1)${RESET} Preview, then quarantine finalized run reports (all workspaces)"
+    echo -e "  ${BOLD}2)${RESET} List quarantine batches"
+    echo -e "  ${BOLD}3)${RESET} Restore a quarantine batch"
+    echo -e "  ${BOLD}4)${RESET} ${RED}Permanently purge ONE quarantine batch (frees disk space; IRREVERSIBLE)${RESET}"
+    echo -e "  ${BOLD}b)${RESET} Back to the session menu (default)"
+    echo -ne "${BOLD}Choose [1, 2, 3, Enter/b = back]: ${RESET}"
+    local choice=""
+    prompt_read choice
+    case "$choice" in
+      1) report_cleanup_preview_apply ;;
+      2) report_cleanup_list || true ;;
+      3) report_cleanup_restore ;;
+      4)
+        echo -e "\n${BOLD}Quarantined run reports — PERMANENT purge (frees disk space; IRREVERSIBLE)${RESET}"
+        quarantine_purge_pick "run-report" "$REPORT_CLEANUP_HELPER"
+        ;;
+      ""|b|B|q|Q) return 0 ;;
+      *) echo "Invalid selection." ;;
+    esac
+  done
+}
+
 # Shown when there are no saved sessions at all. Enter (or n) starts a new
-# session exactly like before; p refreshes subagent models and comes back
-# here instead of launching anything; q quits.
+# session exactly like before; p refreshes subagent models, r manages old
+# run reports and x permanently purges one quarantined-session batch, all
+# coming back here instead of launching anything; q quits. (x is listed but
+# deliberately not advertised in the short prompt, like r -> 4.)
 empty_session_menu() {
   while true; do
     echo -e "\n${DIM}No saved sessions found.${RESET}"
     echo -e "  ${BOLD}${GREEN}n)${RESET} New session (default)"
     echo -e "  ${BOLD}${CYAN}p)${RESET} Refresh subagent models from current prices"
+    echo -e "  ${BOLD}${YELLOW}r)${RESET} Clean run reports and private RTK data (recoverable)"
+    echo -e "  ${BOLD}${RED}x)${RESET} Permanently purge a quarantined-session batch (irreversible)"
     echo -e "  ${BOLD}q)${RESET} Quit"
-    echo -ne "${BOLD}Start a new session? [Enter/n = new, p, q]: ${RESET}"
+    echo -ne "${BOLD}Start a new session? [Enter/n = new, p, r, q]: ${RESET}"
     local choice=""
     prompt_read choice
     case "$choice" in
       p|P)
         refresh_model_routing
+        ;;
+      r|R)
+        cleanup_run_reports
+        ;;
+      x|X)
+        purge_session_quarantine
         ;;
       q|Q)
         echo "Bye!"
@@ -1834,6 +2153,24 @@ select_session() {
         empty_session_menu "$@"
       fi
       ;;
+    r|R)
+      cleanup_run_reports
+      # Never auto-launch a new session after a run-report cleanup.
+      if list_sessions; then
+        select_session "$@"
+      else
+        empty_session_menu "$@"
+      fi
+      ;;
+    x|X)
+      purge_session_quarantine
+      # Never auto-launch a new session after a purge.
+      if list_sessions; then
+        select_session "$@"
+      else
+        empty_session_menu "$@"
+      fi
+      ;;
     *)
       if [[ "${choice:-}" =~ ^[0-9]+$ ]]; then
         local sid
@@ -1897,6 +2234,28 @@ ${BOLD}Features:${RESET}
     type \`yes\`, moves them to ~/.copilot-s-quarantine (recoverable, never
     deleted). Restore with:
     copilot-session-cleanup.py restore --batch <batch>
+  - Clean run reports and private RTK data (menu \`r\`, also offered when
+    there are no sessions): previews FINALIZED per-launch run reports of
+    ALL workspaces (completed/copilot-error/interrupted, finalized more
+    than 24h ago unless you opt in to recent ones; active, unfinalized,
+    report-failure or uncertain runs are always kept) with their private
+    raw/ data (RTK history DB, tee/recall, Copilot usage file) and matching
+    RTK publication, and after you type \`yes\` MOVES them to
+    ~/.copilot/copilot-s-report-quarantine/<batch>/ (recoverable, never
+    deleted — no disk space is freed). The submenu lists and restores
+    batches; or use:
+    copilot-report-cleanup.py list
+    copilot-report-cleanup.py restore --batch <batch> [--yes]
+  - Permanently purge ONE quarantine batch (menu \`x\` for quarantined
+    sessions, submenu \`r\` -> \`4\` for quarantined run reports): only fully
+    settled batches (every entry moved or skipped, at least one moved,
+    nothing changed since it was quarantined) are offered. The helper shows
+    the exact inventory and the ESTIMATED reclaimable space, then deletes
+    only after you type the exact phrase it shows (PURGE <kind> <batch>
+    <snapshot id>) on the terminal. IRREVERSIBLE; never automatic; no
+    yes/force bypass. Also available as:
+    copilot-session-cleanup.py purge-list | purge-preview --batch <batch>
+      | purge --batch <batch>   (same for copilot-report-cleanup.py)
   - Refresh subagent models (menu \`p\`, also offered when there are no
     sessions): fetches the CURRENT official GitHub Copilot prices, shows
     the current vs proposed model/effort/context per subagent route with
@@ -1938,6 +2297,7 @@ ${BOLD}Environment:${RESET}
   COPILOT_TASK_REPORTS_DIR       Override where task usage reports are written
   COPILOT_TASK_REPORT_HELPER     Override the path to copilot-task-report.py
   COPILOT_SESSION_CLEANUP_HELPER Override the path to copilot-session-cleanup.py
+  COPILOT_REPORT_CLEANUP_HELPER  Override the path to copilot-report-cleanup.py
   COPILOT_MODEL_REFRESH_HELPER   Override the path to copilot-model-refresh.py
   COPILOT_SESSION_REPORT_HELPER  Override the path to copilot-session-report.py
   COPILOT_SESSION_REPORTS_DIR    Override where per-launch run records are kept

@@ -266,6 +266,11 @@ mkdir_p "$BIN_PREFIX"
 install_one "$REPO_ROOT/bin/copilot-s" "$BIN_PREFIX/copilot-s" true
 install_one "$REPO_ROOT/bin/copilot-task-report.py" "$BIN_PREFIX/copilot-task-report.py" true
 install_one "$REPO_ROOT/bin/copilot-session-cleanup.py" "$BIN_PREFIX/copilot-session-cleanup.py" true
+install_one "$REPO_ROOT/bin/copilot-report-cleanup.py" "$BIN_PREFIX/copilot-report-cleanup.py" true
+# Shared purge engine (a library, not a command) loaded by both cleanup
+# helpers from their own real directory: the repo for symlink installs, this
+# prefix for --copy installs — so it must sit next to them.
+install_one "$REPO_ROOT/bin/copilot_quarantine_purge.py" "$BIN_PREFIX/copilot_quarantine_purge.py"
 install_one "$REPO_ROOT/bin/copilot-model-refresh.py" "$BIN_PREFIX/copilot-model-refresh.py" true
 install_one "$REPO_ROOT/bin/copilot-session-report.py" "$BIN_PREFIX/copilot-session-report.py" true
 

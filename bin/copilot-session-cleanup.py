@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """copilot-session-cleanup.py — recoverable quarantine of empty Copilot CLI
-sessions, used by `copilot-s` (menu option `c`).
+sessions, used by `copilot-s` (menu option `c`), plus the explicit,
+IRREVERSIBLE purge of one quarantine batch (menu option `x`).
 
-Nothing is ever deleted. Eligible session directories are *renamed* (same
-filesystem only, never copied, and never over an existing path) from
+preview/apply/list/restore never delete anything. Eligible session
+directories are *renamed* (same filesystem only, never copied, and never
+over an existing path) from
 ~/.copilot/session-state/<id>/ into a private batch directory under
 ~/.copilot-s-quarantine/<batch>/sessions/<id>/, with a durable manifest that
 records every transition so that a batch can be restored later — even after
@@ -25,7 +27,20 @@ Subcommands (stdlib only):
            for exactly "yes". Refuses symlinked/foreign quarantine paths, ID
            collisions (atomically, via a no-replace rename), and entries
            whose quarantined contents changed. Re-adds a recorded
-           ~/.copilot-sessions row only if no row for that ID exists.
+           ~/.copilot-sessions row only if no row for that ID exists. The
+           moves run under the session-list lock, and a batch with a purge
+           journal (see below) is refused.
+  purge-list | purge-preview --batch <batch> |
+  purge --batch <batch> [--snapshot <digest>]
+           PERMANENT, disk-space releasing deletion of ONE fully settled
+           batch (every entry "moved" or "skipped", at least one moved;
+           every moved session unchanged since it was quarantined). The
+           preview is read-only and shows the exact inventory and the
+           estimated reclaimable space; `purge` needs a real terminal and
+           the exact typed phrase "PURGE sessions <batch> <snapshot id>".
+           Implemented by copilot_quarantine_purge.py (next to this file;
+           see its docstring for the full protocol, locks and limits). The
+           session-list lock below is held for the whole destructive phase.
 
 Usage (path options, if given, go before the subcommand; defaults are
 ~/.copilot/session-state, ~/.copilot-sessions, ~/.copilot-s-quarantine):
@@ -34,6 +49,9 @@ Usage (path options, if given, go before the subcommand; defaults are
       [--include-recent]
   copilot-session-cleanup.py list
   copilot-session-cleanup.py restore --batch <batch>
+  copilot-session-cleanup.py purge-list
+  copilot-session-cleanup.py purge-preview --batch <batch>
+  copilot-session-cleanup.py purge --batch <batch> [--snapshot <digest>]
 
 A session is eligible only if ALL of the following hold (fail closed on
 anything unexpected):
@@ -110,6 +128,7 @@ sessions until they are restored.
 """
 
 import argparse
+import contextlib
 import ctypes
 import ctypes.util
 import datetime
@@ -175,6 +194,19 @@ MAX_UPDATE_SKEW_SECONDS = 1.0
 MAX_WORKSPACE_BYTES = 64 * 1024
 LSOF_TIMEOUT_SECONDS = 15
 LOCK_TIMEOUT_SECONDS = 10.0
+
+# Permanent purge (purge-* subcommands only). The engine is loaded lazily
+# from this file's real directory, so every other subcommand works without
+# it. PURGE_CONTROL_DIR mirrors copilot_quarantine_purge.CONTROL_DIR.
+PURGE_ENGINE_FILE = "copilot_quarantine_purge.py"
+PURGE_CONTROL_DIR = ".purge"
+PURGE_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+PURGE_MAX_MANIFEST_ENTRIES = 10000
+PURGE_MANIFEST_KEYS = frozenset(["version", "batch", "created_at", "session_state_dir", "sessions_file",
+                                 "scope", "entries"])
+PURGE_ENTRY_KEYS = frozenset(["id", "fingerprint", "state", "reason", "registry", "registry_rows"])
+PURGE_SCOPE_KEYS = frozenset(["all", "cwd", "include_recent"])
+PURGE_SETTLED_REGISTRY = ("removed", "absent")
 
 ALLOWED_KEYS = {
     "id", "cwd", "git_root", "repository", "host_type", "branch",
@@ -1365,21 +1397,24 @@ def cmd_list(args):
         return 0
     try:
         batches = sorted(name for name in os.listdir(root_fd) if BATCH_RE.match(name))
+        purge_notes = {batch: purge_journal_block(root_fd, batch) for batch in batches}
     finally:
         os.close(root_fd)
     if not batches:
         print("No quarantine batches in %s." % display_path(ctx.quarantine_root))
         return 0
     for batch in batches:
+        # Additive status only; the "<batch>  <summary>" form is unchanged.
+        purge_note = "  [permanent purge started: not restorable]" if purge_notes.get(batch) else ""
         try:
             opened = open_batch(ctx, batch)
         except CleanupError as exc:
-            print("%s  (unreadable: %s)" % (batch, exc))
+            print("%s  (unreadable: %s)%s" % (batch, exc, purge_note))
             continue
         opened.close()
         states = Counter(str(entry.get("state")) for entry in opened.manifest["entries"])
         summary = ", ".join("%s %d" % (state, count) for state, count in sorted(states.items()))
-        print("%s  %s" % (batch, summary))
+        print("%s  %s%s" % (batch, summary, purge_note))
     return 0
 
 
@@ -1409,9 +1444,41 @@ def cmd_restore(args):
         ctx.close()
 
 
+def purge_journal_block(root_fd, batch):
+    """None, or why `batch` must not be restored: a permanent purge of it was
+    started (a journal <quarantine>/.purge/<batch>.json exists, whatever its
+    state) or the purge control folder cannot be checked safely (fail
+    closed). Deliberately independent of copilot_quarantine_purge.py so a
+    restore never depends on that file being importable."""
+    try:
+        cfd = os.open(PURGE_CONTROL_DIR, DIR_OPEN_FLAGS, dir_fd=root_fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "the purge control folder %s is not a plain folder; refused" % PURGE_CONTROL_DIR
+    try:
+        st = os.fstat(cfd)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return "the purge control folder %s is not a folder owned by you; refused" % PURGE_CONTROL_DIR
+        try:
+            os.lstat(batch + ".json", dir_fd=cfd)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return "its purge journal cannot be checked; refused"
+        return ("a permanent purge of this batch was started (journal %s/%s.json); its data is or may be "
+                "partly deleted and it can no longer be restored by this tool — review it yourself"
+                % (PURGE_CONTROL_DIR, batch))
+    finally:
+        os.close(cfd)
+
+
 def restore_batch(ctx, batch, opened):
     manifest = opened.manifest
     batch_fd, sessions_fd, state_fd = opened.batch_fd, opened.sessions_fd, ctx.state_fd
+    blocked = purge_journal_block(opened.root_fd, batch)
+    if blocked:
+        raise CleanupError("batch %s: %s" % (batch, blocked))
     _no_replace_rename_func()
 
     plan, refused, changed = [], [], False
@@ -1464,33 +1531,43 @@ def restore_batch(ctx, batch, opened):
         return 0
 
     restored, failures = [], []
-    for entry in plan:
-        sid = entry["id"]
-        try:
-            current, details = fingerprint_dir(sid, sessions_fd)
-            if details["scaffold_problem"] is not None or current != entry.get("fingerprint"):
-                failures.append((sid, "quarantined contents changed"))
-                continue
-            previous_state = entry["state"]
-            entry["state"] = "restoring"
-            save_manifest(batch_fd, manifest)
+    # The moves run under the session-list lock (never held while waiting
+    # for the answer above): a permanent purge holds the same lock for its
+    # whole destructive phase, so the two can never interleave, and the
+    # purge journal is re-checked here, after any purge that ran while the
+    # question was open.
+    with RegistryLock(ctx.sessions_file):
+        blocked = purge_journal_block(opened.root_fd, batch)
+        if blocked:
+            raise CleanupError("batch %s: %s (nothing was restored)" % (batch, blocked))
+        for entry in plan:
+            sid = entry["id"]
             try:
-                # Atomic no-replace: never clobbers anything (even an empty
-                # directory) that appeared at the original path meanwhile.
-                rename_noreplace_at(sessions_fd, sid, state_fd, sid)
-            except OSError as exc:
-                entry["state"] = previous_state
+                current, details = fingerprint_dir(sid, sessions_fd)
+                if details["scaffold_problem"] is not None or current != entry.get("fingerprint"):
+                    failures.append((sid, "quarantined contents changed"))
+                    continue
+                previous_state = entry["state"]
+                entry["state"] = "restoring"
                 save_manifest(batch_fd, manifest)
-                failures.append((sid, "not restored: %s" % move_error_text(exc)))
-                continue
-            fsync_fd(sessions_fd)
-            fsync_fd(state_fd)
-            entry["state"] = "restored"
-            save_manifest(batch_fd, manifest)
-            restored.append(entry)
-        except (OSError, CleanupError) as exc:
-            failures.append((sid, str(exc)))
-            break
+                try:
+                    # Atomic no-replace: never clobbers anything (even an
+                    # empty directory) that appeared at the original path
+                    # meanwhile.
+                    rename_noreplace_at(sessions_fd, sid, state_fd, sid)
+                except OSError as exc:
+                    entry["state"] = previous_state
+                    save_manifest(batch_fd, manifest)
+                    failures.append((sid, "not restored: %s" % move_error_text(exc)))
+                    continue
+                fsync_fd(sessions_fd)
+                fsync_fd(state_fd)
+                entry["state"] = "restored"
+                save_manifest(batch_fd, manifest)
+                restored.append(entry)
+            except (OSError, CleanupError) as exc:
+                failures.append((sid, str(exc)))
+                break
 
     registry_note = None
     rows = {}
@@ -1514,11 +1591,216 @@ def restore_batch(ctx, batch, opened):
     return 1 if (failures or refused or registry_note) else 0
 
 
+# --------------------------------------------------------------------------
+# Permanent purge of one batch (engine: copilot_quarantine_purge.py)
+# --------------------------------------------------------------------------
+
+def load_purge_engine():
+    """Load copilot_quarantine_purge.py from this file's REAL directory (the
+    repo checkout for symlink installs, the install prefix for --copy
+    installs) without writing bytecode next to it."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), PURGE_ENGINE_FILE)
+    if not os.path.isfile(path):
+        raise CleanupError("purge support file %s is missing; re-run the installer (nothing was changed)" % path)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("copilot_quarantine_purge", path)
+    if spec is None or spec.loader is None:
+        raise CleanupError("cannot load %s (nothing was changed)" % path)
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise CleanupError("cannot load %s (%s); nothing was changed" % (path, exc))
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+class SessionPurgeAdapter(object):
+    """Session-quarantine side of copilot_quarantine_purge.py: strict
+    purge-only manifest validation, payload fingerprints (the same
+    fingerprint_dir semantics `restore` uses), exact batch layout, and the
+    session-list lock. Source paths come only from validated session IDs."""
+
+    kind = "sessions"
+    title = "quarantined empty sessions"
+    prog = "copilot-session-cleanup.py"
+
+    def __init__(self, engine, ctx):
+        self.engine, self.ctx = engine, ctx
+        self.root_path = ctx.quarantine_root
+
+    def open_root(self):
+        try:
+            return open_quarantine_root(self.ctx, create=False)
+        except CleanupError as exc:
+            raise self.engine.PurgeError(str(exc))
+
+    def _open(self, root_fd, batch):
+        """open_batch after a bounded manifest size check (open_batch itself
+        reads the whole manifest)."""
+        refused = self.engine.Refused
+        try:
+            bfd = os.open(batch, DIR_OPEN_FLAGS, dir_fd=root_fd)
+        except OSError:
+            raise refused("batch %s not found (or not a plain folder)" % batch)
+        try:
+            mst = os.lstat(MANIFEST_FILE, dir_fd=bfd)
+        except OSError:
+            raise refused("the batch has no manifest")
+        finally:
+            os.close(bfd)
+        if not stat.S_ISREG(mst.st_mode) or mst.st_size > PURGE_MANIFEST_MAX_BYTES:
+            raise refused("the manifest is not a regular file of at most %d bytes" % PURGE_MANIFEST_MAX_BYTES)
+        try:
+            return open_batch(self.ctx, batch)
+        except CleanupError as exc:
+            raise refused(str(exc))
+
+    def _settled(self, manifest):
+        """(moved [(id, fingerprint)], skipped [id]) of a strictly valid,
+        fully settled manifest; raises Refused otherwise."""
+        refused = self.engine.Refused
+        if set(manifest) - PURGE_MANIFEST_KEYS:
+            raise refused("the manifest has unknown fields")
+        if type(manifest.get("version")) is not int or not isinstance(manifest.get("created_at"), str):
+            raise refused("the manifest is not a valid cleanup manifest")
+        if manifest.get("sessions_file") != self.ctx.sessions_file:
+            raise refused("the batch was quarantined with session list %s, not %s"
+                          % (manifest.get("sessions_file"), self.ctx.sessions_file))
+        scope = manifest.get("scope")
+        if (not isinstance(scope, dict) or set(scope) - PURGE_SCOPE_KEYS or not isinstance(scope.get("all"), bool)
+                or not (scope.get("cwd") is None or isinstance(scope.get("cwd"), str))
+                or not isinstance(scope.get("include_recent", False), bool)):
+            raise refused("the manifest scope is not valid")
+        entries = manifest["entries"]
+        if not entries or len(entries) > PURGE_MAX_MANIFEST_ENTRIES:
+            raise refused("the manifest has no entries or too many")
+        moved, skipped, seen = [], [], set()
+        for entry in entries:
+            sid, fingerprint, state = entry.get("id"), entry.get("fingerprint"), entry.get("state")
+            if set(entry) - PURGE_ENTRY_KEYS:
+                raise refused("a manifest entry has unknown fields")
+            if not isinstance(sid, str) or not UUID_RE.match(sid) or sid in seen:
+                raise refused("invalid or duplicate session ID in the manifest")
+            seen.add(sid)
+            if not isinstance(fingerprint, str) or not FINGERPRINT_RE.match(fingerprint):
+                raise refused("entry %s has no valid fingerprint" % sid)
+            if entry.get("reason") is not None and not isinstance(entry.get("reason"), str):
+                raise refused("entry %s is malformed" % sid)
+            rows = entry.get("registry_rows", [])
+            if not isinstance(rows, list) or not all(isinstance(row, str) and "\n" not in row
+                                                     and row_id(row) == sid for row in rows):
+                raise refused("entry %s has malformed session-list rows" % sid)
+            if state == "moved":
+                if entry.get("registry") not in PURGE_SETTLED_REGISTRY:
+                    raise refused("entry %s: its session-list update did not finish (registry %r); restore or "
+                                  "review the batch instead" % (sid, entry.get("registry")))
+                moved.append((sid, fingerprint))
+            elif state == "skipped":
+                if entry.get("registry") is not None:
+                    raise refused("entry %s is malformed" % sid)
+                skipped.append(sid)
+            else:
+                raise refused("entry %s is %r — only fully settled batches (every entry moved or skipped) can "
+                              "be purged" % (sid, state))
+        if not moved:
+            raise refused("nothing was moved into this batch")
+        return moved, skipped
+
+    def manifest_status(self, root_fd, batch):
+        try:
+            opened = self._open(root_fd, batch)
+        except self.engine.Refused as exc:
+            return False, str(exc)
+        try:
+            moved, skipped = self._settled(opened.manifest)
+        except self.engine.Refused as exc:
+            return False, str(exc)
+        finally:
+            opened.close()
+        return True, "%d moved session(s), %d skipped" % (len(moved), len(skipped))
+
+    def verify(self, root_fd, batch, inventory, deadline):
+        refused = self.engine.Refused
+        node = inventory.nodes.get((MANIFEST_FILE,))
+        if node is None or node.kind != "f" or node.st.st_size > PURGE_MANIFEST_MAX_BYTES:
+            raise refused("the batch has no manifest of at most %d bytes" % PURGE_MANIFEST_MAX_BYTES)
+        opened = self._open(root_fd, batch)
+        try:
+            manifest = opened.manifest
+            moved, skipped = self._settled(manifest)
+            if opened.sessions_fd is None:
+                raise refused("the batch has no %s/ folder" % SESSIONS_SUBDIR)
+            expected = {(MANIFEST_FILE,): "f", (SESSIONS_SUBDIR,): "d"}
+            items = []
+            for sid, fingerprint in moved:
+                if time.monotonic() > deadline:
+                    raise refused("not fully inspected (time budget reached; try again)")
+                try:
+                    current, details = fingerprint_dir(sid, opened.sessions_fd)
+                except FileNotFoundError:
+                    raise refused("moved session %s is missing from the batch" % sid)
+                except (OSError, CleanupError) as exc:
+                    raise refused("quarantined session %s is not a safe folder (%s)" % (sid, exc))
+                if details["scaffold_problem"] is not None or current != fingerprint:
+                    raise refused("quarantined session %s changed since it was quarantined" % sid)
+                cwd = None
+                if details["ws_bytes"] is not None:
+                    cwd = lenient_cwd(details["ws_bytes"].decode("utf-8", "replace"))
+                label = "session %s%s" % (sid, ("  " + display_path(cwd)) if cwd and cwd.isprintable() else "")
+                items.append(([(SESSIONS_SUBDIR, sid)], label))
+                expected[(SESSIONS_SUBDIR, sid)] = "d"
+            for sid in skipped:
+                if lexists_at(opened.sessions_fd, sid):
+                    raise refused("skipped session %s is present in the batch" % sid)
+            bst = os.fstat(opened.batch_fd)
+        finally:
+            opened.close()
+        semantic = {
+            "manifest_sha256": hashlib.sha256(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "moved": [[sid, fingerprint] for sid, fingerprint in moved],
+            "skipped": sorted(skipped),
+            "session_state_dir": self.ctx.state_dir,
+        }
+        return self.engine.Verification((bst.st_dev, bst.st_ino), expected, (MANIFEST_FILE,), items, semantic,
+                                        len(moved))
+
+    @contextlib.contextmanager
+    def lock(self, root_fd):
+        """The existing session-list lock (shared with copilot-s, apply and
+        restore), held for the whole destructive phase."""
+        lock = RegistryLock(self.ctx.sessions_file)
+        try:
+            lock.__enter__()
+        except CleanupError as exc:
+            raise self.engine.PurgeError("%s; nothing was deleted" % exc)
+        try:
+            yield
+        finally:
+            lock.__exit__(None, None, None)
+
+
+def cmd_purge(args):
+    engine = load_purge_engine()
+    ctx = Context(args)
+    try:
+        return engine.run(SessionPurgeAdapter(engine, ctx), args.command, getattr(args, "batch", None),
+                          getattr(args, "snapshot", None))
+    finally:
+        ctx.close()
+
+
 def build_parser():
     home = os.path.expanduser("~")
     parser = argparse.ArgumentParser(
         prog="copilot-session-cleanup.py",
-        description="Recoverable quarantine of empty Copilot CLI sessions (used by copilot-s).",
+        description=("Recoverable quarantine of empty Copilot CLI sessions (used by copilot-s); "
+                     "purge-list/purge-preview/purge permanently delete ONE settled quarantine batch only after "
+                     "an exact phrase typed on the terminal."),
     )
     parser.add_argument("--session-state-dir", default=os.path.join(home, ".copilot", "session-state"))
     parser.add_argument("--sessions-file", default=os.path.join(home, ".copilot-sessions"))
@@ -1536,13 +1818,24 @@ def build_parser():
     sub.add_parser("list", help="list quarantine batches")
     restore = sub.add_parser("restore", help="restore a quarantine batch (asks for confirmation)")
     restore.add_argument("--batch", required=True)
+    sub.add_parser("purge-list", help="list quarantine batches and whether each can be purged permanently "
+                                      "(read-only)")
+    purge_preview = sub.add_parser("purge-preview", help="read-only inventory and estimated reclaimable space "
+                                                         "of ONE batch")
+    purge_preview.add_argument("--batch", required=True)
+    purge = sub.add_parser("purge", help="PERMANENTLY delete ONE fully settled batch after the exact phrase is "
+                                         "typed on the terminal (irreversible)")
+    purge.add_argument("--batch", required=True)
+    purge.add_argument("--snapshot", help="optional: the snapshot printed by purge-preview; refuses if the batch "
+                                          "is no longer exactly that snapshot")
     return parser
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    commands = {"preview": cmd_preview, "apply": cmd_apply, "list": cmd_list, "restore": cmd_restore}
+    commands = {"preview": cmd_preview, "apply": cmd_apply, "list": cmd_list, "restore": cmd_restore,
+                "purge-list": cmd_purge, "purge-preview": cmd_purge, "purge": cmd_purge}
     if args.command not in commands:
         parser.print_help()
         return 2

@@ -125,6 +125,11 @@ class ReportHome(unittest.TestCase):
                     "XDG_CONFIG_HOME": str(self.home / "xdg-config"),
                     "XDG_DATA_HOME": str(self.home / "xdg-data"),
                     "COPILOT_TASK_REPORT_PRICING_FETCH": "0"}
+        # start/finish now also reconcile/publish in-process. Isolate those
+        # paths just as strictly as subprocesses, not only the CLI helper.
+        environment = mock.patch.dict(os.environ, self.env, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
         self.mod = load_report()
         self.states = self.home / ".copilot/session-state"
         (self.states / "session-a").mkdir(parents=True)

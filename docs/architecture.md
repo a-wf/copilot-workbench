@@ -113,6 +113,64 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
   RTK fails, and appends a content-free decision line (with the hook's
   `session_id`) to the run folder. Any RTK-mode setup failure exits before
   `copilot` starts.
+- **Automatic RTK publication (`~/.copilot/copilot-s-rtk-export/v1/runs/<run-id>.json`)**
+  — one numeric-only file per RTK-mode launch (schema
+  `copilot-s.rtk-launch` v1, ≤ 16 KiB, `0700` folders / `0600` files, temp
+  file + `os.replace` after exact-contract validation; symlinked,
+  foreign-owned or group/world-writable folders or existing files refused,
+  never repaired). Three writers, all in `copilot-session-report.py`:
+  (1) the launch-scoped **publisher** (`rtk-publisher`, internal): after a
+  successful RTK `start`, `copilot-s` starts it in the background right
+  before `copilot` with `--parent-pid $$`; it leads its own process group,
+  ignores SIGINT, exits on SIGTERM/SIGHUP or when `getppid()` no longer
+  equals the launcher, and every ~30 s (first after ~2 s) evaluates the
+  link from the run's own hook log and per-run OTEL file (incremental
+  `_EvidenceTail` readers: no-follow, descriptor-checked, ≤ 64 MiB, only
+  complete lines, sticky "unusable"), runs one bounded `rtk gain --format
+  json` (re-validated recorded binary, private `RTK_*` paths only, 15 s /
+  1 MiB, child in the publisher's group, cancelled via a signal wake-up
+  pipe) and, under the run lock with a re-read of the record, writes the
+  active file unless the run is finalized. Any failure skips the write (no
+  fresher `published_at` is invented). `copilot-s` stops it (SIGTERM to
+  group + PID, ≤ 5 s, then SIGKILL) and reaps it (`wait`) right after
+  `copilot` exits and again before `finish` and on exit, so RTK calls never
+  overlap and no active result follows the final one. (2) **`finish`**
+  publishes the stored final statistics (no extra RTK run) while still
+  holding the run lock; failures never affect the canonical record, output
+  or exit status. (3) **`start`** (any mode) runs one bounded, resumable
+  reconciliation slice (`reconcile_publications`: ≤ 256 run folders probed
+  by metadata in run-id order after a persisted cursor, ≤ 32 records
+  loaded, ~1 s budget, non-waiting lock; RTK never run) that (re)publishes
+  finalized RTK runs finalized within 14 days whose file is missing or older
+  than the record/hook log (backfill never evicts and adds new files only
+  below 128), withdraws files not rewritten for 14 days, files of non-publishable
+  records and (default reports root only) of deleted run folders, and
+  removes stale temp files. Capacity: at most 256 files; every write runs
+  under `v1/.capacity.lock` (`write_publication`), and a publisher or
+  `finish` write that needs a new file at the cap first evicts the oldest
+  contract-valid *finalized* publications by `finalized_at`
+  (`_evict_oldest_finalized`: no-follow, descriptor-checked reads, identity
+  re-checked before unlinking by exact name); active publications are never
+  evicted, so with all 256 active the write fails closed. Only the
+  sanitized cache file is removed. Run records are read through
+  `load_run_for_export` (no-follow, descriptor-checked, 8 MiB-bounded),
+  never the canonical `load_run`. Session links are computed separately
+  from (and never widening) the canonical `resolve_session` link: only
+  `launcher-selected-resume` or `single-conversation-id-in-own-otel-file`
+  (`_link_from_evidence` while active). A finalized run — whose record
+  holds an OTEL status word instead of the path after `finish` — uses
+  `_finalized_session_link`: the stored canonical link must be confirmed
+  with exactly one of those two bases and agree with the stored evidence
+  counters (`hook_session_ids`/`otel_conversation_ids` ≤ 1,
+  `other_ids_ignored` = 0, clean OTEL diagnostics, clean stored hook
+  summary; missing/invalid counters never read as 0) and with a fresh
+  secure scan of the run's hook log; a stored `unique-new-session-dir`
+  basis therefore publishes `unknown` once finalized (documented
+  limitation). Directory discovery never yields a link and any conflict or
+  malformed record gives `unknown`. Run records, reports, history and
+  accounting are never modified. Consumers (e.g. the Agentic Watcher macOS
+  app) read the files passively; publications carry no sub-agent → launch
+  proof and a linked launch is not proof that a process is alive.
 - **Task ID resolution** — on session start/resume/exit, it tries to
   extract a conservative `KEY-123`-style ID (`[A-Z][A-Z0-9]+-[0-9]+`) from
   the current git branch, falling back to the resumed session's stored
@@ -167,6 +225,69 @@ replace or fork `copilot`; it manages metadata *around* invocations of it:
   modified. The cleanup holds it from the final alias re-check of each
   session through that session's row removal.
   Copilot's native session index is never touched.
+
+- **Run-report cleanup** — menu `r` (session list and the no-sessions
+  menu) shells out to `copilot-report-cleanup.py`: read-only `preview`
+  (all workspaces; finalized `completed`/`copilot-error`/`interrupted`
+  runs with a strictly valid, consistent record, ≥24h old unless the
+  opt-in `--include-recent` marks every candidate line, plain private
+  bounded trees, a matching RTK publication only, not open per a system
+  `lsof` given every file and folder explicitly), then `apply` with exactly
+  the previewed `run-id`+fingerprint pairs after a typed `yes`, plus
+  read-only `list` and `restore --batch B [--yes]`. Apply takes the
+  quarantine's `.transaction.lock`, then the producer's
+  `v1/.reconcile.lock` (whole batch), each `runs/<id>/.lock` and
+  `v1/.capacity.lock` (global, last) — the producer's own lock order — and
+  re-validates the fingerprint under them; the open-file check exempts only
+  its own verified run-lock descriptor (pid, fd, inode). It renames the
+  publication, then the whole run folder (no-replace, same filesystem) into
+  `~/.copilot/copilot-s-report-quarantine/<batch>/` with a durable,
+  bounded `manifest.json` (`pending` → `pub_moved` → `moved`); restore
+  moves the run folder back first, then the publication, and never
+  overwrites. Source paths come only from the home directory and the
+  validated run id. Producer writers re-read the record by its canonical
+  path after taking the run lock, and reconciliation re-lists run folders
+  under its lock before sweeping, so a moved run is never written to or
+  republished and a restored one is not withdrawn. Nothing is deleted and
+  no disk space is freed.
+
+- **Permanent quarantine purge** — menu `x` (sessions; session list and
+  the no-sessions menu) and submenu `r` → `4` (run reports) shell out to
+  the helpers' `purge-list` (read-only; `PURGEABLE<TAB><batch>` lines),
+  then `purge --batch B` directly on the terminal (not captured). Both
+  helpers lazily load the shared stdlib engine
+  `bin/copilot_quarantine_purge.py` from their own real directory (symlink
+  install: the checkout; `--copy`: the prefix, where the installer copies
+  it); every other subcommand works without it. Per batch the engine
+  builds a read-only plan: no purge journal; the helper adapter's strict
+  purge-only manifest validation (fully settled: only `moved`/`skipped`,
+  ≥1 moved; sessions also require a finished session-list update and the
+  configured state dir/session list; reports require consistent
+  `fingerprint`/`tree_fp`/`pub_fp`/mode) and the existing fingerprint
+  checks of every moved payload (`fingerprint_dir`; `scan_run_tree` +
+  `read_publication`), exact top-two-level layout; a descriptor-relative,
+  no-follow, bounded inventory (plain single-link files and plain folders,
+  owner-only writable, no special bits/immutable flags, no repeated folder,
+  same `st_dev` and same mount — macOS `fstatfs` fsid/mount-on path with an
+  fsid==`st_dev` layout self-check, Linux `mnt_id` from
+  `/proc/self/fdinfo` plus no `/proc/self/mountinfo` mount point at or
+  under the batch); a system-`lsof` "nothing open" result; and an identical
+  second inventory. The snapshot digest covers every entry's
+  identity/metadata (incl. `st_blocks`, mtime/ctime, flags) and the verified
+  manifest summary. `purge` prints the plan, reads the exact phrase
+  `PURGE <kind> <batch> <12-hex snapshot>` from `/dev/tty` (input flushed,
+  120 s, no bypass), then — under the session-list `flock` (sessions; now
+  also held by `restore` while moving) or the quarantine
+  `.transaction.lock` (reports; held by `apply`/`restore` throughout; the
+  reconcile/run/capacity locks only guard canonical paths the purge never
+  opens) — rebuilds the plan and requires the same digest. It then links a
+  journal `<quarantine>/.purge/<batch>.json` (`started`, no-replace),
+  deletes bottom-up via `unlinkat`/`rmdir` relative to parent descriptors
+  after re-checking each entry's snapshot metadata and the binding of every
+  parent from the batch down (payload, then manifest, then the batch
+  folder), and records `complete` or `partial`. Any journal blocks
+  `restore`, `purge` and `purge-preview` for that batch (no automatic
+  retry/resume); `list` shows it additively.
 
 `copilot-s` is intentionally the *only* place that knows about git branches,
 terminal prompts, and the session index; it treats the reporter as an

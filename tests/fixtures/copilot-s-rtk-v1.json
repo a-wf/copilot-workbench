@@ -1,0 +1,41 @@
+{
+  "producer": {
+    "helper_version": "1.0.0",
+    "name": "copilot-session-report.py",
+    "supported_rtk_version": "1.2.0"
+  },
+  "published_at": "2026-11-10T12:00:00Z",
+  "run": {
+    "created_at": "2026-11-10T12:00:00Z",
+    "finalized_at": "2026-11-10T12:00:00Z",
+    "launch_kind": "new",
+    "mode": "rtk",
+    "record_state": "finalized",
+    "rtk": {
+      "availability": "available",
+      "measured_at": "2026-11-10T12:00:00Z",
+      "measurement": "stored-at-finalization",
+      "stats": {
+        "avg_savings_pct": null,
+        "avg_time_ms": 200,
+        "oversized_excluded": 0,
+        "total_commands": 2,
+        "total_input": 1000,
+        "total_output": 1200,
+        "total_saved": -200,
+        "total_time_ms": 400
+      }
+    },
+    "run_id": "00000000-0000-4000-8000-000000000001",
+    "session": {
+      "corroborated_by": [
+        "rtk-hook"
+      ],
+      "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "link": "confirmed",
+      "proof": "single-conversation-id-in-own-otel-file"
+    }
+  },
+  "schema": "copilot-s.rtk-launch",
+  "schema_version": 1
+}
