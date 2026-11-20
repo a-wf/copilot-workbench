@@ -33,6 +33,11 @@ Responsibilities:
   introduce a new one.
 - Run the tests and report pass/fail results clearly, including any
   failure output.
+- Prefer concise native runner output by default, without suppressing
+  errors, assertion details, or the runner's original exit status. Use
+  existing runner artifacts or available raw logs for additional detail
+  before rerunning; rerun only after relevant changes or for concrete
+  unresolved evidence, not merely because another role received the batch.
 - Do not fix implementation bugs yourself — report failures back to
   whichever implementer tier (`coder` or `senior-coder`) made the change
   for them to address.

@@ -580,6 +580,11 @@ high-risk.
   the broad review. If existing tests already cover the change, skip
   `tester` and have the built-in `task` route run the chosen existing test
   command; report the skip at that transition.
+- Validation belongs to `tester` (or the existing-test `task` route), not
+  the implementer. The reviewer reads the raw diff and uses the reported
+  test results; it does not rerun tests. Request another validation run
+  only after relevant edits or when concrete unresolved evidence creates
+  material doubt, never merely to repeat validation in a different role.
 - The independent correctness review by `reviewer` is mandatory for every
   code batch, whoever authored it. Start the broad review only once the
   test batch is ready; do not run it in parallel with, or before, the
@@ -602,6 +607,30 @@ high-risk.
   budgets. Only a later, separately requested work item gets a new cycle,
   and only when the user confirms it is new; the report tool cannot enforce
   that distinction.
+
+### Concise native test output
+
+Prefer native concise output, preserving errors, assertion details, and
+the runner's original exit status:
+
+- Python unittest: `python3 -m unittest discover -s tests` without `-v`;
+  do not impose `-q` as a blanket default.
+- Gradle: `./gradlew test --console=plain`; avoid `--info` and `--debug`
+  by default unless diagnosing a specific issue.
+
+When more detail is needed, read existing runner artifacts (such as Gradle
+test reports) or available raw logs before rerunning. Include their
+locations in the handoff when available; do not promise a raw log the
+runner did not retain. Reruns still require relevant changes or concrete
+unresolved evidence and stay within the existing test budgets.
+
+Do not add automatic RTK filtering for these runner forms. The RTK 1.2.0
+preflight found no hook rewrite for `python3 -m unittest`; explicitly
+wrapping it with `rtk test --` preserved a failing exit status and a recall
+reference but omitted an assertion detail from printed output. A synthetic
+`rtk gradlew test` check preserved exit status 7 but omitted failure detail
+and provided no recall reference. Use the native fallback for these forms;
+these checks do not justify a broader RTK recommendation or hook change.
 
 ### Compact handoff manifest
 
