@@ -1810,17 +1810,25 @@ purge_session_quarantine() {
 
 # --- Subagent model refresh (menu option p) ---
 # Fetches CURRENT official GitHub Copilot prices and the official model
-# capability pages via copilot-model-refresh.py, shows every model in view,
-# the current/proposed routing table and any OPTIONAL alternatives, and
-# applies the frozen proposal only after an exact `yes` (default No). The
-# helper refuses to apply if any input or evidence changed since the table was
-# shown. Optional steps, each skipped by Enter: `v` records what you verified
-# in Copilot CLI's /model picker (the helper saves it only after its own exact
-# `yes`, then the proposal is re-evaluated once), and choosing optional
-# alternatives by number (never pre-selected; they still need the final
-# `yes`). Every outcome (applied, cancelled, no changes, offline/failed)
-# prints the final effective routing and waits for Enter, then the caller
-# returns to the menu — never launches `copilot`.
+# capability pages via copilot-model-refresh.py (`propose --review`), shows
+# every model in view and the proposed mapping table FIRST, then asks only
+# about that table's proposed models: "Are all these proposed models
+# available in /model? [y/N]". On No you name the unavailable ones (checked
+# against the displayed list; Enter/EOF cancels). For each exact reasoning
+# level the helper cannot verify from saved/source-backed evidence you answer
+# y/N for that model and level (No = the model is not used where that level
+# is needed; never downgraded). The helper keeps your answers only inside the
+# sealed proposal for this run (nothing is saved), recomputes the mapping from
+# the same frozen prices/evidence, and the loop repeats until nothing is
+# pending (bounded; every round answers something). Optional alternatives are
+# then offered once by number from the latest table (never pre-selected; a
+# selected one is checked the same way). Only a fully checked proposal reaches
+# the separate exact `yes` (default No) that applies it; the helper refuses
+# if any input or evidence changed. Every outcome (applied, cancelled, no
+# changes, offline/failed) prints the final effective routing and waits for
+# Enter, then the caller returns to the menu — never launches `copilot`.
+# (Saving a /model record for later runs stays available separately:
+# copilot-model-refresh.py record-verified.)
 pause_for_menu() {
   local _ignored=""
   echo -ne "${DIM}Press Enter to return to the menu...${RESET}"
@@ -1841,32 +1849,144 @@ show_model_routing_status() {
 }
 
 # Runs one helper command that may emit machine lines, prints every other
-# line, and records the machine lines in MR_* globals. Returns the helper's
-# exit status.
+# line, and records the machine lines in MR_* globals. Exact invariants: at
+# most one PROPOSAL; exactly one REVIEW and exactly one SELECTED whenever
+# either appears; unique ALTERNATIVE numbers, CHECK models and LEVEL
+# model+effort pairs. Any malformed, duplicated, contradictory or
+# inconsistent machine line sets MR_PROTOCOL_OK=false (the caller then fails
+# closed and never reaches a question or apply). Returns the helper's exit
+# status.
 MR_PROPOSAL_ID=""
-MR_VERIFY=false
 MR_ALTERNATIVES=()
+MR_CHECK=()
+MR_CHECK_ROUTES=()
+MR_LEVELS=()
+MR_REVIEW=""
+MR_SELECTED=0
+MR_PROTOCOL_OK=true
+MR_CANCELLED=false
+MODEL_REFRESH_MAX_ROUNDS=20
+MR_MODEL_RE='^[a-z0-9]([a-z0-9.-]{0,78}[a-z0-9])?$'
+MR_EFFORT_RE='^(none|minimal|low|medium|high|xhigh|max)$'
+MR_ROUTES_RE='^[a-z0-9._-]+(,[a-z0-9._-]+)*$'
 run_model_refresh_helper() {
-  local out="" rc=0 line tab=$'\t' rest
+  local out="" rc=0 line tab=$'\t' rest f1 f2 selected_seen=false
   MR_PROPOSAL_ID=""
-  MR_VERIFY=false
   MR_ALTERNATIVES=()
+  MR_CHECK=()
+  MR_CHECK_ROUTES=()
+  MR_LEVELS=()
+  MR_REVIEW=""
+  MR_SELECTED=0
+  MR_PROTOCOL_OK=true
   out=$(python3 "$MODEL_REFRESH_HELPER" "$@") || rc=$?
   while IFS= read -r line; do
-    if [[ "$line" == "PROPOSAL${tab}"* ]]; then
-      MR_PROPOSAL_ID="${line#"PROPOSAL${tab}"}"
-    elif [[ "$line" == "ALTERNATIVE${tab}"* ]]; then
-      rest="${line#"ALTERNATIVE${tab}"}"
-      if [[ "${rest%%"${tab}"*}" =~ ^[0-9]{1,3}$ ]]; then
-        MR_ALTERNATIVES+=("${rest%%"${tab}"*}")
-      fi
-    elif [[ "$line" == "VERIFY${tab}needed" ]]; then
-      MR_VERIFY=true
-    else
-      echo "$line"
-    fi
+    case "$line" in
+      "PROPOSAL${tab}"*)
+        [[ -z "$MR_PROPOSAL_ID" ]] || MR_PROTOCOL_OK=false
+        MR_PROPOSAL_ID="${line#"PROPOSAL${tab}"}"
+        ;;
+      "ALTERNATIVE${tab}"*)
+        rest="${line#"ALTERNATIVE${tab}"}"
+        if [[ "${rest%%"${tab}"*}" =~ ^[0-9]{1,3}$ ]] \
+          && ! model_refresh_in_list "${rest%%"${tab}"*}" "${MR_ALTERNATIVES[@]}"; then
+          MR_ALTERNATIVES+=("${rest%%"${tab}"*}")
+        else
+          MR_PROTOCOL_OK=false
+        fi
+        ;;
+      "CHECK${tab}"*)
+        rest="${line#"CHECK${tab}"}"
+        f1="${rest%%"${tab}"*}"
+        f2="${rest#*"${tab}"}"
+        if [[ "$rest" == *"${tab}"* && "$f1" =~ $MR_MODEL_RE && "$f2" =~ $MR_ROUTES_RE ]] \
+          && ! model_refresh_in_list "$f1" "${MR_CHECK[@]}"; then
+          MR_CHECK+=("$f1")
+          MR_CHECK_ROUTES+=("$f2")
+        else
+          MR_PROTOCOL_OK=false
+        fi
+        ;;
+      "LEVEL${tab}"*)
+        rest="${line#"LEVEL${tab}"}"
+        f1="${rest%%"${tab}"*}"
+        f2="${rest#*"${tab}"}"
+        if [[ "$rest" == *"${tab}"* && "$f1" =~ $MR_MODEL_RE && "$f2" =~ $MR_EFFORT_RE ]] \
+          && ! model_refresh_in_list "$f1 $f2" "${MR_LEVELS[@]}"; then
+          MR_LEVELS+=("$f1 $f2")
+        else
+          MR_PROTOCOL_OK=false
+        fi
+        ;;
+      "REVIEW${tab}pending"|"REVIEW${tab}complete")
+        [[ -z "$MR_REVIEW" ]] || MR_PROTOCOL_OK=false
+        MR_REVIEW="${line#"REVIEW${tab}"}"
+        ;;
+      "REVIEW${tab}"*)
+        MR_PROTOCOL_OK=false
+        ;;
+      "SELECTED${tab}"*)
+        rest="${line#"SELECTED${tab}"}"
+        if [[ "$selected_seen" != "true" && "$rest" =~ ^[0-9]{1,3}$ ]]; then
+          selected_seen=true
+          MR_SELECTED=$((10#$rest))
+        else
+          MR_PROTOCOL_OK=false
+        fi
+        ;;
+      "VERIFY${tab}needed")
+        : # plain propose only; the menu asks about proposed models instead
+        ;;
+      *)
+        echo "$line"
+        ;;
+    esac
   done <<< "$out"
+  # REVIEW and SELECTED come together, exactly once each.
+  if [[ -n "$MR_REVIEW" && "$selected_seen" != "true" ]] || [[ -z "$MR_REVIEW" && "$selected_seen" == "true" ]]; then
+    MR_PROTOCOL_OK=false
+  fi
+  # A pending review must say what to confirm; a complete one must not.
+  if [[ "$MR_REVIEW" == "pending" && ${#MR_CHECK[@]} -eq 0 && ${#MR_LEVELS[@]} -eq 0 ]]; then
+    MR_PROTOCOL_OK=false
+  fi
+  if [[ "$MR_REVIEW" != "pending" ]] && [[ ${#MR_CHECK[@]} -gt 0 || ${#MR_LEVELS[@]} -gt 0 ]]; then
+    MR_PROTOCOL_OK=false
+  fi
   return "$rc"
+}
+
+# Reads one line from the terminal; returns 1 on EOF (Ctrl-D) so the caller
+# cancels instead of guessing an answer.
+model_refresh_read() {
+  local varname="$1"
+  # shellcheck disable=SC2229  # the caller's variable is the intended target
+  IFS= read -r "$varname" < /dev/tty 2>/dev/null
+}
+
+# Discards the latest pending proposal after a failure: the id from the last
+# helper output when it is a safe 16-hex id (even if other machine lines were
+# malformed), else the last accepted id ($1). Anything else is never passed
+# to the helper; an unsafe new id just expires unused (apply needs the id).
+model_refresh_discard_latest() {
+  local id="$1"
+  if [[ "$MR_PROPOSAL_ID" =~ ^[0-9a-f]{16}$ ]]; then
+    id="$MR_PROPOSAL_ID"
+  fi
+  if [[ "$id" =~ ^[0-9a-f]{16}$ ]]; then
+    python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$id" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# 0 = $1 equals one of the remaining arguments.
+model_refresh_in_list() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
 }
 
 # 0 = the selection is a comma-separated list of offered alternative numbers.
@@ -1884,6 +2004,92 @@ model_refresh_selection_valid() {
   return 0
 }
 
+# One review round for the latest proposal: asks about exactly the displayed
+# CHECK models, then y/N for each LEVEL (skipping models you just called
+# unavailable), and runs `review` once. Sets MR_CANCELLED=true (and returns 0)
+# when you cancel (EOF, Enter on the unavailable-IDs prompt, or three invalid
+# lists); otherwise returns the helper's exit status with MR_* updated.
+model_refresh_review_round() {
+  local answer="" tok model effort pair _attempt bad i rc=0
+  local -a args=(review --proposal-id "$MR_PROPOSAL_ID")
+  local -a rejected=()
+  local -a toks=()
+  MR_CANCELLED=false
+  if [[ ${#MR_CHECK[@]} -gt 0 ]]; then
+    echo -e "${BOLD}Proposed models to check in Copilot CLI's /model picker (only these; see the mapping above):${RESET}"
+    for i in "${!MR_CHECK[@]}"; do
+      echo "  ${MR_CHECK[$i]}  (route(s): ${MR_CHECK_ROUTES[$i]//,/, })"
+    done
+    echo -ne "${YELLOW}Are all these proposed models available in /model? [y/N]: ${RESET}"
+    answer=""
+    if ! model_refresh_read answer; then
+      MR_CANCELLED=true
+      return 0
+    fi
+    case "$answer" in
+      y|Y|yes|YES|Yes)
+        args+=(--available-all)
+        ;;
+      *)
+        for _attempt in 1 2 3; do
+          echo -ne "${YELLOW}Which of them are NOT available? Model IDs separated by spaces or commas (the others count as available for this p run only; Enter cancels): ${RESET}"
+          answer=""
+          if ! model_refresh_read answer; then
+            MR_CANCELLED=true
+            return 0
+          fi
+          answer=$(printf '%s' "${answer//,/ }" | tr '[:upper:]' '[:lower:]')
+          toks=()
+          IFS=$' \t' read -r -a toks <<< "$answer" || true
+          if [[ ${#toks[@]} -eq 0 ]]; then
+            MR_CANCELLED=true
+            return 0
+          fi
+          rejected=()
+          bad=""
+          for tok in "${toks[@]}"; do
+            if model_refresh_in_list "$tok" "${MR_CHECK[@]}"; then
+              model_refresh_in_list "$tok" "${rejected[@]}" || rejected+=("$tok")
+            else
+              bad+="${bad:+, }$tok"
+            fi
+          done
+          [[ -z "$bad" ]] && break
+          echo -e "${DIM}Not among the proposed models listed above: ${bad}. Use only the listed IDs.${RESET}"
+          rejected=()
+        done
+        if [[ ${#rejected[@]} -eq 0 ]]; then
+          echo -e "${DIM}No valid answer.${RESET}"
+          MR_CANCELLED=true
+          return 0
+        fi
+        args+=(--unavailable "$(IFS=,; echo "${rejected[*]}")")
+        ;;
+    esac
+  fi
+  for pair in "${MR_LEVELS[@]}"; do
+    model="${pair%% *}"
+    effort="${pair#* }"
+    if model_refresh_in_list "$model" "${rejected[@]}"; then
+      continue
+    fi
+    echo -ne "${YELLOW}Does /model offer reasoning level '${effort}' for ${model}? [y/N] (No = ${model} is not used where '${effort}' is needed): ${RESET}"
+    answer=""
+    if ! model_refresh_read answer; then
+      MR_CANCELLED=true
+      return 0
+    fi
+    case "$answer" in
+      y|Y|yes|YES|Yes) args+=(--level "${model}:${effort}=yes") ;;
+      *) args+=(--level "${model}:${effort}=no") ;;
+    esac
+  done
+  echo -e "\n${CYAN}Recomputing the mapping with your answers (same frozen prices and evidence; nothing saved)...${RESET}"
+  run_model_refresh_helper "${args[@]}" || rc=$?
+  echo ""
+  return "$rc"
+}
+
 refresh_model_routing() {
   if [[ ! -f "$MODEL_REFRESH_HELPER" ]]; then
     echo -e "${RED}Model refresh helper not found at $MODEL_REFRESH_HELPER — subagent routing unchanged. Set COPILOT_MODEL_REFRESH_HELPER or re-run the installer.${RESET}" >&2
@@ -1897,46 +2103,49 @@ refresh_model_routing() {
   fi
 
   echo -e "\n${CYAN}Fetching current official GitHub Copilot prices and model capability docs...${RESET}"
-  local rc=0 proposal_id="" answer="" selection="" select_rc=0 has_alternatives=false selected=false
-  run_model_refresh_helper propose || rc=$?
+  local rc=0 proposal_id="" selection="" select_rc=0 rounds=0 alt_asked=false failed="" cancelled=false
+  local offered="" alt_n confirm="" apply_rc=0
+  run_model_refresh_helper propose --review || rc=$?
   echo ""
 
-  # Optional, once: record what you verified in /model, then re-evaluate.
-  if [[ "$MR_VERIFY" == "true" ]] && [[ $rc -eq 0 || $rc -eq 3 ]]; then
-    echo -ne "${YELLOW}Type 'v' to record the models/reasoning levels you verified in Copilot CLI's /model picker (Enter skips): ${RESET}"
-    prompt_read answer
-    if [[ "$answer" == "v" || "$answer" == "V" ]]; then
-      local record_rc=0
-      python3 "$MODEL_REFRESH_HELPER" record-verified < /dev/tty || record_rc=$?
-      if [[ $record_rc -eq 0 ]]; then
-        if [[ "$MR_PROPOSAL_ID" =~ ^[0-9a-f]{16}$ ]]; then
-          python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$MR_PROPOSAL_ID" >/dev/null 2>&1 || true
-        fi
-        echo -e "\n${CYAN}Re-evaluating with your new record...${RESET}"
-        rc=0
-        run_model_refresh_helper propose || rc=$?
-        echo ""
-      else
-        echo -e "${DIM}Nothing was recorded; continuing with the evaluation above.${RESET}"
-      fi
+  # Review loop: every round answers at least one pending question about the
+  # displayed proposal, so it ends; it is also capped.
+  while true; do
+    if [[ $rc -ne 0 && $rc -ne 3 ]]; then
+      failed="Model refresh did not complete (exit $rc)"
+      break
     fi
-  fi
-
-  proposal_id="$MR_PROPOSAL_ID"
-  [[ ${#MR_ALTERNATIVES[@]} -gt 0 ]] && has_alternatives=true
-
-  if [[ $rc -eq 3 && "$has_alternatives" != "true" ]]; then
-    : # No changes: the helper already printed the final (kept) routing.
-  elif [[ $rc -ne 0 && $rc -ne 3 ]]; then
-    echo -e "${RED}Model refresh did not complete (exit $rc) — subagent routing unchanged.${RESET}" >&2
-    show_model_routing_status
-  elif [[ ! "$proposal_id" =~ ^[0-9a-f]{16}$ ]]; then
-    echo -e "${RED}Model refresh returned no valid proposal — subagent routing unchanged.${RESET}" >&2
-    show_model_routing_status
-  else
-    # Optional alternatives: never pre-selected; Enter keeps none.
-    if [[ "$has_alternatives" == "true" ]]; then
-      local offered="" alt_n
+    if [[ "$MR_PROTOCOL_OK" != "true" || -z "$MR_REVIEW" ]]; then
+      failed="Model refresh returned malformed review output"
+      break
+    fi
+    if [[ $rc -eq 3 && -z "$MR_PROPOSAL_ID" ]]; then
+      break # No changes: the helper already printed the final (kept) routing.
+    fi
+    if [[ ! "$MR_PROPOSAL_ID" =~ ^[0-9a-f]{16}$ ]]; then
+      failed="Model refresh returned no valid proposal"
+      break
+    fi
+    proposal_id="$MR_PROPOSAL_ID"
+    if [[ "$MR_REVIEW" == "pending" ]]; then
+      rounds=$((rounds + 1))
+      if [[ $rounds -gt $MODEL_REFRESH_MAX_ROUNDS ]]; then
+        echo -e "${RED}Too many review rounds — nothing was applied.${RESET}" >&2
+        cancelled=true
+        break
+      fi
+      rc=0
+      model_refresh_review_round || rc=$?
+      if [[ "$MR_CANCELLED" == "true" ]]; then
+        cancelled=true
+        break
+      fi
+      continue
+    fi
+    # Optional alternatives (latest table only; never pre-selected; Enter keeps none).
+    if [[ ${#MR_ALTERNATIVES[@]} -gt 0 && "$alt_asked" != "true" ]]; then
+      alt_asked=true
+      offered=""
       for alt_n in "${MR_ALTERNATIVES[@]}"; do
         offered+="${offered:+, }#$alt_n"
       done
@@ -1948,41 +2157,50 @@ refresh_model_routing() {
         if model_refresh_selection_valid "$selection"; then
           select_rc=0
           run_model_refresh_helper select --proposal-id "$proposal_id" --choose "$selection" || select_rc=$?
-          if [[ $select_rc -ne 0 || ! "$MR_PROPOSAL_ID" =~ ^[0-9a-f]{16}$ ]]; then
+          if [[ $select_rc -ne 0 || "$MR_PROTOCOL_OK" != "true" || -z "$MR_REVIEW" || ! "$MR_PROPOSAL_ID" =~ ^[0-9a-f]{16}$ ]]; then
             echo -e "${RED}Selecting the alternatives did not complete (exit $select_rc) — nothing was applied.${RESET}" >&2
-            python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" >/dev/null 2>&1 || true
+            model_refresh_discard_latest "$proposal_id"
             show_model_routing_status
             echo ""
             pause_for_menu
             return 0
           fi
-          proposal_id="$MR_PROPOSAL_ID"
-          selected=true
+          rc=0
+          continue # a selected alternative may need its own /model check
         else
           echo -e "${DIM}Not a list of offered numbers — no alternative was selected.${RESET}"
         fi
       fi
     fi
-    if [[ $rc -eq 3 && "$selected" != "true" ]]; then
-      # Nothing proposed by default and nothing selected: drop the no-op proposal.
-      python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" || true
+    break
+  done
+
+  if [[ -n "$failed" ]]; then
+    echo -e "${RED}${failed} — subagent routing unchanged.${RESET}" >&2
+    model_refresh_discard_latest "$proposal_id"
+    show_model_routing_status
+  elif [[ "$cancelled" == "true" ]]; then
+    python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" || true
+  elif [[ -z "$MR_PROPOSAL_ID" ]]; then
+    : # No changes (possibly after your answers): the final kept routing was printed.
+  elif [[ $rc -eq 3 && $MR_SELECTED -eq 0 ]]; then
+    # Nothing proposed and nothing selected: drop the no-op proposal.
+    python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" || true
+  else
+    echo ""
+    if [[ $MR_SELECTED -gt 0 ]]; then
+      echo -e "${YELLOW}This includes the optional alternatives YOU selected (see their price impact above).${RESET}"
+    fi
+    echo -ne "${YELLOW}Type 'yes' to apply these subagent routing changes (categorical fit, not measured quality; anything else cancels): ${RESET}"
+    prompt_read confirm
+    if [[ "$confirm" == "yes" ]]; then
+      python3 "$MODEL_REFRESH_HELPER" apply --proposal-id "$proposal_id" || apply_rc=$?
+      if [[ $apply_rc -ne 0 ]]; then
+        echo -e "${RED}Apply did not complete (exit $apply_rc) — see the message above; current routing:${RESET}" >&2
+        show_model_routing_status
+      fi
     else
-      echo ""
-      if [[ "$selected" == "true" ]]; then
-        echo -e "${YELLOW}This includes the optional alternatives YOU selected (see their price impact above).${RESET}"
-      fi
-      echo -ne "${YELLOW}Type 'yes' to apply these subagent routing changes (categorical fit, not measured quality; anything else cancels): ${RESET}"
-      local confirm="" apply_rc=0
-      prompt_read confirm
-      if [[ "$confirm" == "yes" ]]; then
-        python3 "$MODEL_REFRESH_HELPER" apply --proposal-id "$proposal_id" || apply_rc=$?
-        if [[ $apply_rc -ne 0 ]]; then
-          echo -e "${RED}Apply did not complete (exit $apply_rc) — see the message above; current routing:${RESET}" >&2
-          show_model_routing_status
-        fi
-      else
-        python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" || true
-      fi
+      python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" || true
     fi
   fi
   echo ""
@@ -2367,13 +2585,15 @@ ${BOLD}Features:${RESET}
     change), lists every model in view with price, documented capabilities
     and whether YOU verified it as available, shows the current vs proposed
     model/effort/context per subagent route with rates, reasons and
-    evidence, and applies local overrides only after you type \`yes\`
-    (default No). Optional, each skipped with Enter: \`v\` records the
-    models/reasoning levels you verified in the Copilot CLI /model picker
-    (saved only after its own \`yes\`), and numbered optional alternatives
-    (possibly more expensive, with a documented differentiator) that are
-    never pre-selected. Shipped defaults are never edited; your own
-    /subagents values are never overwritten. Undo with:
+    evidence, then the proposed mapping table and asks only whether ITS
+    proposed models are available in /model [y/N] (on No you name the
+    unavailable ones and it recomputes, repeating until nothing is
+    pending), plus y/N for any exact reasoning level it cannot verify.
+    Answers are used for that run only, never saved. Numbered optional
+    alternatives (possibly more expensive, with a documented
+    differentiator) are never pre-selected. Local overrides are applied
+    only after a separate \`yes\` (default No). Shipped defaults are never
+    edited; your own /subagents values are never overwritten. Undo with:
     copilot-model-refresh.py reset --yes
   - Prompts to keep/rename/delete a session when \`copilot\` exits
   - For sessions created by copilot-s from now on: shows the context fill

@@ -2428,5 +2428,386 @@ class TestOptionalSelectionAndEvidence(LiveRefreshCase):
         self.assertEqual(self.routing_bytes(), before)
 
 
+class TestProposalScopedReview(LiveRefreshCase):
+    """Actual helper transactions; all model facts and transport are synthetic."""
+
+    def setUp(self):
+        super().setUp()
+        self.config.pop("available_models")
+        self.save_config()
+        self.markdown = self.live_prices(new=5, cheap=6)
+
+    def protected_bytes(self):
+        return dict(self.routing_bytes(), **{
+            str(p): Path(p).read_bytes() if Path(p).exists() else None
+            for p in (self.paths.user_config, self.paths.verified, self.routing, self.catalog_path)
+        })
+
+    def machine(self, output, marker):
+        return [line.split("\t")[1:] for line in output.splitlines()
+                if line.startswith(marker + "\t")]
+
+    def frozen(self, output):
+        markers = self.machine(output, "PROPOSAL")
+        self.assertEqual(len(markers), 1, output)
+        doc = self.read_json(self.paths.proposal)
+        self.assertEqual(markers, [[doc["proposal_id"]]])
+        key = Path(self.paths.proposal_key).read_bytes().strip()
+        body = {k: v for k, v in doc.items() if k != "seal"}
+        canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=True).encode("ascii")
+        self.assertEqual(doc["seal"], hmac.new(key, canonical, hashlib.sha256).hexdigest())
+        return doc
+
+    def review_proposal(self):
+        self.context()
+        rc, out, err = self.cli("propose", "--offline", "--review")
+        self.assertEqual(rc, 0, out + err)
+        return self.frozen(out), out
+
+    def answer(self, doc, *answers, now=NOW + 1):
+        with mock.patch.object(self.mod, "refresh_pricing", side_effect=AssertionError("review fetched prices")), \
+                mock.patch.object(self.mod, "_fetch_capability_bytes",
+                                  side_effect=AssertionError("review fetched docs")):
+            return self.cli("review", "--proposal-id", doc["proposal_id"], *answers, now=now)
+
+    def test_first_proposal_needs_no_inventory_and_accept_all_is_one_session_only_answer(self):
+        before = self.protected_bytes()
+        with mock.patch.object(self.mod, "_ask", side_effect=AssertionError("asked for inventory")):
+            rc, out, err = self.cli("propose", "--review")
+        self.assertEqual(rc, 0, out + err)
+        first = self.frozen(out)
+        self.assertEqual(set(first["overrides"]), set(self.defaults))
+        self.assertTrue(all(v == dict(self.defaults[k], model=NEW)
+                            for k, v in first["overrides"].items()))
+        self.assertEqual(self.machine(out, "CHECK"), [[NEW, ",".join(self.defaults)]])
+        self.assertEqual(self.machine(out, "LEVEL"), [])
+        self.assertEqual(self.machine(out, "REVIEW"), [["pending"]])
+        self.assertLess(out.index("Routes (current -> proposed)"), out.index("CHECK\t"))
+        self.assertNotIn("ACTION REQUIRED", out)
+        self.assertNotIn("VERIFY\t", out)
+        self.assertEqual(len(self.fetches), 1)
+        self.assertEqual(len(self.docs_fetches), 2)
+        self.assertEqual(self.protected_bytes(), before)
+
+        rc, out, err = self.answer(first, "--available-all")
+        self.assertEqual(rc, 0, out + err)
+        checked = self.frozen(out)
+        self.assertEqual(checked["review"], {
+            "round": 1, "available": [NEW], "rejected": [], "levels": {}})
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        self.assertEqual(self.machine(out, "CHECK"), [])
+        self.assertEqual(checked["digests"], first["digests"])
+        self.assertEqual(checked["snapshot_id"], first["snapshot_id"])
+        self.assertEqual(checked["created_epoch"], first["created_epoch"])
+        self.assertEqual(checked["expires_epoch"], first["expires_epoch"])
+        self.assertNotEqual(checked["proposal_id"], first["proposal_id"])
+        self.assertNotEqual(checked["seal"], first["seal"])
+        self.assertEqual(self.protected_bytes(), before)
+        rc, out, err = self.answer(checked, "--available-all")
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("nothing", err)
+        self.assertEqual(self.protected_bytes(), before)
+
+        rc, out, err = self.cli("apply", "--proposal-id", checked["proposal_id"], now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read_json(self.paths.effective)["routes"]["tester"]["values"],
+                         dict(self.defaults["tester"], model=NEW))
+        for path in (self.paths.user_config, self.paths.verified, self.routing, self.catalog_path):
+            self.assertEqual(self.protected_bytes()[str(path)], before[str(path)])
+        self.assertEqual(len(self.fetches), 1)
+        self.assertEqual(len(self.docs_fetches), 2)
+
+    def test_reject_repropose_accept_uses_same_snapshot_and_excludes_rejected_in_every_route(self):
+        before = self.protected_bytes()
+        first, _ = self.review_proposal()
+        rc, out, err = self.answer(first, "--unavailable", NEW.upper())
+        self.assertEqual(rc, 0, out + err)
+        revised = self.frozen(out)
+        self.assertEqual(revised["review"]["rejected"], [NEW])
+        self.assertEqual(self.machine(out, "CHECK"), [[CHEAP, ",".join(self.defaults)]])
+        self.assertTrue(all(v == dict(self.defaults[k], model=CHEAP)
+                            for k, v in revised["overrides"].items()))
+        self.assertTrue(all(a["values"]["model"] != NEW for a in revised["alternatives"]))
+        for field in ("snapshot_id", "digests", "created_epoch", "expires_epoch"):
+            self.assertEqual(revised[field], first[field])
+        self.assertNotEqual(revised["proposal_id"], first["proposal_id"])
+        rc, out, err = self.answer(first, "--available-all")
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("does not match", err)
+
+        rc, out, err = self.answer(revised, "--available-all", now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        checked = self.frozen(out)
+        self.assertEqual(checked["review"]["available"], [CHEAP])
+        self.assertEqual(checked["review"]["rejected"], [NEW])
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        ctx = self.mod.build_context(self.paths, NOW + 2)
+        ctx["review"] = self.mod.validate_review(checked["review"])
+        for key, row in self.rows(ctx).items():
+            self.assertEqual(row["proposed"], dict(self.defaults[key], model=CHEAP))
+            self.assertNotIn(NEW, row["tentative"])
+            self.assertTrue(all(a["model"] != NEW for a in row["alternatives"]))
+        self.assertEqual(self.protected_bytes(), before)
+        self.assertEqual(self.events, [])
+
+    def test_exhausting_candidates_removes_proposal_and_keeps_current_mapping(self):
+        before = self.protected_bytes()
+        first, _ = self.review_proposal()
+        rc, out, err = self.answer(first, "--unavailable", NEW)
+        self.assertEqual(rc, 0, out + err)
+        second = self.frozen(out)
+        rc, out, err = self.answer(second, "--unavailable", CHEAP, now=NOW + 2)
+        self.assertEqual(rc, 3, out + err)
+        self.assertIn("No eligible replacement remains", out)
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        self.assertEqual(self.machine(out, "PROPOSAL"), [])
+        self.assertEqual(self.machine(out, "CHECK"), [])
+        self.assertFalse(Path(self.paths.proposal).exists())
+        self.assertEqual(self.protected_bytes(), before)
+        self.assertEqual(self.events, [])
+
+    def test_invalid_out_of_map_and_unasked_level_answers_never_change_proposal(self):
+        self.config.pop("verified_capabilities")
+        self.save_config()
+        doc, _ = self.review_proposal()
+        before = self.protected_bytes()
+        frozen = Path(self.paths.proposal).read_bytes()
+        for args in (
+            (), ("--unavailable", ""), ("--unavailable", USER_ONLY),
+            ("--unavailable", UNKNOWN), ("--unavailable", self.defaults["coder"]["model"]),
+            ("--unavailable", NEW + ",../invalid"),
+            ("--available-all", "--level", USER_ONLY + ":low=yes"),
+            ("--available-all", "--level", NEW + ":max=yes"),
+            ("--available-all", "--level", NEW + ":high=unknown"),
+            ("--available-all", "--level", NEW + ":high=yes", "--level", NEW + ":high=no"),
+            ("--unavailable", NEW, "--level", NEW + ":high=yes"),
+        ):
+            with self.subTest(args=args):
+                rc, out, err = self.answer(doc, *args)
+                self.assertEqual(rc, 2, out + err)
+                self.assertEqual(Path(self.paths.proposal).read_bytes(), frozen)
+                self.assertEqual(self.protected_bytes(), before)
+
+    def test_availability_does_not_attest_levels_and_exact_yes_no_never_downgrades(self):
+        self.config.pop("verified_capabilities")
+        self.save_config()
+        before = self.protected_bytes()
+        doc, out = self.review_proposal()
+        efforts = {v["reasoning_effort"] for v in self.defaults.values()}
+        self.assertEqual({tuple(row) for row in self.machine(out, "LEVEL")},
+                         {(NEW, effort) for effort in efforts})
+        rc, out, err = self.answer(doc, "--available-all")
+        self.assertEqual(rc, 0, out + err)
+        available = self.frozen(out)
+        self.assertEqual(available["review"]["levels"], {})
+        self.assertEqual(self.machine(out, "CHECK"), [])
+        self.assertEqual({tuple(row) for row in self.machine(out, "LEVEL")},
+                         {(NEW, effort) for effort in efforts})
+        answers = []
+        for effort in sorted(efforts):
+            answers += ["--level", "%s:%s=%s" % (NEW, effort, "no" if effort == "high" else "yes")]
+        rc, out, err = self.answer(available, *answers, now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        revised = self.frozen(out)
+        high_routes = {k for k, v in self.defaults.items() if v["reasoning_effort"] == "high"}
+        for key, values in revised["overrides"].items():
+            self.assertEqual(values["reasoning_effort"], self.defaults[key]["reasoning_effort"])
+            self.assertEqual(values["context_tier"], self.defaults[key]["context_tier"])
+            self.assertEqual(values["model"], CHEAP if key in high_routes else NEW)
+        self.assertEqual(self.machine(out, "CHECK"), [[CHEAP, ",".join(
+            k for k in self.defaults if k in high_routes)]])
+        self.assertEqual(self.machine(out, "LEVEL"), [[CHEAP, "high"]])
+        rc, out, err = self.answer(revised, "--available-all", "--level", CHEAP + ":high=yes", now=NOW + 3)
+        self.assertEqual(rc, 0, out + err)
+        checked = self.frozen(out)
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        self.assertFalse(checked["review"]["levels"][NEW]["high"])
+        self.assertEqual(self.protected_bytes(), before)
+
+    def test_unknown_level_keeps_apply_tentative_and_no_for_every_level_exhausts_candidates(self):
+        self.config.pop("verified_capabilities")
+        self.save_config()
+        before = self.protected_bytes()
+        first, _ = self.review_proposal()
+        rc, out, err = self.answer(first, "--available-all")
+        self.assertEqual(rc, 0, out + err)
+        unknown = self.frozen(out)
+        rc, out, err = self.cli("apply", "--proposal-id", unknown["proposal_id"], now=NOW + 1)
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("tentative", err)
+        self.assertEqual(self.protected_bytes(), before)
+        first, _ = self.review_proposal()
+        efforts = sorted({v["reasoning_effort"] for v in self.defaults.values()})
+        for mid in (NEW, CHEAP):
+            args = ["--available-all"]
+            for effort in efforts:
+                args += ["--level", "%s:%s=no" % (mid, effort)]
+            rc, out, err = self.answer(first, *args)
+            if mid == NEW:
+                self.assertEqual(rc, 0, out + err)
+                first = self.frozen(out)
+            else:
+                self.assertEqual(rc, 3, out + err)
+                self.assertNotIn("PROPOSAL\t", out)
+        self.assertEqual(self.protected_bytes(), before)
+
+    def test_pending_availability_cannot_apply_or_answer_a_plain_proposal(self):
+        before = self.protected_bytes()
+        doc, _ = self.review_proposal()
+        rc, out, err = self.cli("apply", "--proposal-id", doc["proposal_id"])
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("tentative", err)
+        self.assertEqual(self.protected_bytes(), before)
+        self.config["available_models"] = {"verified_on": "2026-11-16", "models": list(self.ids)}
+        self.save_config()
+        plain = self.proposal()
+        frozen = Path(self.paths.proposal).read_bytes()
+        rc, out, err = self.cli("review", "--proposal-id", plain, "--available-all")
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("without --review", err)
+        self.assertEqual(Path(self.paths.proposal).read_bytes(), frozen)
+
+    def test_selected_premiums_are_reviewed_and_carried_by_route_values_not_old_numbers(self):
+        self.premium(cheap=11)
+        before = self.protected_bytes()
+        rc, out, err = self.cli("propose", "--offline", "--review")
+        self.assertEqual(rc, 3, out + err)
+        first = self.frozen(out)
+        self.assertEqual(first["overrides"], {})
+        self.assertEqual(first["selected"], [])
+        self.assertEqual(self.machine(out, "CHECK"), [], "unselected alternatives must not ask questions")
+        keep_n = self.numbered(first["proposal_id"], "tester", NEW)
+        drop_n = self.numbered(first["proposal_id"], "coder", CHEAP)
+        rc, out, err = self.cli("select", "--proposal-id", first["proposal_id"],
+                                "--choose", "%s,%s" % (keep_n, drop_n), now=NOW + 1)
+        self.assertEqual(rc, 0, out + err)
+        selected = self.frozen(out)
+        self.assertEqual({row[0] for row in self.machine(out, "CHECK")}, {NEW, CHEAP})
+        self.assertEqual(self.machine(out, "REVIEW"), [["pending"]])
+        self.assertIn("costs MORE", out)
+        self.assertEqual(self.protected_bytes(), before)
+        rc, out, err = self.answer(selected, "--unavailable", CHEAP, now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        checked = self.frozen(out)
+        self.assertEqual(checked["overrides"], {"tester": dict(self.defaults["tester"], model=NEW)})
+        kept = [a for a in checked["alternatives"] if a["n"] in checked["selected"]]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0]["route"], "tester")
+        self.assertEqual(kept[0]["values"], dict(self.defaults["tester"], model=NEW))
+        self.assertNotEqual(kept[0]["n"], keep_n, "the renumbered table must not reuse stale selections")
+        self.assertTrue(all(a["values"]["model"] != CHEAP for a in checked["alternatives"]))
+        self.assertIn("dropped", out)
+        self.assertEqual(self.machine(out, "SELECTED"), [["1"]])
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        for field in ("snapshot_id", "digests", "created_epoch", "expires_epoch"):
+            self.assertEqual(checked[field], first[field])
+        self.assertEqual(self.protected_bytes(), before)
+
+    def test_changed_inputs_tampering_and_expiry_refuse_review_and_checked_apply(self):
+        original = self.protected_bytes()
+        for command in ("review", "apply"):
+            for changed in ("settings", "user_config", "routing", "catalog", "verified",
+                            "pricing", "capabilities", "review-seal", "expired"):
+                with self.subTest(command=command, changed=changed):
+                    for path, raw in original.items():
+                        if raw is None:
+                            Path(path).unlink(missing_ok=True)
+                        else:
+                            self.write(path, raw)
+                    doc, _ = self.review_proposal()
+                    if command == "apply":
+                        rc, out, err = self.answer(doc, "--available-all")
+                        self.assertEqual(rc, 0, out + err)
+                        doc = self.frozen(out)
+                    if changed == "settings":
+                        data = copy.deepcopy(self.initial_settings)
+                        data["theme"] = "edited-after-proposal"
+                        self.write_json(self.paths.settings, data)
+                    elif changed == "user_config":
+                        data = copy.deepcopy(self.config)
+                        data["pins"] = {"tester": {"model": USER_ONLY}}
+                        self.write_json(self.paths.user_config, data)
+                    elif changed == "routing":
+                        self.write(self.routing, Path(self.routing).read_bytes() + b"\n# changed\n")
+                    elif changed == "catalog":
+                        data = copy.deepcopy(self.catalog)
+                        data["models"][CHEAP]["display_name"] = "Changed fixture display name"
+                        self.write_json(self.catalog_path, data)
+                    elif changed == "verified":
+                        self.write_json(self.paths.verified, self.verified_doc())
+                    elif changed == "pricing":
+                        data = self.read_json(self.pricing.official_pricing_cache_path())
+                        data["models"][NEW]["tiers"]["default"]["input"] = 6
+                        self.write_json(self.pricing.official_pricing_cache_path(), data)
+                    elif changed == "capabilities":
+                        data = self.read_json(self.paths.capabilities)
+                        data["sources"]["model_comparison"]["sections"]["tasks"]["models"][NEW]["excels_at"] = "edited"
+                        self.write_json(self.paths.capabilities, data)
+                    elif changed == "review-seal":
+                        data = copy.deepcopy(doc)
+                        data["review"]["levels"][NEW] = {"max": True}
+                        self.write_json(self.paths.proposal, data)
+                    before = self.protected_bytes()
+                    args = ("--available-all",) if command == "review" else ()
+                    now = NOW + 901 if changed == "expired" else NOW + 2
+                    with mock.patch.object(self.mod, "refresh_pricing", side_effect=AssertionError("fetched")), \
+                            mock.patch.object(self.mod, "_fetch_capability_bytes",
+                                              side_effect=AssertionError("fetched")):
+                        rc, out, err = self.cli(command, "--proposal-id", doc["proposal_id"], *args, now=now)
+                    self.assertEqual(rc, 4, out + err)
+                    self.assertIn("expired" if changed == "expired" else
+                                  "altered" if changed == "review-seal" else "changed", err)
+                    self.assertEqual(self.protected_bytes(), before)
+
+    def test_evidence_expiring_within_original_ttl_refuses_review_without_refetch(self):
+        before = self.protected_bytes()
+        for evidence in ("pricing", "supported_models"):
+            with self.subTest(evidence=evidence):
+                self.seed_cache(age=DAY - 100 if evidence == "pricing" else 0)
+                self.seed_docs({"supported_models": 3 * DAY - 100} if evidence == "supported_models" else {})
+                rc, out, err = self.cli("propose", "--offline", "--review")
+                self.assertEqual(rc, 0, out + err)
+                doc = self.frozen(out)
+                rc, out, err = self.answer(doc, "--available-all", now=NOW + 101)
+                self.assertEqual(rc, 4, out + err)
+                self.assertIn("changed", err)
+                self.assertEqual(self.protected_bytes(), before)
+                self.assertEqual(self.events, [])
+
+    def test_review_preserves_native_pins_config_pins_and_unknown_price_fallback(self):
+        settings = copy.deepcopy(self.initial_settings)
+        settings["subagents"]["agents"]["coder"] = {"model": "native-choice", "effortLevel": "inherit"}
+        self.write_json(self.paths.settings, settings)
+        self.config["pins"] = {"reviewer.stronger": {"reasoning_effort": "max"}}
+        self.save_config()
+        task_model = self.defaults["task"]["model"]
+        self.markdown = b"\n".join(line for line in self.markdown.splitlines()
+                                  if not line.startswith(("| %s |" % task_model).encode()))
+        before = self.protected_bytes()
+        doc, out = self.review_proposal()
+        self.assertNotIn("coder", doc["overrides"])
+        self.assertNotIn("reviewer.stronger", doc["overrides"])
+        self.assertNotIn("task", doc["overrides"])
+        self.assertIn("native-choice", out)
+        self.assertIn("not in the current official pricing", out)
+        rc, out, err = self.answer(doc, "--available-all")
+        self.assertEqual(rc, 0, out + err)
+        checked = self.frozen(out)
+        self.assertEqual(self.protected_bytes(), before)
+        rc, out, err = self.cli("apply", "--proposal-id", checked["proposal_id"], now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        after = self.read_json(self.paths.settings)["subagents"]["agents"]
+        self.assertEqual(after["coder"], settings["subagents"]["agents"]["coder"])
+        self.assertNotIn("task", after)
+        self.assertEqual(Path(self.paths.user_config).read_bytes(), before[self.paths.user_config])
+        rc, out, err = self.cli("status", "--instructions")
+        self.assertEqual(rc, 0, out + err)
+        routes = self.live_routes(out)
+        self.assertEqual(routes["coder"]["model"], "OMIT")
+        self.assertEqual(routes["task"], self.defaults["task"])
+        self.assertEqual(routes["reviewer.stronger"]["reasoning_effort"], "max")
+
+
 if __name__ == "__main__":
     unittest.main()

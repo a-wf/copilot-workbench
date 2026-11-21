@@ -724,7 +724,8 @@ layers confirmed local overrides on top of them.
   Otherwise the route is
   kept with the reason; user-fixable blocks (availability, reasoning level)
   end the output with an ACTION REQUIRED block and a config example (and
-  `propose` prints `VERIFY<TAB>needed` so `copilot-s` can offer `v`). The
+  plain `propose` prints `VERIFY<TAB>needed`; `copilot-s` uses review mode
+  instead, below). The
   table states that fit is categorical, not measured or equal quality.
 - **Optional alternatives.** Per unpinned route with a known current
   price, an eligible model (every gate above) in the route's accepted task
@@ -741,7 +742,32 @@ layers confirmed local overrides on top of them.
   `ALTERNATIVE<TAB>n<TAB>route<TAB>model`. None is ever pre-selected: when
   nothing else changes, `propose` still exits 3 but freezes a no-op
   proposal so an explicit selection is possible.
-- **Two-phase apply.** `propose` writes `pending-proposal.json` (format 2,
+- **Review mode (`propose --review`, what menu `p` runs).** A candidate
+  whose ONLY failing gates are availability and/or the exact reasoning
+  level (user-fixable codes) is kept as tentatively eligible and may be
+  proposed; every other gate, pins, the 10% rule and "never an automatic
+  premium" are unchanged, and current routes stay the fallback. The
+  proposal seals a `review` object (round, models you confirmed available,
+  models you called unavailable, yes/no per model+level). Output adds the
+  mapping table, each proposed model once (routes, needed levels, price,
+  rationale, what is pending) and machine lines
+  `CHECK<TAB>model<TAB>routes`, `LEVEL<TAB>model<TAB>effort`,
+  `REVIEW<TAB>pending|complete` and `SELECTED<TAB>count`. `review
+  --proposal-id ID (--available-all | --unavailable IDS) [--level
+  MODEL:EFFORT=yes|no ...]` accepts answers ONLY for the displayed CHECK /
+  LEVEL items (every CHECK model must be answered; listed IDs must be a
+  subset), re-derives cache-only from the same frozen inputs (refusing on
+  any digest/evidence change or expiry), applies the answers — an
+  unavailable model is excluded even if an older saved record lists it; a
+  "no" level excludes the model wherever that level is needed — and writes
+  a new sealed proposal (new id, same expiry; selections carried only by
+  identity, dropped if no longer offered). Answers are never written to
+  `verified-models.json`, `user-config.json` or routing files. Each round
+  answers at least one item, and rounds are capped (25 helper, 20 menu).
+  `apply` refuses any proposal that still has pending items. Saved
+  availability/level evidence is always reused first; `record-verified`
+  remains a separate command.
+- **Two-phase apply.** `propose` writes `pending-proposal.json` (format 3,
   15 min TTL) with digests of settings, state, user config, verified
   record, routing defaults, catalog, capability evidence, pricing snapshot
   and generated files, the expected output digests, an evidence digest

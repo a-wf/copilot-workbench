@@ -6,6 +6,35 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — menu `p` asks about the proposed models instead of a full `/model` inventory (model-live-refresh-c2)
+
+- `copilot-model-refresh.py propose --review` (used by `copilot-s` menu `p`)
+  may propose a candidate blocked ONLY by unverified availability or an
+  unverified exact reasoning level, marked TENTATIVE; all other gates
+  (fresh pricing, official Copilot CLI support, Category, task area,
+  1M context, pins, the 10% rule, no automatic premium) are unchanged. It
+  prints the mapping table first, then each proposed model once (routes,
+  needed levels, price, rationale) and the machine lines `CHECK`, `LEVEL`,
+  `REVIEW` and `SELECTED`.
+- New `review --proposal-id ID (--available-all | --unavailable IDS)
+  [--level MODEL:EFFORT=yes|no]`: answers only the displayed items, keeps
+  them sealed inside a new proposal (new id, same expiry, same frozen
+  inputs; nothing re-fetched) and recomputes the mapping. Unavailable models
+  are excluded for the rest of the run even if an older record lists them;
+  a "no" level excludes that model where the level is needed (never
+  downgraded). Answers are never saved to `verified-models.json` or
+  `user-config.json`. `apply` refuses a proposal with anything pending.
+  Proposal format 3.
+- `copilot-s` menu `p`: "Are all these proposed models available in
+  /model? [y/N]"; on No you name the unavailable ones from the list
+  (validated, re-asked; Enter/EOF cancels), plus y/N per unverified exact
+  level; repeats (bounded) until nothing is pending, then offers optional
+  alternatives once (a selected one is checked the same way) and asks for
+  the separate exact `yes`. The `v` full-inventory recorder is no longer
+  part of the menu; `copilot-model-refresh.py record-verified` remains.
+  Malformed machine lines fail closed. Help, README and architecture docs
+  updated.
+
 ### Added — live official model capabilities, full model list and optional alternatives in menu `p` (model-live-refresh-c1)
 
 - `copilot-model-refresh.py` now fetches, in the same run as the price

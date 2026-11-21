@@ -2058,6 +2058,9 @@ class TestModelRefreshMenu(BaseHomeTestCase):
     CONFIRM = "anything else cancels):"
     PAUSE = "Press Enter to return to the menu..."
     PROPOSAL_ID = "0123456789abcdef"
+    AVAILABLE = "Are all these proposed models available in /model? [y/N]:"
+    UNAVAILABLE = "Enter cancels):"
+    REVIEW_ID = "1111111111111111"
 
     def _refresh_env(self, extra=None):
         helper = os.path.join(self.home, "fake-refresh.py")
@@ -2070,6 +2073,14 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 "def real_helper():\n"
                 " os.environ['COPILOT_TASK_REPORT_HELPER']=os.environ['REAL_REPORT_HELPER']\n"
                 " runpy.run_path(os.environ['REAL_REFRESH_HELPER'],run_name='__main__')\n"
+                "if args[0] in ('propose','review','select') and os.environ.get('REFRESH_STEPS'):\n"
+                " with open(os.environ['REFRESH_LOG']) as f: calls=[json.loads(line) for line in f]\n"
+                " index=sum(c[0] in ('propose','review','select') for c in calls)-1\n"
+                " steps=json.loads(os.environ['REFRESH_STEPS'])\n"
+                " if index>=len(steps): print('unexpected extra review command'); sys.exit(9)\n"
+                " step=steps[index]\n"
+                " print('\\n'.join(step['lines']))\n"
+                " sys.exit(step.get('rc',0))\n"
                 "if args[0]=='propose':\n"
                 " if os.environ.get('REAL_PROPOSE')=='1': real_helper()\n"
                 " print('Routes current -> proposed; 15/75/5/5 assumption; categorical fit NOT measured quality')\n"
@@ -2079,6 +2090,8 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 "  print('ALTERNATIVE\\t1\\ttester\\tgpt-6.2-sol')\n"
                 "  print('ALTERNATIVE\\t2\\tcoder\\tfixture-premium')\n"
                 " if os.environ.get('REFRESH_VERIFY')=='1' and not os.path.exists(os.path.join(os.environ['HOME'],'.copilot/model-refresh/verified-models.json')): print('VERIFY\\tneeded')\n"
+                " print('REVIEW\\tcomplete')\n"
+                " print('SELECTED\\t0')\n"
                 " if rc==0 or (rc==3 and alts): print('PROPOSAL\\t'+os.environ.get('REFRESH_ID','0123456789abcdef'))\n"
                 " elif rc==3: print('Final effective routing (kept): ten routes')\n"
                 " else: print('fixture propose failed before a final table')\n"
@@ -2086,6 +2099,8 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 "if args[0]=='select':\n"
                 " rc=int(os.environ.get('SELECT_RC','0'))\n"
                 " print('You selected OPTIONAL alternatives; blended $/1M 10.00 -> 12.00 (+$2.00/1M, +20%)')\n"
+                " print('REVIEW\\tcomplete')\n"
+                " print('SELECTED\\t'+str(len(args[-1].split(','))))\n"
                 " if rc==0: print('PROPOSAL\\t'+os.environ.get('SELECT_ID','fedcba9876543210'))\n"
                 " sys.exit(rc)\n"
                 "if args[0]=='record-verified':\n"
@@ -2110,6 +2125,45 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         if extra:
             additions.update(extra)
         return self._env(additions)
+
+    def _review_reply(self, proposal_id=PROPOSAL_ID, checks=(), levels=(),
+                      alternatives=(), selected=0, rc=0):
+        lines = ["MAPPING TABLE: current -> proposed; proposed IDs " + ", ".join(checks)]
+        lines += ["CHECK\t%s\ttester" % mid for mid in checks]
+        lines += ["LEVEL\t%s\t%s" % (mid, effort) for mid, effort in levels]
+        lines += ["REVIEW\t" + ("pending" if checks or levels else "complete"),
+                  "SELECTED\t%d" % selected]
+        lines += ["ALTERNATIVE\t%s\ttester\tfixture-premium" % n for n in alternatives]
+        if proposal_id:
+            lines.append("PROPOSAL\t" + proposal_id)
+        else:
+            lines.append("Final effective routing (kept): ten routes")
+        return {"lines": lines, "rc": rc}
+
+    def _review_env(self, steps):
+        if os.path.exists(os.path.join(self.home, "refresh.jsonl")):
+            os.unlink(os.path.join(self.home, "refresh.jsonl"))
+        return self._refresh_env({"REFRESH_STEPS": json.dumps(steps)})
+
+    def _routing_snapshot(self):
+        paths = [
+            ".copilot/settings.json", ".copilot/model-refresh/state.json",
+            ".copilot/model-refresh/effective-routing.json",
+            ".copilot/model-refresh/verified-models.json",
+            ".copilot/model-refresh/user-config.json",
+        ]
+        paths += [os.path.relpath(os.path.join(directory, name), self.home)
+                  for directory, _, files in os.walk(os.path.join(self.home, ".copilot", "instructions"))
+                  for name in files]
+        snapshot = {}
+        for relative in paths:
+            path = os.path.join(self.home, relative)
+            if os.path.exists(path):
+                with open(path, "rb") as handle:
+                    snapshot[relative] = handle.read()
+            else:
+                snapshot[relative] = None
+        return snapshot
 
     def _calls(self):
         if not os.path.exists(self.refresh_log):
@@ -2136,7 +2190,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
             self.assertEqual(sum(row.startswith(label + "  ") for row in rows), 1, section)
         self.assertIn("native-status-choice", section)
 
-    def _scripted_tty(self, env, actions, args=(), timeout=12):
+    def _scripted_tty(self, env, actions, args=(), timeout=12, forbidden=()):
         pid, master = pty.fork()
         if pid == 0:
             os.chdir(self.cwd)
@@ -2166,6 +2220,10 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                             response = response()
                         os.write(master, response.encode())
                         answered += 1
+                    for marker in forbidden:
+                        if marker.encode() in output[cursor:]:
+                            self.fail("Unexpected model-review prompt: " + marker + "\n"
+                                      + output.decode(errors="replace"))
                 waited, child_status = os.waitpid(pid, os.WNOHANG)
                 if waited == pid:
                     status = os.waitstatus_to_exitcode(child_status)
@@ -2201,7 +2259,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         ])
         self.assertEqual(status, 0, out)
         self.assertEqual(self._calls(), [
-            ["propose"], ["apply", "--proposal-id", self.PROPOSAL_ID]])
+            ["propose", "--review"], ["apply", "--proposal-id", self.PROPOSAL_ID]])
         self.assertIn("Final effective routing", out)
         self.assertNotIn("PROPOSAL\t", out, "machine marker must not leak into display")
         self.assertNotIn("Session name (Enter for automatic):", out)
@@ -2230,7 +2288,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 ])
                 self.assertEqual(status, 0, out)
                 self.assertEqual(self._calls(), [
-                    ["propose"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+                    ["propose", "--review"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
                 self.assertIn("Cancelled", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
 
@@ -2247,7 +2305,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                     (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
                 ])
                 self.assertEqual(status, 0, out)
-                self.assertEqual(self._calls(), [["propose"]] + ([] if rc == 3 else [["status"]]))
+                self.assertEqual(self._calls(), [["propose", "--review"]] + ([] if rc == 3 else [["status"]]))
                 self.assertNotIn("Type 'yes'", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
 
@@ -2279,7 +2337,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                     (self.EMPTY_PROMPT, "q\n"),
                 ])
                 self.assertEqual(status, 0, out)
-                self.assertEqual(self._calls(), [["propose"], ["status"]])
+                self.assertEqual(self._calls(), [["propose", "--review"], ["status"]])
                 self._assert_final_ten_route_table(out)
                 self.assertNotIn("Type 'yes'", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
@@ -2355,7 +2413,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 ])
                 self.assertEqual(status, 0, out)
                 self.assertEqual(self._calls(), [
-                    ["propose"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
+                    ["propose", "--review"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
                     [command, "--proposal-id", selected_id]])
                 self.assertIn("+$2.00/1M, +20%", out)
                 self.assertNotIn("PROPOSAL\t", out)
@@ -2373,7 +2431,8 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                     (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
                 ])
                 self.assertEqual(status, 0, out)
-                self.assertEqual(self._calls(), [["propose"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+                self.assertEqual(self._calls(), [
+                    ["propose", "--review"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
                 self.assertNotIn("Type 'yes' to apply", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
 
@@ -2389,60 +2448,258 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 ])
                 self.assertEqual(status, 0, out)
                 self.assertEqual(self._calls(), [
-                    ["propose"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1,2"],
+                    ["propose", "--review"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1,2"],
                     ["discard", "--proposal-id", self.PROPOSAL_ID], ["status"]])
                 self.assertNotIn("Type 'yes' to apply", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
 
-    def test_verification_skip_or_failed_record_never_reproposes_or_applies_without_yes(self):
-        for answer, record in (("\n", False), ("v\n", True)):
-            with self.subTest(answer=repr(answer)):
-                env = self._refresh_env({"REFRESH_VERIFY": "1", "RECORD_RC": "3"})
-                if os.path.exists(self.refresh_log):
-                    os.unlink(self.refresh_log)
-                status, out = self._scripted_tty(env, [
-                    (self.EMPTY_PROMPT, "p\n"), ("(Enter skips):", answer),
-                    (self.CONFIRM, "no\n"), (self.PAUSE, self._assert_no_launch_at_pause),
-                    (self.EMPTY_PROMPT, "q\n"),
-                ])
-                self.assertEqual(status, 0, out)
-                self.assertEqual(self._calls(), [["propose"]] + ([["record-verified"]] if record else []) +
-                                 [["discard", "--proposal-id", self.PROPOSAL_ID]])
-                self.assertNotIn("VERIFY\t", out)
-                self.assertFalse(os.path.exists(self.copilot_log))
-
-    def test_real_verification_save_and_apply_have_independent_confirmations_without_settings_mutations(self):
+    def test_proposal_table_first_accept_all_once_and_separate_final_yes_without_saved_record(self):
         self._native_status_settings()
-        settings_path = os.path.join(self.home, ".copilot/settings.json")
-        with open(settings_path, "rb") as handle:
-            before = handle.read()
-        verified_path = os.path.join(self.home, ".copilot/model-refresh/verified-models.json")
-        for save, saved in (("YES\n", False), ("yes\n", True)):
-            with self.subTest(save=repr(save)):
-                env = self._refresh_env({"REFRESH_VERIFY": "1", "REAL_RECORD": "1"})
-                if os.path.exists(self.refresh_log):
-                    os.unlink(self.refresh_log)
+        before = self._routing_snapshot()
+
+        def checked_before_answer():
+            self.assertEqual(self._routing_snapshot(), before)
+            self.assertFalse(os.path.exists(self.copilot_log))
+            return "y\n"
+
+        def checked_before_final_yes():
+            self.assertEqual(self._routing_snapshot(), before)
+            self.assertEqual(self._calls(), [
+                ["propose", "--review"],
+                ["review", "--proposal-id", self.PROPOSAL_ID, "--available-all"]])
+            return "yes\n"
+
+        env = self._review_env([
+            self._review_reply(checks=("fixture-cheap",)),
+            self._review_reply(self.REVIEW_ID),
+        ])
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.AVAILABLE, checked_before_answer),
+            (self.CONFIRM, checked_before_final_yes), (self.PAUSE, self._assert_no_launch_at_pause),
+            (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertLess(out.index("MAPPING TABLE:"), out.index(self.AVAILABLE))
+        self.assertEqual(out.count(self.AVAILABLE), 1)
+        self.assertNotIn("Which of them are NOT available?", out)
+        self.assertNotIn("Enter all model", out)
+        self.assertEqual(self._calls()[-1], ["apply", "--proposal-id", self.REVIEW_ID])
+        self.assertFalse(any(c[0] == "record-verified" for c in self._calls()))
+        for marker in ("REVIEW\t", "CHECK\t", "LEVEL\t", "SELECTED\t", "PROPOSAL\t"):
+            self.assertNotIn(marker, out)
+
+    def test_no_asks_only_unavailable_ids_reprompts_out_of_map_and_reproposes_new_ids(self):
+        self._native_status_settings()
+        before = self._routing_snapshot()
+        env = self._review_env([
+            self._review_reply(checks=("fixture-cheap", "fixture-other")),
+            self._review_reply(self.REVIEW_ID, checks=("fixture-new",)),
+            self._review_reply("2222222222222222"),
+        ])
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.AVAILABLE, "n\n"),
+            (self.UNAVAILABLE, "not-proposed\n"), (self.UNAVAILABLE, "bad/id\n"),
+            (self.UNAVAILABLE, "FIXTURE-CHEAP,fixture-cheap\n"),
+            (self.AVAILABLE, "y\n"), (self.CONFIRM, "no\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(out.count("Not among the proposed models listed above:"), 2)
+        self.assertEqual(out.count("MAPPING TABLE:"), 3)
+        self.assertEqual(self._calls(), [
+            ["propose", "--review"],
+            ["review", "--proposal-id", self.PROPOSAL_ID, "--unavailable", "fixture-cheap"],
+            ["review", "--proposal-id", self.REVIEW_ID, "--available-all"],
+            ["discard", "--proposal-id", "2222222222222222"]])
+        self.assertEqual(self._routing_snapshot(), before)
+        self.assertNotIn("Enter all model", out)
+
+    def test_unavailable_enter_eof_three_invalid_lists_and_availability_eof_cancel(self):
+        for answer, ids in (("n\n", ("\n",)), ("n\n", ("\x04",)),
+                            ("n\n", ("other\n", "bad/id\n", "fixture-missing\n")),
+                            ("\x04", ())):
+            with self.subTest(answer=repr(answer), ids=ids):
+                before = self._routing_snapshot()
+                env = self._review_env([self._review_reply(checks=("fixture-cheap",))])
+                actions = [(self.EMPTY_PROMPT, "p\n"), (self.AVAILABLE, answer)]
+                actions += [(self.UNAVAILABLE, response) for response in ids]
+                actions += [(self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n")]
+                status, out = self._scripted_tty(env, actions)
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [
+                    ["propose", "--review"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+                self.assertNotIn("Type 'yes'", out)
+                self.assertEqual(self._routing_snapshot(), before)
+
+    def test_exact_level_yes_no_unknown_enter_and_eof_do_not_infer_levels(self):
+        for answer, level_answer in (("Y\n", "yes"), ("no\n", "no"), ("unknown\n", "no"),
+                                     ("\n", "no"), ("\x04", None)):
+            with self.subTest(answer=repr(answer)):
+                before = self._routing_snapshot()
+                env = self._review_env([
+                    self._review_reply(levels=(("fixture-cheap", "xhigh"),)),
+                    self._review_reply(self.REVIEW_ID),
+                ])
+                actions = [
+                    (self.EMPTY_PROMPT, "p\n"),
+                    ("Does /model offer reasoning level 'xhigh' for fixture-cheap?", answer)]
+                if level_answer is not None:
+                    actions.append((self.CONFIRM, "no\n"))
+                actions += [(self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n")]
+                status, out = self._scripted_tty(env, actions)
+                self.assertEqual(status, 0, out)
+                calls = [["propose", "--review"]]
+                if level_answer is not None:
+                    calls += [["review", "--proposal-id", self.PROPOSAL_ID,
+                               "--level", "fixture-cheap:xhigh=" + level_answer]]
+                calls += [["discard", "--proposal-id",
+                           self.REVIEW_ID if level_answer is not None else self.PROPOSAL_ID]]
+                self.assertEqual(self._calls(), calls)
+                self.assertNotIn(self.AVAILABLE, out)
+                self.assertNotIn("Reasoning levels /model shows", out)
+                self.assertEqual(self._routing_snapshot(), before)
+
+    def test_rejected_model_skips_its_level_questions_and_exhaustion_never_reaches_apply(self):
+        before = self._routing_snapshot()
+        env = self._review_env([
+            self._review_reply(checks=("fixture-cheap",),
+                               levels=(("fixture-cheap", "high"),)),
+            self._review_reply(None, rc=3),
+        ])
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.AVAILABLE, "n\n"),
+            (self.UNAVAILABLE, "fixture-cheap\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+            (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self._calls(), [
+            ["propose", "--review"],
+            ["review", "--proposal-id", self.PROPOSAL_ID, "--unavailable", "fixture-cheap"]])
+        self.assertNotIn("Does /model offer reasoning level", out)
+        self.assertNotIn("Type 'yes'", out)
+        self.assertEqual(self._routing_snapshot(), before)
+
+    def test_selected_premium_has_its_own_review_before_final_confirmation(self):
+        env = self._review_env([
+            self._review_reply(alternatives=(1,)),
+            self._review_reply(self.REVIEW_ID, checks=("fixture-premium",), selected=1),
+            self._review_reply("2222222222222222", selected=1),
+        ])
+        before = self._routing_snapshot()
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), ("or Enter for none:", "1\n"),
+            (self.AVAILABLE, "y\n"), (self.CONFIRM, "yes\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self._calls(), [
+            ["propose", "--review"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
+            ["review", "--proposal-id", self.REVIEW_ID, "--available-all"],
+            ["apply", "--proposal-id", "2222222222222222"]])
+        self.assertIn("YOU selected", out)
+        self.assertEqual(self._routing_snapshot(), before, "the scripted helper itself never writes routing")
+
+    def test_strict_review_protocol_failure_on_propose_or_recompute_never_applies(self):
+        proposal = "PROPOSAL\t" + self.PROPOSAL_ID
+        paired = [proposal, "SELECTED\t0"]
+        malformed = [
+            [proposal],
+            [proposal, "REVIEW\tcomplete"],  # missing SELECTED
+            paired,  # missing REVIEW
+            paired + ["REVIEW\tunknown"],
+            paired + ["REVIEW\tcomplete\textra"],
+            paired + ["REVIEW\tcomplete", "REVIEW\tcomplete"],
+            paired + ["REVIEW\tpending"],
+            paired + ["REVIEW\tcomplete", "CHECK\tfixture-cheap\ttester"],
+            paired + ["REVIEW\tpending", "CHECK\tbad/id\ttester"],
+            paired + ["REVIEW\tpending", "CHECK\tfixture-cheap\ttester\textra"],
+            paired + ["REVIEW\tpending", "LEVEL\tfixture-cheap\tunknown"],
+            paired + ["PROPOSAL\t" + self.REVIEW_ID, "REVIEW\tcomplete"],
+            paired + ["REVIEW\tpending", "CHECK\tfixture-cheap\ttester", "CHECK\tfixture-cheap\ttester"],
+            paired + ["REVIEW\tpending", "CHECK\tfixture-cheap\ttester", "CHECK\tfixture-cheap\tcoder"],
+            paired + ["REVIEW\tpending", "LEVEL\tfixture-cheap\thigh", "LEVEL\tfixture-cheap\thigh"],
+            paired + ["REVIEW\tcomplete", "SELECTED\t0"],
+            paired + ["REVIEW\tcomplete", "SELECTED\t1"],
+            paired + ["REVIEW\tcomplete",
+                      "ALTERNATIVE\t1\ttester\tfixture-premium", "ALTERNATIVE\t1\tcoder\tfixture-other"],
+        ]
+        for recompute in (False, True):
+            for lines in malformed:
+                with self.subTest(recompute=recompute, lines=lines):
+                    before = self._routing_snapshot()
+                    steps = [self._review_reply(checks=("fixture-cheap",))] if recompute else []
+                    steps.append({"lines": lines})
+                    env = self._review_env(steps)
+                    actions = [(self.EMPTY_PROMPT, "p\n")]
+                    if recompute:
+                        actions.append((self.AVAILABLE, "y\n"))
+                    actions += [(self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n")]
+                    status, out = self._scripted_tty(
+                        env, actions, forbidden=(self.AVAILABLE, "Does /model offer reasoning level",
+                                                 "or Enter for none:", self.CONFIRM))
+                    self.assertEqual(status, 0, out)
+                    self.assertIn("malformed review output", out)
+                    self.assertFalse(any(c[0] == "apply" for c in self._calls()))
+                    self.assertEqual(self._calls()[-1], ["status"])
+                    self.assertNotIn("Type 'yes'", out)
+                    self.assertEqual(self._routing_snapshot(), before)
+
+    def test_protocol_failure_discards_latest_proposal_id_before_status(self):
+        for recompute in (False, True):
+            with self.subTest(recompute=recompute):
+                current_id = self.REVIEW_ID if recompute else self.PROPOSAL_ID
+                lines = ["PROPOSAL\t" + current_id, "REVIEW\tpending", "SELECTED\t0",
+                         "CHECK\tfixture-cheap\ttester", "CHECK\tfixture-cheap\ttester"]
+                steps = [self._review_reply(checks=("fixture-cheap",))] if recompute else []
+                steps.append({"lines": lines})
+                env = self._review_env(steps)
+                before = self._routing_snapshot()
+                actions = [(self.EMPTY_PROMPT, "p\n")]
+                if recompute:
+                    actions.append((self.AVAILABLE, "y\n"))
+                actions += [(self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n")]
+                status, out = self._scripted_tty(
+                    env, actions, forbidden=(self.AVAILABLE, "Does /model offer reasoning level", self.CONFIRM))
+                self.assertEqual(status, 0, out)
+                self.assertIn("malformed review output", out)
+                expected = [["propose", "--review"]]
+                if recompute:
+                    expected += [["review", "--proposal-id", self.PROPOSAL_ID, "--available-all"]]
+                expected += [["discard", "--proposal-id", current_id], ["status"]]
+                self.assertEqual(self._calls(), expected)
+                self.assertEqual(self._routing_snapshot(), before)
+
+    def test_old_verify_marker_does_not_offer_full_inventory_recorder_in_p(self):
+        env = self._refresh_env({"REFRESH_VERIFY": "1"})
+        before = self._routing_snapshot()
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.CONFIRM, "no\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self._calls(), [
+            ["propose", "--review"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+        self.assertNotIn("(Enter skips):", out)
+        self.assertNotIn("VERIFY\t", out)
+        self.assertEqual(self._routing_snapshot(), before)
+
+    def test_review_failure_does_not_confirm_apply_and_returns_current_routing(self):
+        for rc in (2, 4, 130):
+            with self.subTest(rc=rc):
+                env = self._review_env([
+                    self._review_reply(checks=("fixture-cheap",)),
+                    {"lines": ["fixture review refused"], "rc": rc},
+                ])
+                before = self._routing_snapshot()
                 status, out = self._scripted_tty(env, [
-                    (self.EMPTY_PROMPT, "p\n"), ("(Enter skips):", "v\n"),
-                    ("Enter = cancel):", "gpt-6.1-terra\n"), ("[y/N]:", "no\n"),
-                    ("Reasoning levels /model shows for gpt-6.1-terra", "low high\n"),
-                    (self.CONFIRM, save), ("Type 'yes' to apply", "no\n"),
+                    (self.EMPTY_PROMPT, "p\n"), (self.AVAILABLE, "y\n"),
                     (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
                 ])
                 self.assertEqual(status, 0, out)
-                self.assertEqual(os.path.exists(verified_path), saved)
-                with open(settings_path, "rb") as handle:
-                    self.assertEqual(handle.read(), before)
-                calls = [["propose"], ["record-verified"]]
-                if saved:
-                    calls += [["discard", "--proposal-id", self.PROPOSAL_ID], ["propose"]]
-                    with open(verified_path, encoding="utf-8") as handle:
-                        doc = json.load(handle)
-                    self.assertEqual(doc["models"]["gpt-6.1-terra"]["reasoning_levels"], ["low", "high"])
-                    self.assertNotIn("VERIFY\t", out)
-                    os.unlink(verified_path)
-                self.assertEqual(self._calls(), calls + [["discard", "--proposal-id", self.PROPOSAL_ID]])
-                self.assertFalse(os.path.exists(self.copilot_log))
+                self.assertFalse(any(c[0] == "apply" for c in self._calls()))
+                self.assertEqual(self._calls()[-1], ["status"])
+                self.assertNotIn("Type 'yes'", out)
+                self.assertEqual(self._routing_snapshot(), before)
 
 
 class TestRegistryLockSafety(BaseHomeTestCase):

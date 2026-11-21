@@ -63,10 +63,26 @@ What it does
   records, per-route decisions and alternatives); `select` and `apply`
   re-derive everything from the caches and refuse (change nothing) if any
   of it changed, the proposal expired, was altered, or was already applied.
-- `record-verified` (interactive, terminal only) records the model IDs and
-  reasoning levels YOU saw in Copilot CLI's /model picker into a separate
-  tool-written file (model-refresh/verified-models.json, dated, 30-day
-  validity) after an exact `yes`; user-config.json is never written.
+- `propose --review` (what copilot-s menu `p` runs) additionally lets a
+  candidate that is blocked ONLY by your unverified /model availability
+  and/or an unverified exact reasoning level be proposed TENTATIVELY, so
+  you see the mapping table first and are asked only about its proposed
+  models. Every other gate (fresh pricing, official Copilot CLI support,
+  Category, task area, 1M context, pins, the 10% rule, no automatic
+  premium) is unchanged. A tentative proposal is never applicable: `review`
+  records your answers (models available / NOT available, and yes/no per
+  needed exact reasoning level) in the sealed proposal only — never in
+  verified-models.json or user-config.json — and writes a re-derived
+  proposal (new id, same expiry and same frozen inputs). A model you call
+  unavailable is excluded for the rest of that run even if an older record
+  lists it; a "no" for a level excludes that model wherever the level is
+  needed (never downgraded). Only a proposal with nothing left to confirm
+  can be applied, still after a separate exact `yes`.
+- `record-verified` (interactive, terminal only; no longer part of menu
+  `p`) records the model IDs and reasoning levels YOU saw in Copilot CLI's
+  /model picker into a separate tool-written file
+  (model-refresh/verified-models.json, dated, 30-day validity) after an
+  exact `yes`; user-config.json is never written.
 
 Effective resolution (same files for every route/context):
   shipped defaults (agent-routing.yaml)
@@ -111,16 +127,22 @@ Honest limits
 - The blended cost is an assumption-based comparison aid, not a forecast
   and not your bill.
 
-Commands: status [--instructions] | preview [--offline] | propose [--offline] |
+Commands: status [--instructions] | preview [--offline] |
+          propose [--offline] [--review] |
+          review --proposal-id ID (--available-all | --unavailable IDS)
+                 [--level MODEL:EFFORT=yes|no ...] |
           select --proposal-id ID --choose N[,N...] | apply --proposal-id ID |
           discard --proposal-id ID | record-verified | reset [--yes]
-Exit codes: 0 ok (propose: changes pending; record-verified: saved), 2 error,
-            3 no changes (propose: may still print a PROPOSAL id when optional
-            alternatives exist; record-verified: nothing saved),
-            4 refused (stale proposal, concurrent edit, unsafe target),
-            130 interrupted (nothing half-written).
-Machine lines on stdout (propose/select): PROPOSAL<TAB>id,
-  ALTERNATIVE<TAB>n<TAB>route<TAB>model, VERIFY<TAB>needed.
+Exit codes: 0 ok (propose/review: changes pending; record-verified: saved),
+            2 error, 3 no changes (propose/review: may still print a PROPOSAL
+            id when optional alternatives exist; record-verified: nothing
+            saved), 4 refused (stale/tentative proposal, concurrent edit,
+            unsafe target), 130 interrupted (nothing half-written).
+Machine lines on stdout (propose/select/review): PROPOSAL<TAB>id,
+  ALTERNATIVE<TAB>n<TAB>route<TAB>model, VERIFY<TAB>needed (plain propose
+  only); review proposals also print CHECK<TAB>model<TAB>route[,route...]
+  (availability to confirm), LEVEL<TAB>model<TAB>effort (exact level to
+  confirm), REVIEW<TAB>pending|complete and SELECTED<TAB>count.
 User-maintained input (never written by this tool):
   <COPILOT_HOME>/model-refresh/user-config.json — available_models
   {verified_on, models}, verified_capabilities {verified_on, models:
@@ -166,7 +188,7 @@ USER_CONFIG_KIND = "copilot-toolkit-model-refresh-user-config"
 SEEN_KIND = "copilot-toolkit-model-refresh-seen-models"
 CAPABILITY_KIND = "copilot-toolkit-model-capability-evidence"
 VERIFIED_KIND = "copilot-toolkit-model-refresh-verified-models"
-PROPOSAL_FORMAT = 2
+PROPOSAL_FORMAT = 3
 
 EXIT_OK = 0
 EXIT_ERROR = 2
@@ -213,6 +235,7 @@ WORKLOAD_MIX = (("input", 0.15), ("cached_input", 0.75), ("cache_write", 0.05), 
 MIN_SAVING_FRACTION = 0.10
 AVAILABILITY_MAX_AGE_DAYS = 30
 PROPOSAL_TTL_SECONDS = 15 * 60
+MAX_REVIEW_ROUNDS = 25
 LOCK_TIMEOUT_SECONDS = 10
 MAX_HISTORY = 20
 MAX_BACKUP_SETS = 10
@@ -865,13 +888,14 @@ def availability(user_config, today, verified=None):
                                      len(excluded), avail["verified_on"], verified["verified_on"],
                                      ", ".join(sorted(excluded))))
         else:
-            parts.append("recorded /model list %s is stale or future-dated — re-verify (copilot-s p -> v)"
+            parts.append("recorded /model list %s is stale or future-dated — re-verify (copilot-model-refresh.py record-verified)"
                          % verified["verified_on"])
             stale_models |= models
     fresh_models |= uc_fresh
     if not any_list:
-        return None, ("no verified availability list (add available_models to %s/user-config.json, or record "
-                      "it with copilot-s p -> v)" % STATE_DIRNAME), False
+        return None, ("no verified availability list (copilot-s p asks you about the proposed models; or add "
+                      "available_models to %s/user-config.json, or run copilot-model-refresh.py record-verified)"
+                      % STATE_DIRNAME), False
     if fresh_models:
         return fresh_models, "; ".join(parts), True
     return stale_models, "; ".join(parts), False
@@ -905,7 +929,7 @@ def load_verified_record(paths):
         doc = parse_json_bytes(raw, paths.verified)
         return validate_verified_record(doc), sha, None
     except RefreshError as ex:
-        return None, sha, "%s is invalid (%s) — ignored; record it again with copilot-s p -> v" % (
+        return None, sha, "%s is invalid (%s) — ignored; record it again with copilot-model-refresh.py record-verified" % (
             paths.verified, _safe_text(str(ex), 200))
 
 
@@ -1953,6 +1977,75 @@ def route_policy(key, defaults, catalog, today, facts=None):
 REASON_AVAILABILITY = "availability"  # user-fixable: verify the model in available_models
 REASON_CAPABILITY = "capability"      # user-fixable: verify the required reasoning level
 REASON_OTHER = "other"
+# Review mode (propose --review): a candidate blocked ONLY by these may be
+# proposed tentatively; it can never be applied until the user answers.
+PENDING_CODES = frozenset((REASON_AVAILABILITY, REASON_CAPABILITY))
+REVIEW_SOURCE = "your answer in this copilot-s p review (this run only; not saved)"
+
+
+# ------------------------------------------------ session review answers ---
+# Proposal-scoped and sealed with the proposal: the models YOU confirmed as
+# available / NOT available in /model and your yes/no per exact reasoning
+# level, each only for models that were displayed as proposed. Never
+# written to verified-models.json or user-config.json.
+
+def blank_review():
+    return {"round": 0, "available": set(), "rejected": set(), "levels": {}}
+
+
+def validate_review(raw):
+    """Proposal `review` field -> ctx form (sets); None stays None (a plain,
+    non-review proposal). Anything malformed refuses."""
+    if raw is None:
+        return None
+
+    def bad(what):
+        raise RefreshError("malformed proposal (review %s)" % what, EXIT_REFUSED)
+    if not isinstance(raw, dict) or set(raw) != {"round", "available", "rejected", "levels"}:
+        bad("fields")
+    rnd = raw["round"]
+    if not isinstance(rnd, int) or isinstance(rnd, bool) or not 0 <= rnd <= MAX_REVIEW_ROUNDS:
+        bad("round")
+    for name in ("available", "rejected"):
+        ids = raw[name]
+        if (not isinstance(ids, list) or len(ids) > 500 or not all(valid_model_id(m) for m in ids)
+                or len(set(ids)) != len(ids)):
+            bad(name)
+    if set(raw["available"]) & set(raw["rejected"]):
+        bad("answers (a model is both available and unavailable)")
+    levels = raw["levels"]
+    if not isinstance(levels, dict) or len(levels) > 500:
+        bad("levels")
+    for model_id, rec in levels.items():
+        if (not valid_model_id(model_id) or not isinstance(rec, dict) or not rec
+                or not all(e in EFFORTS and isinstance(v, bool) for e, v in rec.items())):
+            bad("levels")
+    return {"round": rnd, "available": set(raw["available"]), "rejected": set(raw["rejected"]),
+            "levels": {m: dict(r) for m, r in levels.items()}}
+
+
+def review_doc(review):
+    """Canonical JSON form of the ctx review state (None = not a review)."""
+    if review is None:
+        return None
+    return {"round": review["round"], "available": sorted(review["available"]),
+            "rejected": sorted(review["rejected"]),
+            "levels": {m: {e: review["levels"][m][e] for e in sorted(review["levels"][m])}
+                       for m in sorted(review["levels"])}}
+
+
+def reasoning_level_status(model_id, effort, ctx):
+    """(True | False | None, provenance) for ONE exact level. Fresh
+    source-backed or saved user-verified levels win; otherwise only your
+    answer for this exact model+level in the current review counts. None =
+    unknown (never inferred, never downgraded)."""
+    levels, provenance = verified_reasoning_levels(model_id, ctx)
+    if levels is not None:
+        return effort in levels, provenance
+    answer = (((ctx.get("review") or {}).get("levels") or {}).get(model_id) or {}).get(effort)
+    if answer is not None:
+        return answer, REVIEW_SOURCE
+    return None, provenance
 
 
 def check_candidate(model_id, key, values, policy, ctx):
@@ -1986,11 +2079,14 @@ def check_candidate(model_id, key, values, policy, ctx):
         no("no official configurable-reasoning support" + (" documented" if f["configurable_reasoning"] is None else ""))
     else:
         required = values["reasoning_effort"]
-        levels, provenance = verified_reasoning_levels(model_id, ctx)
-        if levels is None:
+        ok, provenance = reasoning_level_status(model_id, required, ctx)
+        if ok is None:
             no("reasoning level '%s' not verified for this model (%s; generic configurable-reasoning support "
                "does not prove a specific level)" % (required, provenance), REASON_CAPABILITY)
-        elif required not in levels:
+        elif not ok and provenance == REVIEW_SOURCE:
+            no("you said /model does NOT offer reasoning level '%s' for it (%s)" % (required, REVIEW_SOURCE))
+        elif not ok:
+            levels, _prov = verified_reasoning_levels(model_id, ctx)
             no("reasoning level '%s' not offered per %s (verified: %s)" % (required, provenance, ", ".join(levels)))
     if values["context_tier"] == "long_context" and f["one_million_context"] is not True:
         no("no official 1M-context support (route uses long_context)")
@@ -1998,7 +2094,13 @@ def check_candidate(model_id, key, values, policy, ctx):
         no("Copilot CLI support is %s in the official per-client table"
            % fact_text("copilot_cli_client", f["copilot_cli_client"]))
     avail_models, _desc, avail_ok = ctx["availability"]
-    if not avail_ok:
+    review = ctx.get("review")
+    if review is not None and model_id in review["rejected"]:
+        # Overrides any older saved record for the rest of this review.
+        no("you said it is NOT available in your /model picker (%s)" % REVIEW_SOURCE)
+    elif review is not None and model_id in review["available"]:
+        pass  # you confirmed it in this review (only ever asked for proposed models)
+    elif not avail_ok:
         no("availability not verified", REASON_AVAILABILITY)
     elif model_id not in avail_models:
         no("not in your verified available_models", REASON_AVAILABILITY)
@@ -2009,10 +2111,15 @@ def evaluate(ctx):
     """Per-route decisions. Never proposes for pinned routes, without fresh
     pricing, or for candidates failing any gate. Also lists, per route, the
     optional (not >= 10% cheaper) alternatives with a documented
-    differentiator, and every same-task-area model that was considered."""
+    differentiator, and every same-task-area model that was considered.
+    Review mode (ctx["review"] set): a candidate blocked ONLY by your
+    unverified availability / exact reasoning level is kept as TENTATIVE
+    (row["tentative"][model] = pending reason codes) and may be proposed —
+    such a proposal is never applicable until you answer."""
     defaults, eff, snapshot = ctx["defaults"], ctx["effective"], ctx["snapshot"]
     overrides = ctx["state"]["overrides"]
     facts = ctx["facts"]
+    review_mode = ctx.get("review") is not None
     rows = []
     for route in ROUTES:
         key = route["key"]
@@ -2020,7 +2127,7 @@ def evaluate(ctx):
         values = cur["values"]
         row = {"key": key, "label": route["label"], "current": dict(values), "sources": dict(cur["sources"]),
                "proposed": None, "reason": "", "evidence": [], "blocked": [], "alternatives": [],
-               "considered": [], "other_area_count": 0, "alternatives_note": None}
+               "considered": [], "other_area_count": 0, "alternatives_note": None, "tentative": {}}
         rows.append(row)
         cur_cost = blended_cost(default_rates(snapshot, values["model"])) if values["model"] != INHERIT else None
         row["current_cost"] = cur_cost
@@ -2057,7 +2164,10 @@ def evaluate(ctx):
             if model_id == values["model"]:
                 current_reasons = reasons
             cost = blended_cost(default_rates(snapshot, model_id))
-            if reasons:
+            codes = {code for code, _text in reasons}
+            if reasons and review_mode and codes <= PENDING_CODES:
+                row["tentative"][model_id] = sorted(codes)
+            elif reasons:
                 if cost is not None and (cur_cost is None or cost < cur_cost):
                     row["blocked"].append((cost, model_id, reasons))
                 continue
@@ -2068,6 +2178,9 @@ def evaluate(ctx):
                 label = "assessed from current official docs"
             else:
                 label = "catalogued %s" % f["catalog_origin"]
+            if model_id in row["tentative"]:
+                label = (("shipped baseline" if model_id == baseline["model"] else label)
+                         + "; TENTATIVE until you confirm it in /model")
             eligible[model_id] = (label, cand_values)
         row["blocked"].sort(key=lambda b: (b[0], b[1]))
         long_route = baseline["context_tier"] == "long_context"
@@ -2147,20 +2260,31 @@ def _decide_route(row, ctx, values, baseline, eligible, current_reasons, current
         return
     best_cost = blended_cost(default_rates(snapshot, best))
     best_values = eligible[best][1]
+    pending = row["tentative"].get(best, [])
     row["proposed"] = dict(best_values)
     row["proposed_cost"] = best_cost
-    row["reason"] = ("CHANGE: %s; %s — categorical fit only, NOT a measured-quality or equal-quality claim"
-                     % (change_reason, eligible[best][0]))
+    row["reason"] = ("CHANGE%s: %s; %s — categorical fit only, NOT a measured-quality or equal-quality claim"
+                     % (" (TENTATIVE — pending your /model check)" if pending else "", change_reason,
+                        eligible[best][0]))
     if long_route:
         row["evidence"].append("long-context tier blended $/1M (input above the threshold): %s -> %s" % (
             _money(cur_long), _money(blended_cost(long_tier_rates(snapshot, best)))))
     f = ctx["facts"].get(best)
     if f and best != baseline["model"]:
-        levels, provenance = verified_reasoning_levels(best, ctx)
         row["evidence"].append(_facts_evidence_line(best, f))
         row["evidence"] += ["%s: %s" % (best, note) for note in f["notes"]]
-        row["evidence"].append("reasoning level '%s' verified via %s; context '%s' kept from the route baseline"
-                               % (best_values["reasoning_effort"], provenance, best_values["context_tier"]))
+    if (f and best != baseline["model"]) or REASON_CAPABILITY in pending:
+        ok, provenance = reasoning_level_status(best, best_values["reasoning_effort"], ctx)
+        if ok:
+            row["evidence"].append("reasoning level '%s' verified via %s; context '%s' kept from the route baseline"
+                                   % (best_values["reasoning_effort"], provenance, best_values["context_tier"]))
+        else:
+            row["evidence"].append("reasoning level '%s' NOT verified yet (%s) — you are asked before anything can "
+                                   "be applied; context '%s' kept from the route baseline"
+                                   % (best_values["reasoning_effort"], provenance, best_values["context_tier"]))
+    if REASON_AVAILABILITY in pending:
+        row["evidence"].append("%s is not verified as available in your /model picker yet — you are asked before "
+                               "anything can be applied" % best)
 
 
 def _attach_alternatives(row, ctx, values, policy, results, cur_cost, cur_long, long_route, saving_ok):
@@ -2183,7 +2307,8 @@ def _attach_alternatives(row, ctx, values, policy, results, cur_cost, cur_long, 
             row["other_area_count"] += 1
             continue
         cost = blended_cost(default_rates(snapshot, model_id))
-        if reasons:
+        pending = row["tentative"].get(model_id, [])
+        if reasons and not pending:
             if cost is not None and cost < cur_cost:
                 continue  # already listed as a blocked cheaper candidate
             row["considered"].append({"model": model_id, "cost": cost, "status": "not eligible", "reasons": reasons})
@@ -2205,8 +2330,9 @@ def _attach_alternatives(row, ctx, values, policy, results, cur_cost, cur_long, 
             "current_cost": cur_cost, "long_route": long_route,
             "long_cost": blended_cost(long_tier_rates(snapshot, model_id)) if long_route else None,
             "current_long": cur_long if long_route else None, "differentiators": diffs,
-            "excels_at": f.get("excels_at"), "notes": list(f["notes"]),
-            "levels": verified_reasoning_levels(model_id, ctx), "replaces_proposal": chosen is not None,
+            "excels_at": f.get("excels_at"), "notes": list(f["notes"]), "pending": list(pending),
+            "level": reasoning_level_status(model_id, cand_values["reasoning_effort"], ctx),
+            "replaces_proposal": chosen is not None,
             "basis": "current official docs" if f["all_live"] else "dated catalog"})
     row["alternatives"].sort(key=lambda a: (a["cost"], a["model"]))
     row["considered"].sort(key=lambda c: (c["cost"] is None, c["cost"] or 0, c["model"]))
@@ -2245,8 +2371,11 @@ def evidence_digest(ctx, rows):
         "pricing_status": ctx["pricing_ctx"].get("status"),
         "capabilities": ctx["capabilities"]["digest"], "catalog": ctx["catalog_digest"],
         "user_config": ctx["user_sha"], "verified": ctx["verified_sha"], "today": ctx["today"].isoformat(),
+        "review": review_doc(ctx.get("review")),
         "routes": [{"key": r["key"], "current": r["current"], "proposed": r["proposed"],
-                    "alternatives": [[a["model"], a["values"], round(a["cost"], 9)] for a in r["alternatives"]]}
+                    "tentative": r.get("tentative", {}),
+                    "alternatives": [[a["model"], a["values"], round(a["cost"], 9), a.get("pending", [])]
+                                     for a in r["alternatives"]]}
                    for r in rows],
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -2262,6 +2391,45 @@ def proposed_overrides(rows, state, defaults):
         elif key in state["overrides"]:
             out[key] = {f: state["overrides"][key][f] for f in FIELDS}
     return out
+
+
+def review_targets(rows, selected):
+    """Every route change the proposal would make (cost-led changes, then
+    your selected alternatives replacing a route's change), in route order,
+    with what is still pending for it."""
+    by_route = {}
+    labels = {r["key"]: r["label"] for r in rows}
+    for row in rows:
+        if row["proposed"] is not None:
+            by_route[row["key"]] = {
+                "route": row["key"], "label": row["label"], "values": dict(row["proposed"]),
+                "pending": list(row["tentative"].get(row["proposed"]["model"], [])), "why": row["reason"],
+                "cost": row.get("proposed_cost"), "current_cost": row.get("current_cost"), "alternative": None}
+    for alt in selected:
+        by_route[alt["route"]] = {
+            "route": alt["route"], "label": labels[alt["route"]], "values": dict(alt["values"]),
+            "pending": list(alt.get("pending", [])),
+            "why": "your selected optional alternative #%d (%s)" % (alt["n"], "; ".join(alt["differentiators"])),
+            "cost": alt["cost"], "current_cost": alt["current_cost"], "alternative": alt["n"]}
+    return [by_route[r["key"]] for r in ROUTES if r["key"] in by_route]
+
+
+def review_pending(targets):
+    """{"check": {model: [routes]}, "levels": {model: set(efforts)}} — what
+    you must still confirm before the proposal can be applied (empty = fully
+    checked). Only models the proposal actually assigns are ever asked."""
+    check, levels = {}, {}
+    for t in targets:
+        model_id = t["values"]["model"]
+        if REASON_AVAILABILITY in t["pending"]:
+            check.setdefault(model_id, []).append(t["route"])
+        if REASON_CAPABILITY in t["pending"]:
+            levels.setdefault(model_id, set()).add(t["values"]["reasoning_effort"])
+    return {"check": check, "levels": levels}
+
+
+def has_pending(pending):
+    return bool(pending["check"] or pending["levels"])
 
 
 # ------------------------------------------------------ generated outputs ---
@@ -2630,7 +2798,9 @@ def render_proposal(ctx, rows, unassessed, new_models):
         if row.get("alternatives_note"):
             out.append("      alternatives: %s" % row["alternatives_note"])
     out += render_alternatives(ctx, rows)
-    out += render_action_required(ctx, rows)
+    if ctx.get("review") is None:
+        # In a review (copilot-s p) you are asked about the proposed models instead.
+        out += render_action_required(ctx, rows)
     out += render_universe(ctx, rows, new_models)
     if unassessed:
         out.append("")
@@ -2684,11 +2854,16 @@ def render_alternatives(ctx, rows):
         if alt["excels_at"]:
             out.append("      official 'Excels at' text: \"%s\" (the vendor's description, not a measurement)"
                        % _safe_text(alt["excels_at"], 300))
-        levels, provenance = alt["levels"]
-        out.append("      reasoning level '%s' verified via %s; 1M context %s for context '%s'; evidence: %s" % (
-            alt["values"]["reasoning_effort"], provenance,
+        ok, provenance = alt["level"]
+        out.append("      reasoning level '%s' %s %s; 1M context %s for context '%s'; evidence: %s" % (
+            alt["values"]["reasoning_effort"], "verified via" if ok else "NOT verified yet:", provenance,
             "documented" if alt["values"]["context_tier"] == "long_context" else "not needed",
             alt["values"]["context_tier"], alt["basis"]))
+        if alt["pending"]:
+            out.append("      TENTATIVE: if you select it you are asked to confirm its %s in /model before the "
+                       "final yes" % " and ".join(
+                           t for c, t in ((REASON_AVAILABILITY, "availability"),
+                                          (REASON_CAPABILITY, "reasoning level")) if c in alt["pending"]))
         for note in alt["notes"]:
             out.append("      note: %s" % _safe_text(note, 240))
         if alt["replaces_proposal"]:
@@ -2740,15 +2915,93 @@ def render_action_required(ctx, rows):
     out.append("  List ONLY models you can actually select in Copilot CLI's /model picker under your plan/organization,")
     out.append("  and for each model ONLY the reasoning levels that picker offers for it (edit the example to match;")
     out.append("  it is pre-filled with the levels the routes need, not with verified facts). Then choose p again.")
-    out.append("  Or, in copilot-s menu p, type v to record what you see in /model interactively (saved separately, only")
-    out.append("  after you type yes; nothing is assumed). Copilot CLI documents no way to list them automatically.")
+    out.append("  Or use copilot-s menu p, which proposes the mapping first and asks only about its proposed models (your")
+    out.append("  answers are used for that run only), or run copilot-model-refresh.py record-verified to save what you see")
+    out.append("  in /model (only after you type yes). Copilot CLI documents no way to list them automatically.")
+    return out
+
+
+def render_review(ctx, rows, targets, pending, heading):
+    """The mapping table to check in /model: every route (current ->
+    proposed), then each proposed model ONCE with its route(s), the exact
+    reasoning level(s) it needs, price and rationale, and what is still
+    pending. Your answers so far are listed (this run only; not saved)."""
+    review = ctx.get("review") or blank_review()
+    by_route = {t["route"]: t for t in targets}
+    out = ["", heading]
+    table_rows = []
+    for row in rows:
+        t = by_route.get(row["key"])
+        if t is None:
+            table_rows.append([row["label"], _route_text(row["current"]), "(keep)", _money(row.get("current_cost")),
+                               "keep"])
+            continue
+        status = "CHANGE — confirm in /model" if t["pending"] else "CHANGE"
+        if t["alternative"]:
+            status += " (your alternative #%d)" % t["alternative"]
+        table_rows.append([row["label"], _route_text(row["current"]), _route_text(t["values"]),
+                           "%s -> %s" % (_money(t["current_cost"]), _money(t["cost"])), status])
+    out += _table(["Route", "Current (model · effort · context)", "Proposed", "Blended $/1M", "Decision"], table_rows)
+    if targets:
+        out.append("")
+        out.append("Proposed models (each listed once):")
+        models = []
+        for t in targets:
+            if t["values"]["model"] not in models:
+                models.append(t["values"]["model"])
+        for model_id in models:
+            mine = [t for t in targets if t["values"]["model"] == model_id]
+            efforts = [e for e in EFFORTS if any(t["values"]["reasoning_effort"] == e for t in mine)]
+            out.append("  %s — route(s): %s · reasoning level(s) needed: %s · blended $%s/1M" % (
+                model_id, ", ".join(t["label"] for t in mine), ", ".join(efforts), _money(mine[0]["cost"])))
+            if model_id in pending["check"]:
+                avail = "NOT verified yet — please check it in Copilot CLI's /model picker"
+            elif model_id in review["available"]:
+                avail = "confirmed by you in this review (this run only; not saved)"
+            else:
+                avail = "verified in your saved availability record"
+            out.append("      availability: %s" % avail)
+            for effort in efforts:
+                ok, provenance = reasoning_level_status(model_id, effort, ctx)
+                if effort in pending["levels"].get(model_id, ()):
+                    text = "NOT verified yet (%s) — you are asked" % provenance
+                else:
+                    text = "verified via %s" % provenance if ok else "not offered (%s)" % provenance
+                out.append("      reasoning '%s': %s" % (effort, text))
+            for t in mine:
+                out.append("      why (%s): %s; %s" % (t["label"], _safe_text(t["why"], 300),
+                                                      _delta_text(t["cost"], t["current_cost"])))
+    else:
+        out.append("  No route change remains — every route keeps its current model.")
+    answers = []
+    if review["available"]:
+        answers.append("available: %s" % ", ".join(sorted(review["available"])))
+    if review["rejected"]:
+        answers.append("NOT available (excluded): %s" % ", ".join(sorted(review["rejected"])))
+    yes_levels = ["%s:%s" % (m, e) for m in sorted(review["levels"]) for e in EFFORTS
+                  if review["levels"][m].get(e) is True]
+    no_levels = ["%s:%s" % (m, e) for m in sorted(review["levels"]) for e in EFFORTS
+                 if review["levels"][m].get(e) is False]
+    if yes_levels:
+        answers.append("levels offered: %s" % ", ".join(yes_levels))
+    if no_levels:
+        answers.append("levels NOT offered (excluded where needed): %s" % ", ".join(no_levels))
+    if answers:
+        out.append("  Your answers so far (this copilot-s p run only; never saved): %s." % "; ".join(answers))
+    if has_pending(pending):
+        out.append("  TENTATIVE: this mapping cannot be applied until you confirm the items marked above.")
     return out
 
 
 def _availability_text(model_id, ctx):
     avail_models, _desc, avail_ok = ctx["availability"]
     complete = availability_complete(ctx.get("verified"), ctx["today"])
-    if avail_ok and model_id in avail_models:
+    review = ctx.get("review") or {}
+    if model_id in review.get("rejected", ()):
+        text = "NOT available — your answer in this review"
+    elif model_id in review.get("available", ()):
+        text = "available — your answer in this review"
+    elif avail_ok and model_id in avail_models:
         text = "verified available to you"
     elif avail_ok and complete:
         text = "NOT in your complete verified /model list"
@@ -3350,6 +3603,9 @@ def _check_proposal_lifetime_and_seal(paths, doc, now):
 
 def _freeze_proposal(ctx, rows, alternatives, selected, new_overrides, plan, route_changes, created_epoch,
                      expires_epoch):
+    """Seal and write the (single) pending proposal. A review proposal also
+    seals your review answers (ctx["review"]); it is applicable only once
+    nothing is pending (re-derived and checked again by apply)."""
     proposal_id = secrets.token_hex(8)
     doc = {
         "schema_version": SCHEMA_VERSION, "kind": PROPOSAL_KIND, "format": PROPOSAL_FORMAT,
@@ -3358,6 +3614,7 @@ def _freeze_proposal(ctx, rows, alternatives, selected, new_overrides, plan, rou
         "digests": _input_digests(ctx), "expected": _expected_outputs(ctx, plan),
         "snapshot_id": ctx["snapshot"]["snapshot_id"], "evidence_digest": evidence_digest(ctx, rows),
         "alternatives": _frozen_alternatives(alternatives), "selected": sorted(selected),
+        "review": review_doc(ctx.get("review")),
     }
     doc["seal"] = _proposal_seal(_proposal_key(ctx["paths"], create=True), doc)
     atomic_write_bytes(ctx["paths"].proposal, json_bytes(doc))
@@ -3373,12 +3630,29 @@ def _print_machine_lines(alternatives, verify_needed, proposal_id):
         print("PROPOSAL\t%s" % proposal_id)
 
 
+def _print_review_lines(pending, alternatives, selected_count, proposal_id):
+    """Review-proposal machine lines (model IDs/efforts/route keys are
+    validated tokens; never contain a tab)."""
+    for model_id in sorted(pending["check"]):
+        print("CHECK\t%s\t%s" % (model_id, ",".join(pending["check"][model_id])))
+    for model_id in sorted(pending["levels"]):
+        for effort in EFFORTS:
+            if effort in pending["levels"][model_id]:
+                print("LEVEL\t%s\t%s" % (model_id, effort))
+    print("REVIEW\t%s" % ("pending" if has_pending(pending) else "complete"))
+    print("SELECTED\t%d" % selected_count)
+    _print_machine_lines(alternatives, False, proposal_id)
+
+
 def cmd_preview(paths, args, now, freeze=False):
+    review_mode = freeze and getattr(args, "review", False)
     with refresh_lock(paths):
         note = recover_journal(paths)
         if note:
             print("Note: %s." % note)
         ctx = build_context(paths, now, refresh=True, offline=args.offline)
+        if review_mode:
+            ctx["review"] = blank_review()
         if ctx["snapshot"] is None:
             print("\n".join(render_header(ctx)))
             print("\n".join(render_final(ctx["effective"], ctx["defaults"], set(),
@@ -3389,9 +3663,14 @@ def cmd_preview(paths, args, now, freeze=False):
         rows, new_overrides, plan, lines, priced, alternatives = _evaluate_and_render(ctx)
         print("\n".join(lines))
         remember_seen(paths, priced, ctx["snapshot"]["snapshot_id"], now)
-        verify_needed = bool(render_action_required(ctx, rows))
+        verify_needed = bool(render_action_required(ctx, rows)) and not review_mode
+        targets = review_targets(rows, [])
+        pending = review_pending(targets)
         route_changes = [r["key"] for r in rows if r["proposed"] is not None]
         sync = plan["settings_changed"] is not None and _sync_needed(ctx, plan)
+        if review_mode and targets:
+            print("\n".join(render_review(ctx, rows, targets, pending,
+                                          "Proposed mapping to check in Copilot CLI's /model picker:")))
         if not route_changes and not sync:
             print("\n".join(render_final(ctx["effective"], ctx["defaults"], set(),
                                          "No routing changes proposed — final effective routing (kept):")))
@@ -3402,19 +3681,27 @@ def cmd_preview(paths, args, now, freeze=False):
                       "changes unless you select one and then confirm." % len(alternatives))
                 proposal_id = _freeze_proposal(ctx, rows, alternatives, [], new_overrides, plan, [], now,
                                                now + PROPOSAL_TTL_SECONDS)
-                _print_machine_lines(alternatives, verify_needed, proposal_id)
+                if review_mode:
+                    _print_review_lines(pending, alternatives, 0, proposal_id)
+                else:
+                    _print_machine_lines(alternatives, verify_needed, proposal_id)
                 return EXIT_NO_CHANGES
             if freeze:
                 with contextlib.suppress(OSError):
                     os.unlink(paths.proposal)
-                _print_machine_lines([], verify_needed, None)
+                if review_mode:
+                    _print_review_lines(pending, [], 0, None)
+                else:
+                    _print_machine_lines([], verify_needed, None)
             return EXIT_NO_CHANGES
         if not route_changes and sync:
             print("\nNo model changes, but the generated routing files are out of sync with your pins/overrides; "
                   "applying re-syncs them.")
         print("\n".join(render_final(plan["effective"], ctx["defaults"], set(route_changes),
-                                     "Effective routing IF you apply (categorical fit only — not measured or "
-                                     "equal quality; optional alternatives NOT included unless you select them):")))
+                                     ("TENTATIVE effective routing IF you confirm every pending check and then apply "
+                                      if has_pending(pending) else "Effective routing IF you apply ")
+                                     + "(categorical fit only — not measured or equal quality; optional "
+                                       "alternatives NOT included unless you select them):")))
         problem = preflight(ctx, plan)
         if problem:
             with contextlib.suppress(OSError):
@@ -3427,7 +3714,10 @@ def cmd_preview(paths, args, now, freeze=False):
             return EXIT_OK
         proposal_id = _freeze_proposal(ctx, rows, alternatives, [], new_overrides, plan, route_changes, now,
                                        now + PROPOSAL_TTL_SECONDS)
-        _print_machine_lines(alternatives, verify_needed, proposal_id)
+        if review_mode:
+            _print_review_lines(pending, alternatives, 0, proposal_id)
+        else:
+            _print_machine_lines(alternatives, verify_needed, proposal_id)
         return EXIT_OK
 
 
@@ -3464,6 +3754,9 @@ def _load_proposal(paths, proposal_id, now):
             or len(set(selected)) != len(selected)
             or not set(selected) <= {a.get("n") for a in alts if isinstance(a, dict)}):
         raise RefreshError("malformed proposal (alternatives)", EXIT_REFUSED)
+    if "review" not in doc:
+        raise RefreshError("malformed proposal (review)", EXIT_REFUSED)
+    validate_review(doc["review"])
     return doc
 
 
@@ -3476,6 +3769,9 @@ def _verify_proposal_evidence(paths, doc, ctx):
         with contextlib.suppress(OSError):
             os.unlink(paths.proposal)
         raise RefreshError(message, EXIT_REFUSED)
+    # Your sealed review answers (None = a plain proposal) are part of the
+    # re-derivation; nothing is re-fetched mid-review.
+    ctx["review"] = validate_review(doc["review"])
     current = _input_digests(ctx)
     stale = sorted(k for k, v in current.items() if doc["digests"].get(k) != v)
     if stale:
@@ -3549,11 +3845,164 @@ def cmd_select(paths, args, now):
         if more:
             out.append("  At least one selection costs MORE than the current route under the blended assumption "
                        "(not your bill).")
+        pending = review_pending(review_targets(rows, selected))
+        if ctx["review"] is not None:
+            out += render_review(ctx, rows, review_targets(rows, selected), pending,
+                                 "Proposed mapping including your selection — check it in Copilot CLI's /model "
+                                 "picker:")
         out += render_final(plan["effective"], ctx["defaults"], set(route_changes),
-                            "Effective routing IF you apply (includes your selected alternatives; categorical fit "
-                            "only — not measured or equal quality):")
+                            ("TENTATIVE effective routing IF you confirm every pending check and then apply "
+                             if has_pending(pending) else "Effective routing IF you apply ")
+                            + "(includes your selected alternatives; categorical fit only — not measured or equal "
+                              "quality):")
         print("\n".join(out))
-        print("PROPOSAL\t%s" % proposal_id)
+        if ctx["review"] is not None:
+            _print_review_lines(pending, alternatives, len(selected), proposal_id)
+        else:
+            print("PROPOSAL\t%s" % proposal_id)
+    return EXIT_OK
+
+
+def _parse_level_answers(values):
+    """--level MODEL:EFFORT=yes|no (repeatable) -> {(model, effort): bool}."""
+    out = {}
+    for text in values or []:
+        m = re.match(r"^([^:=\s]{1,80}):([a-z]{1,10})=(yes|no)$", text or "")
+        if not m or not valid_model_id(m.group(1)) or m.group(2) not in EFFORTS:
+            raise RefreshError("invalid --level %r (use MODEL:EFFORT=yes or =no); nothing was changed"
+                               % _safe_text(text, 80))
+        key = (m.group(1), m.group(2))
+        if key in out:
+            raise RefreshError("--level %s:%s given twice; nothing was changed" % key)
+        out[key] = m.group(3) == "yes"
+    return out
+
+
+def cmd_review(paths, args, now):
+    """Record your answers about the CURRENT review proposal's displayed
+    proposed models — available / NOT available in /model, and yes/no for
+    each exact reasoning level it asked about — then re-derive the mapping
+    from the SAME frozen inputs (cache only; refuses if anything changed or
+    the proposal expired) and write a new sealed proposal (new id, same
+    expiry). Answers exist only inside that proposal: never written to
+    verified-models.json, user-config.json or any routing file. Each call
+    must answer every displayed availability question (or, if none, at
+    least one level), so the review always progresses and is finite."""
+    unavailable = None
+    if args.unavailable is not None:
+        tokens = list(dict.fromkeys(t.lower() for t in _parse_tokens(args.unavailable)))
+        if not tokens or len(tokens) > 200 or not all(valid_model_id(t) for t in tokens):
+            raise RefreshError("invalid --unavailable list (model IDs separated by spaces or commas); nothing was "
+                               "changed")
+        unavailable = set(tokens)
+    levels = _parse_level_answers(args.level)
+    with refresh_lock(paths):
+        note = recover_journal(paths)
+        if note:
+            print("Note: %s." % note)
+        doc = _load_proposal(paths, args.proposal_id, now)
+        if doc["review"] is None:
+            raise RefreshError("proposal %s is not a review proposal (made without --review); nothing was changed"
+                               % doc["proposal_id"], EXIT_REFUSED)
+        ctx = build_context(paths, now, refresh=None)
+        rows, alternatives = _verify_proposal_evidence(paths, doc, ctx)
+        by_n = {a["n"]: a for a in alternatives}
+        selected = [by_n[n] for n in doc["selected"]]
+        pending = review_pending(review_targets(rows, selected))
+        if not has_pending(pending):
+            raise RefreshError("nothing in proposal %s is waiting for your answer; nothing was changed"
+                               % doc["proposal_id"], EXIT_REFUSED)
+        shown = set(pending["check"])
+        rejected = set()
+        if shown:
+            if bool(args.available_all) == (unavailable is not None):
+                raise RefreshError("answer the availability of %s with exactly one of --available-all or "
+                                   "--unavailable IDS; nothing was changed" % ", ".join(sorted(shown)))
+            rejected = unavailable or set()
+            if not rejected <= shown:
+                raise RefreshError("not among the proposed models you were asked about: %s; nothing was changed"
+                                   % ", ".join(sorted(rejected - shown)))
+        elif args.available_all or unavailable is not None:
+            raise RefreshError("no proposed model is waiting for an availability answer; nothing was changed")
+        elif not levels:
+            raise RefreshError("no answer given; nothing was changed")
+        for model_id, effort in levels:
+            if effort not in pending["levels"].get(model_id, ()):
+                raise RefreshError("reasoning level %s:%s was not asked about in this proposal; nothing was changed"
+                                   % (model_id, effort))
+            if model_id in rejected:
+                raise RefreshError("%s was answered as NOT available; its reasoning level is not asked; nothing was "
+                                   "changed" % model_id)
+        review = ctx["review"]
+        if review["round"] >= MAX_REVIEW_ROUNDS:
+            with contextlib.suppress(OSError):
+                os.unlink(paths.proposal)
+            raise RefreshError("refused: more than %d review rounds; nothing was applied — run p again"
+                               % MAX_REVIEW_ROUNDS, EXIT_REFUSED)
+        new_review = {"round": review["round"] + 1, "available": review["available"] | (shown - rejected),
+                      "rejected": review["rejected"] | rejected,
+                      "levels": {m: dict(r) for m, r in review["levels"].items()}}
+        for (model_id, effort), ok in levels.items():
+            new_review["levels"].setdefault(model_id, {})[effort] = ok
+        ctx["review"] = new_review
+        rows = evaluate(ctx)
+        alternatives = number_alternatives(rows)
+        # Selections are carried only by identity (same route and exact
+        # values) into the renumbered table; anything no longer offered is
+        # dropped. Old option numbers are never reused.
+        kept, dropped = [], []
+        for old in selected:
+            match = next((a for a in alternatives if a["route"] == old["route"] and a["values"] == old["values"]),
+                         None)
+            if match is None:
+                dropped.append(old)
+            else:
+                kept.append(match)
+        new_overrides = derive_overrides(rows, ctx["state"], ctx["defaults"], kept)
+        plan = plan_outputs(ctx, new_overrides)
+        targets = review_targets(rows, kept)
+        pending = review_pending(targets)
+        route_changes = [t["route"] for t in targets]
+        sync = plan["settings_changed"] is not None and _sync_needed(ctx, plan)
+        out = ["", "Review round %d — your answers are used for this copilot-s p run only (never saved). Recomputed "
+                   "from the same frozen prices and official evidence (nothing re-fetched)." % new_review["round"]]
+        for old in dropped:
+            out.append("  Your selected alternative #%d (%s -> %s) is no longer offered after your answers and was "
+                       "dropped." % (old["n"], old["route"], _route_text(old["values"])))
+        out += render_review(ctx, rows, targets, pending, "Revised mapping:")
+        out.append("")
+        out.append("Reasons:")
+        for row in rows:
+            out.append("  %s: %s" % (row["label"], _safe_text(row["reason"], 400)))
+        if alternatives:
+            out += render_alternatives(ctx, rows)
+        if not route_changes and not sync:
+            out += render_final(ctx["effective"], ctx["defaults"], set(),
+                                "No eligible replacement remains after your answers — every route keeps its "
+                                "current model; nothing was changed. Final effective routing (kept):")
+            print("\n".join(out))
+            if alternatives and preflight(ctx, plan) is None:
+                proposal_id = _freeze_proposal(ctx, rows, alternatives, [], new_overrides, plan, [],
+                                               doc["created_epoch"], doc["expires_epoch"])
+                _print_review_lines(pending, alternatives, 0, proposal_id)
+            else:
+                with contextlib.suppress(OSError):
+                    os.unlink(paths.proposal)
+                _print_review_lines(pending, [], 0, None)
+            return EXIT_NO_CHANGES
+        problem = preflight(ctx, plan)
+        if problem:
+            with contextlib.suppress(OSError):
+                os.unlink(paths.proposal)
+            raise RefreshError("these changes cannot be applied: %s; nothing was changed" % problem, EXIT_REFUSED)
+        out += render_final(plan["effective"], ctx["defaults"], set(route_changes),
+                            ("TENTATIVE effective routing IF you confirm every pending check and then apply "
+                             if has_pending(pending) else "Effective routing IF you apply ")
+                            + "(categorical fit only — not measured or equal quality):")
+        proposal_id = _freeze_proposal(ctx, rows, alternatives, [a["n"] for a in kept], new_overrides, plan,
+                                       route_changes, doc["created_epoch"], doc["expires_epoch"])
+        print("\n".join(out))
+        _print_review_lines(pending, alternatives, len(kept), proposal_id)
     return EXIT_OK
 
 
@@ -3573,6 +4022,12 @@ def cmd_apply(paths, args, now):
         rows, alternatives = _verify_proposal_evidence(paths, doc, ctx)
         by_n = {a["n"]: a for a in alternatives}
         selected = [by_n[n] for n in doc["selected"]]
+        if has_pending(review_pending(review_targets(rows, selected))):
+            # A tentative review proposal is never directly applicable.
+            with contextlib.suppress(OSError):
+                os.unlink(paths.proposal)
+            raise RefreshError("refused: this review proposal still has proposed models or reasoning levels you have "
+                               "not confirmed (tentative); nothing was applied — run p again", EXIT_REFUSED)
         new_overrides = derive_overrides(rows, ctx["state"], ctx["defaults"], selected)
         if new_overrides != {k: dict(v) for k, v in doc["overrides"].items()}:
             with contextlib.suppress(OSError):
@@ -3665,8 +4120,7 @@ def cmd_record_verified(paths, args, now):
     Copilot CLI's /model picker. Writes only model-refresh/verified-models.json
     and only after an exact `yes` (never user-config.json, never routing)."""
     if not sys.stdin.isatty():
-        raise RefreshError("record-verified is interactive: run it from a terminal (copilot-s p, then v); nothing "
-                           "was saved")
+        raise RefreshError("record-verified is interactive: run it from a terminal; nothing was saved")
     ctx = build_context(paths, now, refresh=None)
     today = ctx["today"].isoformat()
     rows = evaluate(ctx) if ctx["snapshot"] else []
@@ -3787,7 +4241,24 @@ def main(argv=None, now=None):
                                           "; freeze the proposal for apply and print 'PROPOSAL<TAB>id'")))
         p.add_argument("--offline", action="store_true",
                        help="Use the cached pricing snapshot and capability evidence only (no network)")
+        if freeze:
+            p.add_argument("--review", action="store_true",
+                           help="Review mode (copilot-s p): also propose candidates pending only your /model "
+                                "availability or exact reasoning-level answer; such a TENTATIVE proposal cannot be "
+                                "applied until `review` has recorded every answer; prints CHECK/LEVEL/REVIEW lines")
         p.set_defaults(func=(lambda f: (lambda pa, a, n: cmd_preview(pa, a, n, freeze=f)))(freeze))
+    p = sub.add_parser("review", help="Answer a review proposal's pending questions (session-only answers sealed in "
+                                      "a NEW proposal; never saved elsewhere; no routing writes)")
+    p.add_argument("--proposal-id", required=True)
+    group = p.add_mutually_exclusive_group()
+    group.add_argument("--available-all", action="store_true",
+                       help="Every model listed by CHECK lines is available in your /model picker")
+    group.add_argument("--unavailable", metavar="IDS",
+                       help="Models listed by CHECK lines that are NOT available (space/comma separated); the other "
+                            "listed ones count as available for this review only")
+    p.add_argument("--level", action="append", metavar="MODEL:EFFORT=yes|no",
+                   help="Your answer for one LEVEL line: does /model offer that exact reasoning level (repeatable)")
+    p.set_defaults(func=cmd_review)
     p = sub.add_parser("apply", help="Apply a frozen proposal (refuses if anything changed since)")
     p.add_argument("--proposal-id", required=True)
     p.set_defaults(func=cmd_apply)

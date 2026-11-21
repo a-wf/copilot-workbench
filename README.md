@@ -559,16 +559,29 @@ and `p` returns to that menu instead of launching anything) runs
    task area, Category, capabilities and CLI support; otherwise it is
    listed as unassessed and never assigned. Models new since your last
    refresh are flagged.
-4. **Optional: record what you verified (`v`).** When replacements are
-   blocked only by availability or reasoning levels you have not verified,
-   `copilot-s` offers `v` (Enter skips). You type the model IDs you can
-   select in Copilot CLI's `/model` picker, whether that is the complete
-   list, and — only for models your routes need — the reasoning levels the
-   picker shows for each. Nothing is saved unless you type `yes`; it goes to
-   `~/.copilot/model-refresh/verified-models.json` (dated, valid 30 days;
-   `user-config.json` is never written), and the proposal is re-evaluated
-   once. Levels you do not re-enter keep their original date (never
-   silently renewed).
+4. **Check the proposed models in `/model`.** `copilot-s` runs the helper in
+   review mode: a candidate blocked *only* by availability or an exact
+   reasoning level you have not verified may still be proposed, marked
+   TENTATIVE (every other gate below still applies). After the table, it
+   lists each proposed model once — its route(s), the exact reasoning
+   level(s) it needs, blended price and why — and asks **"Are all these
+   proposed models available in /model? [y/N]"**. On No you type only the
+   unavailable IDs from that list (spaces/commas; anything else is
+   re-asked; Enter or EOF cancels — availability is never assumed); the
+   others count as available. For a needed level that no saved or
+   source-backed record covers, it asks y/N for that exact model and level
+   (No = that model is not used where the level is needed; never
+   downgraded). The helper then recomputes the mapping from the same frozen
+   prices and evidence (an unavailable model is excluded for the rest of
+   that run, even if an older record lists it) and asks again only about
+   new proposals, until nothing is pending; if no replacement remains, every
+   route keeps its model. Your answers live only inside the sealed proposal
+   for that run — never in `verified-models.json`, `user-config.json` or
+   any routing file — and a tentative proposal can never be applied. To
+   save a `/model` record for later runs instead, run
+   `copilot-model-refresh.py record-verified` (interactive; saved to
+   `~/.copilot/model-refresh/verified-models.json`, dated, valid 30 days,
+   only after you type `yes`).
 5. **Optional alternatives.** Besides the cost-saving proposals (rule
    unchanged: at least 10% cheaper), a route can list numbered optional
    alternatives: models that pass every gate below, are in the route's
@@ -582,11 +595,14 @@ and `p` returns to that menu instead of launching anything) runs
    threshold), the differentiator and its source, the official "Excels at"
    text labelled as the vendor's description, and its limits — no measured,
    equal or better quality claim. None is pre-selected: you may type their
-   numbers (Enter = none); a selected alternative replaces that route's
-   cost-saving change and still needs the final `yes`. Pinned routes and
+   numbers (Enter = none; offered once, from the latest table); a selected
+   alternative replaces that route's cost-saving change, is checked in
+   `/model` like any proposed model if needed, and still needs the final
+   `yes`. Pinned routes and
    routes with an unknown current price get none.
-6. **Confirm.** Changes are applied only after you type exactly `yes`
-   (anything else, Enter, or EOF cancels). The proposal is frozen with
+6. **Confirm.** Only a fully checked proposal is offered, and changes are
+   applied only after you type exactly `yes` (anything else, Enter, or EOF
+   cancels). The proposal is frozen with
    digests of everything it read plus an evidence digest; `apply` (and
    `select`) re-derive every decision from the cached evidence and refuse,
    changing nothing, if `settings.json`, the refresh state, your user
@@ -622,13 +638,15 @@ baseline. A route is changed only when it is not pinned and a candidate:
   Category in the live pricing (otherwise it needs re-review) and the
   catalog entry has not expired;
 - is in **your verified availability list** (`user-config.json` and/or
-  the list recorded with `v`) — Copilot CLI documents no programmatic model
-  catalog, so availability under your plan and organization policy is
-  never assumed from the pricing or supported-models pages;
+  the list recorded with `record-verified`) or you confirmed it in this
+  `p` run's review — Copilot CLI documents no programmatic model catalog,
+  so availability under your plan and organization policy is never assumed
+  from the pricing or supported-models pages;
 - has the route's **specific reasoning level** (e.g. `high`, `xhigh`)
   verified for that model — either a source-backed `reasoning_levels` entry
-  in the catalog or your own dated record (`verified_capabilities` or
-  levels recorded with `v`). The
+  in the catalog, your own dated record (`verified_capabilities` or
+  levels recorded with `record-verified`), or your y/N for that exact
+  level in this `p` run's review. The
   official docs only say reasoning is "configurable" and that levels vary
   per model (Copilot CLI shows them only in the interactive `/model`
   picker), so the shipped catalog lists no levels and an unknown level
@@ -755,7 +773,8 @@ or deleted and the output explains how to recover by hand.
 configurable reasoning, not which levels; which models and levels YOU can
 use is visible only in Copilot CLI's interactive `/model` picker (no
 documented programmatic listing), so availability and levels are never
-claimed automatically — only from what you record. Fit is categorical: no
+claimed automatically — only from what you record or answer in a `p`
+review (that run only). Fit is categorical: no
 output claims measured, equal or better quality, and the blended price
 impact is an assumption, not your bill. The capability fetch sends only a
 plain GET for the two fixed public URLs (no credentials, cookies, model
@@ -763,7 +782,12 @@ usage or local data); remote text is sanitized, shown only in the
 terminal, and never written into the generated instruction or settings.
 Scripted use: `copilot-model-refresh.py propose` prints machine lines
 `PROPOSAL<TAB>id`, `ALTERNATIVE<TAB>n<TAB>route<TAB>model` and
-`VERIFY<TAB>needed`; `select --proposal-id ID --choose 1,2` adds chosen
+`VERIFY<TAB>needed`; `propose --review` instead adds
+`CHECK<TAB>model<TAB>routes`, `LEVEL<TAB>model<TAB>effort`,
+`REVIEW<TAB>pending|complete` and `SELECTED<TAB>count`, and `review
+--proposal-id ID (--available-all | --unavailable IDS) [--level
+MODEL:EFFORT=yes|no ...]` answers them (a proposal with anything pending is
+never applicable); `select --proposal-id ID --choose 1,2` adds chosen
 alternatives (new id); `record-verified` is interactive and refuses to run
 without a terminal.
 
@@ -1650,7 +1674,7 @@ Verify the pipeline is loaded:
 | Legacy company fixed per-request policy (inactive) | `~/.copilot/task-reports/request-pricing.json` | copied from `config/request-pricing.json` on first install (only if absent); unused |
 | Executables install prefix | `scripts/install.sh --prefix DIR` | `~/.local/bin` |
 | Install method | `scripts/install.sh --copy` | symlink |
-| Subagent model refresh (menu `p`) | `copilot-model-refresh.py`; state, backups, capability evidence cache, your `user-config.json` and `verified-models.json` (recorded with `v`) in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated fallback catalog `~/.copilot/model-role-catalog.json`; `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` stops the capability-page fetch | no overrides; replacements need your verified availability list |
+| Subagent model refresh (menu `p`) | `copilot-model-refresh.py`; state, backups, capability evidence cache, your `user-config.json` and `verified-models.json` (recorded with `copilot-model-refresh.py record-verified`) in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated fallback catalog `~/.copilot/model-role-catalog.json`; `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` stops the capability-page fetch | no overrides; replacements need your verified availability list |
 | Model refresh helper path | `COPILOT_MODEL_REFRESH_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-model-refresh.py` |
 | Per-launch session reports | `COPILOT_SESSION_REPORTS_DIR` env var | `~/.copilot/session-reports` (never pruned automatically) |
 | Session report helper path | `COPILOT_SESSION_REPORT_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-session-report.py` |
