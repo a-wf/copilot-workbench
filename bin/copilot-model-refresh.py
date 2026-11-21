@@ -98,7 +98,8 @@ What it does
   from the caches (never re-fetching) and refuse (change nothing) if any of
   it changed, the proposal expired, was altered, was made by an older
   format, or was already applied.
-- `propose --review` (what copilot-s menu `p` runs) additionally lets a
+- `propose --review` (copilot-s menu `p` adds `--draft`, below; the
+  cost-led menu `p` runs it without) additionally lets a
   candidate that is blocked ONLY by your unverified /model availability
   and/or an unverified exact reasoning level be proposed TENTATIVELY, so
   you see the mapping table first and are asked only about its proposed
@@ -113,6 +114,42 @@ What it does
   lists it; a "no" for a level excludes that model wherever the level is
   needed (never downgraded). Only a proposal with nothing left to confirm
   can be applied, still after a separate exact `yes`.
+- `propose --review --draft` (what copilot-s menu `p` runs, balanced
+  policy only) shows ONE compact numbered mapping table first: every route
+  (row number = route order, stable), its current model · effort ·
+  context, a DRAFTED change or keep, the blended price change, a short
+  basis, how many explicit alternatives exist and the status (pinned /
+  kept / draft / accepted / still to check). The draft is a proposal only —
+  nothing is selected. Per route it takes, among the route's offered
+  options only (every gate above already passed), the first of: (1) the
+  same model back at the baseline effort/context ("Alignment"); (2) the
+  ONLY option that fresh third-party metrics measured at this route's
+  exact reasoning levels favour — at least one higher, none lower, no
+  aggregator disagreement ("Benchmark", reference only); and, only when no
+  such comparable metric separates the two models, (3) a documented
+  official differentiator at IDENTICAL official rates (both tiers on
+  long_context routes, never an imputed price; more differentiators first,
+  then model ID — "Documented, same price") or else (4) the cheapest >= 10%
+  official saving ("Savings", a price fact, never a quality claim).
+  Options with adverse or mixed comparable metrics, several favoured
+  options, or a documented advantage at another price are never drafted
+  automatically; they stay reachable with `o` (labelled, never "best").
+  `draft --proposal-id ID --do CMD` changes the sealed table: `a` accept
+  every draft change, `a 1,3` accept only those rows (other unaccepted
+  drafts are kept; rows accepted earlier stay accepted), `k 1,3` keep,
+  `r 1,3` repropose those rows with their next ranked candidate never shown
+  before (remembered; `r` alone repeats on them; no cycling — exhausted
+  rows are kept, with the reason), `o`/`o ROW` list the alternatives (read
+  only), `o ROW.K` drafts one, `e` edits an accepted table. Only ACCEPTED
+  rows are then checked with you (`review`: availability / exact level);
+  an answer that rules out an accepted or drafted model re-drafts ONLY the
+  rows using it (they must be accepted again) and preserves every other
+  row and answer. Only an accepted table with nothing left to check can be
+  applied, after the separate exact `yes`. The draft state (decisions,
+  identities, bases, every identity shown, remembered subset, phase, step
+  counter, ranking version) is sealed in the proposal and re-validated
+  against a cache-only re-derivation on every command; a draft that does
+  not match fails closed.
 - `record-verified` (interactive, terminal only; no longer part of menu
   `p`) records the model IDs and reasoning levels YOU saw in Copilot CLI's
   /model picker into a separate tool-written file
@@ -164,7 +201,8 @@ Honest limits
 
 Commands: status [--instructions] |
           preview [--offline] [--cost-led] [--details] |
-          propose [--offline] [--review] [--cost-led] [--details] |
+          propose [--offline] [--review [--draft]] [--cost-led] [--details] |
+          draft --proposal-id ID --do 'a | a ROWS | k ROWS | r [ROWS] | o [ROW[.K]] | e' |
           details [--proposal-id ID] [--cost-led] |
           review --proposal-id ID (--available-all | --unavailable IDS)
                  [--level MODEL:EFFORT=yes|no ...] |
@@ -173,13 +211,21 @@ Commands: status [--instructions] |
 Exit codes: 0 ok (propose/review: changes pending; record-verified: saved),
             2 error, 3 no changes (propose/review: may still print a PROPOSAL
             id when optional alternatives exist; record-verified: nothing
-            saved), 4 refused (stale/tentative proposal, concurrent edit,
-            unsafe target), 130 interrupted (nothing half-written).
+            saved), 4 refused (stale/tentative/unaccepted proposal,
+            concurrent edit, unsafe target), 5 (draft) command not accepted —
+            nothing changed, same PROPOSAL and DRAFT lines printed again,
+            130 interrupted (nothing half-written).
 Machine lines on stdout (propose/select/review): PROPOSAL<TAB>id,
   ALTERNATIVE<TAB>n<TAB>route<TAB>model, VERIFY<TAB>needed (plain propose
   only); review proposals also print CHECK<TAB>model<TAB>route[,route...]
   (availability to confirm), LEVEL<TAB>model<TAB>effort (exact level to
   confirm), REVIEW<TAB>pending|complete and SELECTED<TAB>count.
+  Draft proposals (propose --draft, draft, review of a draft) print
+  DRAFT<TAB>choose|verify|final|none<TAB>open<TAB>accepted (exactly once)
+  and never ALTERNATIVE/VERIFY; choose: only DRAFT and PROPOSAL; verify:
+  CHECK/LEVEL for the ACCEPTED rows, REVIEW<TAB>pending, SELECTED<TAB>
+  accepted; final: REVIEW<TAB>complete, SELECTED<TAB>accepted; none: no
+  PROPOSAL (nothing to apply).
 User-maintained input (never written by this tool):
   <COPILOT_HOME>/model-refresh/user-config.json — available_models
   {verified_on, models}, verified_capabilities {verified_on, models:
@@ -229,7 +275,7 @@ USER_CONFIG_KIND = "copilot-toolkit-model-refresh-user-config"
 SEEN_KIND = "copilot-toolkit-model-refresh-seen-models"
 CAPABILITY_KIND = "copilot-toolkit-model-capability-evidence"
 VERIFIED_KIND = "copilot-toolkit-model-refresh-verified-models"
-PROPOSAL_FORMAT = 4
+PROPOSAL_FORMAT = 5
 # Selection policy. "balanced" (default, copilot-s p): nothing is changed or
 # preselected automatically; savings and documented/benchmark-backed options
 # are offered by number. "cost-led" (explicit --cost-led): the legacy
@@ -241,6 +287,9 @@ EXIT_OK = 0
 EXIT_ERROR = 2
 EXIT_NO_CHANGES = 3
 EXIT_REFUSED = 4
+# `draft --do`: the command was not accepted (unknown/invalid for this phase);
+# the proposal is unchanged and its machine lines are printed again.
+EXIT_INPUT = 5
 
 MODEL_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.\-]{0,78}[a-z0-9])?$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -2680,6 +2729,402 @@ def has_pending(pending):
     return bool(pending["check"] or pending["levels"])
 
 
+# ---------------------------------------------------------- draft mapping ---
+# `propose --review --draft` (copilot-s menu p, balanced policy): a DRAFT
+# mapping — at most one drafted change per route, chosen by the fixed ranking
+# below ONLY among the route's offered options (every hard gate already
+# passed; pending only your /model availability / exact-level answers) — is
+# shown as one numbered table (row number = route order, stable). The draft
+# is a proposal only: nothing is selected until you accept rows (`a`),
+# accepted rows are then checked with you, and only a separate exact `yes`
+# applies them. The whole draft state (per-route decision, drafted identity,
+# its basis, every identity already shown, the remembered reproposal subset,
+# the phase and a step counter) lives in the SEALED proposal and is
+# re-validated against a cache-only re-derivation on every command.
+
+DRAFT_RANKING_VERSION = 1
+DRAFT_PHASES = ("choose", "confirm")
+DRAFT_DECISIONS = ("open", "accepted", "kept")
+DRAFT_BASES = ("alignment", "benchmark", "official", "savings", "manual")
+DRAFT_FLAGS = ("", "revised", "exhausted")
+DRAFT_ROW_KEYS = {"route", "decision", "values", "basis", "flag", "shown"}
+MAX_DRAFT_STEPS = 60
+MAX_DRAFT_SHOWN = 40
+DRAFT_BASIS_LABELS = {
+    "alignment": "Alignment",
+    "benchmark": "Benchmark",
+    "official": "Documented, same price",
+    "savings": "Savings (price only)",
+    "manual": "Your pick",
+}
+
+
+def _vkey(values):
+    return (values["model"], values["reasoning_effort"], values["context_tier"])
+
+
+def draft_evidence(alt):
+    """How FRESH third-party metrics measured at EXACTLY this route's levels
+    (the source states both models' effort and it equals the route's) relate
+    the option to the current model: (kind, higher, lower) with kind
+    "none" (no such comparable metric differs — no comparable evidence
+    separates them; pages at another/unstated effort are context only),
+    "favours" (>= 1 higher for the option, none lower, aggregators' own
+    composites do not disagree), "adverse" (only lower) or "mixed"."""
+    bench = alt.get("benchmark") or {}
+    higher = lower = 0
+    for entry in bench.get("fresh") or []:
+        if not entry.get("setup_matches"):
+            continue
+        for x in entry["metrics"]:
+            if x["comparable"]:
+                higher += x["candidate"] > x["current"]
+                lower += x["candidate"] < x["current"]
+    if not higher and not lower:
+        return "none", 0, 0
+    if higher and not lower and not bench.get("providers_disagree"):
+        return "favours", higher, lower
+    if lower and not higher:
+        return "adverse", higher, lower
+    return "mixed", higher, lower
+
+
+def _same_official_price(snapshot, current, candidate, long_route):
+    """True only when the OFFICIAL rates are identical: the Default tier,
+    and for long_context routes also the tier billed above the threshold
+    (both present and equal with the same threshold, or both absent). No
+    price is ever imputed for a missing tier."""
+    a = snapshot["models"].get(current) if snapshot else None
+    b = snapshot["models"].get(candidate) if snapshot else None
+    if not a or not b or a["tiers"]["default"] != b["tiers"]["default"]:
+        return False
+    if long_route:
+        return (a["tiers"].get("long_context") == b["tiers"].get("long_context")
+                and a.get("threshold") == b.get("threshold"))
+    return True
+
+
+def draft_ranking(ctx, row):
+    """[(option, basis)] in draft order for one route, ONLY among its offered
+    options (row["alternatives"]: every hard gate passed). Deterministic:
+    1. "alignment": the current model back at the route's baseline
+       effort/context;
+    2. "benchmark": the ONLY option that fresh third-party metrics at this
+       route's exact levels favour (>= 1 higher, none lower, no aggregator
+       disagreement) — reference evidence, never proof of quality;
+    3. "official" (no comparable metric separates the two models): a
+       documented official differentiator at IDENTICAL official rates (both
+       tiers on long_context routes), more differentiators first, then ID;
+    4. "savings" (no comparable metric separates them): >= 10% cheaper on
+       official rates, cheapest first — a price fact, NOT a quality claim.
+    Options with adverse or mixed comparable metrics, several favoured
+    options (no ranking between them), and documented advantages at another
+    price are never drafted automatically — only via `o` (your pick)."""
+    alts = row["alternatives"]
+    snap = ctx["snapshot"]
+    out = [(a, "alignment") for a in alts if "alignment" in a["bases"]]
+    others = [a for a in alts if "alignment" not in a["bases"]]
+    kinds = [draft_evidence(a)[0] for a in others]
+    favoured = [a for a, k in zip(others, kinds) if k == "favours"]
+    if len(favoured) == 1:
+        out.append((favoured[0], "benchmark"))
+    neutral = [a for a, k in zip(others, kinds) if k == "none"]
+    same = sorted((a for a in neutral if "official" in a["bases"] and "saving" not in a["bases"]
+                   and _same_official_price(snap, a["current_model"], a["model"], a["long_route"])),
+                  key=lambda a: (-len(a["differentiators"]), a["model"]))
+    out += [(a, "official") for a in same]
+    savings = sorted((a for a in neutral if "saving" in a["bases"]),
+                     key=lambda a: (a["cost"], a["long_cost"] if a["long_cost"] is not None else 0.0, a["model"]))
+    out += [(a, "savings") for a in savings]
+    return out
+
+
+def _alt_for(row, values):
+    return next((a for a in row["alternatives"] if a["values"] == values), None)
+
+
+def _blank_draft_row(key):
+    return {"route": key, "decision": "kept", "values": None, "basis": None, "flag": "", "shown": []}
+
+
+def initial_draft(ctx, rows):
+    """The first draft: each route's top-ranked option (open, NOT accepted)
+    or kept when it has none (pinned, blocked, no option, or only options
+    that are never drafted automatically)."""
+    out = []
+    for row in rows:
+        ranking = draft_ranking(ctx, row)
+        d = _blank_draft_row(row["key"])
+        if ranking:
+            alt, basis = ranking[0]
+            d.update(decision="open", values=dict(alt["values"]), basis=basis, shown=[dict(alt["values"])])
+        out.append(d)
+    return {"version": DRAFT_RANKING_VERSION, "phase": "choose", "step": 0, "subset": [], "rows": out}
+
+
+def validate_draft(raw):
+    """Structural validation of the sealed draft state (None = not a draft
+    proposal). Anything unknown, out of range, duplicated or inconsistent
+    refuses (fail closed)."""
+    if raw is None:
+        return None
+
+    def bad(what):
+        raise RefreshError("malformed proposal (draft %s)" % what, EXIT_REFUSED)
+
+    def is_int(v):
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    def check_values(v, what):
+        if (not isinstance(v, dict) or set(v) != set(FIELDS) or not valid_model_id(v["model"])
+                or v["reasoning_effort"] not in EFFORTS or v["context_tier"] not in CONTEXT_TIERS):
+            bad(what)
+    if not isinstance(raw, dict) or set(raw) != {"version", "phase", "step", "subset", "rows"}:
+        bad("fields")
+    if not is_int(raw["version"]) or raw["version"] != DRAFT_RANKING_VERSION:
+        bad("ranking version")
+    if raw["phase"] not in DRAFT_PHASES:
+        bad("phase")
+    if not is_int(raw["step"]) or not 0 <= raw["step"] <= MAX_DRAFT_STEPS:
+        bad("step")
+    subset = raw["subset"]
+    if (not isinstance(subset, list) or not all(is_int(n) and 1 <= n <= len(ROUTES) for n in subset)
+            or subset != sorted(set(subset))):
+        bad("subset")
+    rows = raw["rows"]
+    if not isinstance(rows, list) or len(rows) != len(ROUTES):
+        bad("rows")
+    for route, d in zip(ROUTES, rows):
+        if not isinstance(d, dict) or set(d) != DRAFT_ROW_KEYS or d["route"] != route["key"]:
+            bad("row")
+        if d["decision"] not in DRAFT_DECISIONS or d["flag"] not in DRAFT_FLAGS:
+            bad("row status")
+        shown = d["shown"]
+        if not isinstance(shown, list) or len(shown) > MAX_DRAFT_SHOWN:
+            bad("history")
+        for v in shown:
+            check_values(v, "history")
+        if len({_vkey(v) for v in shown}) != len(shown):
+            bad("history (duplicate)")
+        if d["values"] is None:
+            if d["basis"] is not None or d["decision"] != "kept":
+                bad("row (decision without a drafted change)")
+        else:
+            check_values(d["values"], "row values")
+            if d["basis"] not in DRAFT_BASES or d["flag"] == "exhausted" or d["values"] not in shown:
+                bad("row basis")
+        if raw["phase"] == "confirm" and d["decision"] == "open":
+            bad("phase (an unaccepted draft row in the confirm phase)")
+    return copy.deepcopy(raw)
+
+
+def draft_alternatives(ctx, rows, draft):
+    """({route: option}, problem). Every drafted identity must be an offered
+    option of its route right now (re-derived from the frozen inputs), and a
+    ranked basis must be exactly what the ranking gives it. Read-only."""
+    by_route = {}
+    for i, (row, d) in enumerate(zip(rows, draft["rows"]), 1):
+        if d["values"] is None:
+            continue
+        alt = _alt_for(row, d["values"])
+        if alt is None:
+            return None, "row %d (%s) drafts %s, which is not an offered option" % (i, row["key"],
+                                                                                   _route_text(d["values"]))
+        if d["basis"] != "manual":
+            ranked = [b for a, b in draft_ranking(ctx, row) if a is alt]
+            if ranked != [d["basis"]]:
+                return None, "row %d (%s) has a basis the ranking does not give" % (i, row["key"])
+        by_route[row["key"]] = alt
+    return by_route, None
+
+
+def _accepted_alts(draft, by_route):
+    return [by_route[d["route"]] for d in draft["rows"] if d["decision"] == "accepted"]
+
+
+def _check_draft(paths, ctx, rows, draft, selected):
+    """draft_alternatives() that refuses (dropping the proposal) on any
+    mismatch, and binds the sealed selection to exactly the accepted rows."""
+    by_route, problem = draft_alternatives(ctx, rows, draft)
+    if problem is None and selected is not None and sorted(selected) != sorted(
+            a["n"] for a in _accepted_alts(draft, by_route)):
+        problem = "the accepted rows do not match the sealed selection"
+    if problem:
+        with contextlib.suppress(OSError):
+            os.unlink(paths.proposal)
+        raise RefreshError("refused: the draft does not match a re-derivation from the frozen evidence (%s; "
+                           "altered?); nothing was applied — run p again" % problem, EXIT_REFUSED)
+    return by_route
+
+
+def _draft_counts(draft):
+    return (sum(d["decision"] == "open" for d in draft["rows"]),
+            sum(d["decision"] == "accepted" for d in draft["rows"]))
+
+
+class DraftInputError(Exception):
+    """A `draft --do` command that is not valid now (nothing changed)."""
+
+
+def _parse_row_list(text, n_rows):
+    toks = [t for t in re.split(r"[\s,]+", text.strip()) if t]
+    if not toks or len(toks) > n_rows or not all(re.match(r"^[1-9][0-9]?$", t) for t in toks):
+        raise DraftInputError("use row numbers from the table, e.g. 1 or 1,3")
+    rows = [int(t) for t in toks]
+    if len(set(rows)) != len(rows):
+        raise DraftInputError("a row number is repeated")
+    bad = [str(n) for n in rows if n > n_rows]
+    if bad:
+        raise DraftInputError("no row %s in the table (rows 1-%d)" % (", ".join(bad), n_rows))
+    return sorted(rows)
+
+
+def parse_draft_command(text):
+    """(verb, rows_or_None, (row, k)_or_None) for one table command:
+    a | a ROWS | k ROWS | r | r ROWS | o | o ROW | o ROW.K | e."""
+    text = (text or "").strip()
+    m = re.match(r"^([AaKkRrOoEe])(?:\s+([0-9][0-9 ,.]{0,60}))?$", text) if len(text) <= 64 else None
+    if not m:
+        raise DraftInputError("not a table command (a, a ROWS, k ROWS, r, r ROWS, o, o ROW, o ROW.K)")
+    verb, arg = m.group(1).lower(), (m.group(2) or "").strip()
+    n_rows = len(ROUTES)
+    if verb == "e":
+        if arg:
+            raise DraftInputError("e takes no row numbers")
+        return verb, None, None
+    if verb == "o":
+        if not arg:
+            return verb, None, None
+        om = re.match(r"^([1-9][0-9]?)(?:\.([1-9][0-9]?))?$", arg)
+        if not om or int(om.group(1)) > n_rows:
+            raise DraftInputError("use o, o ROW or o ROW.K (e.g. o 3 or o 3.2)")
+        if om.group(2) is None:
+            return verb, [int(om.group(1))], None
+        return verb, None, (int(om.group(1)), int(om.group(2)))
+    if "." in arg:
+        raise DraftInputError("use row numbers from the table, e.g. 1 or 1,3")
+    if verb == "k" and not arg:
+        raise DraftInputError("k needs row numbers, e.g. k 1,3")
+    return verb, (_parse_row_list(arg, n_rows) if arg else None), None
+
+
+def apply_draft_command(ctx, rows, draft, verb, row_list, option):
+    """(new_draft_or_None, message_lines). None = read-only (`o` listing).
+    Raises DraftInputError (nothing changed) when the command is not valid
+    in the current phase or for the given rows."""
+    new = copy.deepcopy(draft)
+    if verb == "e":
+        if draft["phase"] != "confirm":
+            raise DraftInputError("e (edit) is only for an accepted table; you are already editing it")
+        new["phase"] = "choose"
+        return new, ["", "Editing the table again — rows you accepted stay accepted until you keep (k) or "
+                         "repropose (r) them."]
+    if draft["phase"] != "choose":
+        raise DraftInputError("the table is accepted; type e to edit it")
+    if verb == "o" and option is None:
+        return None, render_draft_options(ctx, rows, draft, row_list[0] if row_list else None)
+    if verb == "o":
+        i, k = option
+        row, d = rows[i - 1], new["rows"][i - 1]
+        if not row["alternatives"]:
+            raise DraftInputError("row %d (%s) has no alternative (%s)" % (
+                i, row["key"], "pinned" if is_pinned(ctx["effective"][row["key"]]) else "no eligible option"))
+        if k > len(row["alternatives"]):
+            raise DraftInputError("row %d has alternatives %d.1-%d.%d" % (i, i, i, len(row["alternatives"])))
+        alt = row["alternatives"][k - 1]
+        if d["values"] == alt["values"] and d["decision"] != "kept":
+            raise DraftInputError("%d.%d is already row %d's draft" % (i, k, i))
+        if alt["values"] not in d["shown"]:
+            if len(d["shown"]) >= MAX_DRAFT_SHOWN:
+                raise DraftInputError("row %d has shown too many drafts; keep it or cancel" % i)
+            d["shown"].append(dict(alt["values"]))
+        ranked = [b for a, b in draft_ranking(ctx, row) if a is alt]
+        d.update(values=dict(alt["values"]), basis=ranked[0] if ranked else "manual", decision="open", flag="")
+        return new, ["", "Row %d now drafts %d.%d (%s) — still only a draft: accept it with a (or a %d)."
+                     % (i, i, k, _route_text(alt["values"]), i)]
+    if verb == "k":
+        for i in row_list:
+            new["rows"][i - 1]["decision"] = "kept"
+        return new, ["", "Kept unchanged: row(s) %s." % ", ".join(str(i) for i in row_list)]
+    if verb == "r":
+        targets = row_list if row_list is not None else new["subset"]
+        if not targets:
+            raise DraftInputError("no rows to repropose yet — use r ROWS, e.g. r 1,3")
+        for i in targets:
+            if not rows[i - 1]["alternatives"]:
+                raise DraftInputError("row %d (%s) has no option to repropose (%s)" % (
+                    i, rows[i - 1]["key"], "pinned" if is_pinned(ctx["effective"][rows[i - 1]["key"]])
+                    else "no eligible option"))
+        msgs = []
+        for i in targets:
+            d = new["rows"][i - 1]
+            shown = {_vkey(v) for v in d["shown"]}
+            nxt = next(((a, b) for a, b in draft_ranking(ctx, rows[i - 1]) if _vkey(a["values"]) not in shown), None)
+            if nxt is not None and len(d["shown"]) < MAX_DRAFT_SHOWN:
+                alt, basis = nxt
+                d["shown"].append(dict(alt["values"]))
+                d.update(values=dict(alt["values"]), basis=basis, decision="open", flag="")
+                msgs.append("row %d -> %s (%s)" % (i, _route_text(alt["values"]), DRAFT_BASIS_LABELS[basis]))
+            else:
+                d.update(values=None, basis=None, decision="kept", flag="exhausted")
+                msgs.append("row %d: no further recommendable candidate — kept (o %d lists the other options with "
+                            "their tradeoffs)" % (i, i))
+        new["subset"] = sorted(targets)
+        return new, [""] + _wrap("Reproposed: ", "; ".join(msgs) + ". Rows outside %s are unchanged; r alone "
+                                 "reproposes the same rows again." % ", ".join(str(i) for i in new["subset"]),
+                                 indent="", style="bold")
+    # verb == "a"
+    if row_list is None:
+        for d in new["rows"]:
+            if d["decision"] == "open":
+                d.update(decision="accepted", flag="")
+    else:
+        for i in row_list:
+            if new["rows"][i - 1]["values"] is None:
+                raise DraftInputError("row %d (%s) has no drafted change to accept (r %d or o %d first)"
+                                      % (i, rows[i - 1]["key"], i, i))
+        for i, d in enumerate(new["rows"], 1):
+            if i in row_list:
+                d.update(decision="accepted", flag="")
+            elif d["decision"] == "open":
+                d["decision"] = "kept"
+    new["phase"] = "confirm"
+    return new, []
+
+
+def reconcile_draft(ctx, rows, draft):
+    """After your /model answers: (new_draft, revised_rows). ONLY rows whose
+    drafted identity is no longer an offered option (a model you called
+    unavailable, a level you said /model does not offer) are re-drafted with
+    the next ranked candidate not shown before (or kept when none is left)
+    and must be accepted again; every other row — its identity, decision
+    and basis — is preserved. Any revision returns to the table."""
+    new = copy.deepcopy(draft)
+    revised = []
+    for i, (row, d) in enumerate(zip(rows, new["rows"]), 1):
+        if d["values"] is None:
+            continue
+        alt = _alt_for(row, d["values"])
+        ranked = [b for a, b in draft_ranking(ctx, row) if a is alt] if alt is not None else []
+        if alt is not None and (d["basis"] == "manual" or ranked == [d["basis"]]):
+            continue
+        if d["decision"] == "kept":
+            d.update(values=None, basis=None)
+            continue
+        shown = {_vkey(v) for v in d["shown"]}
+        nxt = next(((a, b) for a, b in draft_ranking(ctx, row) if _vkey(a["values"]) not in shown), None)
+        if nxt is not None and len(d["shown"]) < MAX_DRAFT_SHOWN:
+            alt, basis = nxt
+            d["shown"].append(dict(alt["values"]))
+            d.update(values=dict(alt["values"]), basis=basis, decision="open", flag="revised")
+        else:
+            d.update(values=None, basis=None, decision="kept", flag="exhausted")
+        revised.append(i)
+    if revised:
+        new["phase"] = "choose"
+    return new, revised
+
+
 # ------------------------------------------------------ generated outputs ---
 
 NATIVE_PIN = "pin:/subagents"
@@ -3308,6 +3753,23 @@ def render_next(ctx, rows, review_mode, freeze):
     return [""] + _wrap("Next: ", text, indent="", style="boldcyan")
 
 
+def _overview_header(ctx, title):
+    """Title plus the one-line state of every source and any blocking
+    warning (shared by the overview and the draft table)."""
+    out = [sty("bold", title)]
+    out += _wrap("Official pricing: ", _pricing_summary(ctx), style="bold")
+    out += _wrap("Official docs: ", _docs_summary(ctx), style="bold")
+    out += _wrap("Third-party: ", benchmark_summary(ctx), style="bold")
+    out += _wrap("Availability: ", ctx["availability"][1], style="bold")
+    if ctx["global_block"]:
+        out += _wrap("BLOCKED: ", "%s — nothing can be offered or changed" % ctx["global_block"], style="boldred")
+    for warning in list(ctx["pin_warnings"]) + [ctx.get("verified_warning"),
+                                                (ctx.get("capabilities") or {}).get("warning")]:
+        if warning:
+            out += _wrap("Warning: ", _safe_text(warning, 300), style="boldyellow")
+    return out
+
+
 def render_overview(ctx, rows, review_mode=False, freeze=False, recap=False):
     """Change-first summary shown at the top of every propose/preview: source
     state, every route (current model and whether options exist), the
@@ -3317,20 +3779,10 @@ def render_overview(ctx, rows, review_mode=False, freeze=False, recap=False):
     balanced = ctx.get("policy", DEFAULT_POLICY) == "balanced"
     out = []
     if not recap:
-        out.append(sty("bold", "Subagent model routing — %s" % (
+        out += _overview_header(ctx, "Subagent model routing — %s" % (
             "balanced mode: options only, nothing preselected" if balanced
             else "cost-led mode: the cheapest eligible >= %d%% saving is proposed automatically"
-            % round(MIN_SAVING_FRACTION * 100))))
-        out += _wrap("Official pricing: ", _pricing_summary(ctx), style="bold")
-        out += _wrap("Official docs: ", _docs_summary(ctx), style="bold")
-        out += _wrap("Third-party: ", benchmark_summary(ctx), style="bold")
-        out += _wrap("Availability: ", ctx["availability"][1], style="bold")
-        if ctx["global_block"]:
-            out += _wrap("BLOCKED: ", "%s — nothing can be offered or changed" % ctx["global_block"], style="boldred")
-        for warning in list(ctx["pin_warnings"]) + [ctx.get("verified_warning"),
-                                                    (ctx.get("capabilities") or {}).get("warning")]:
-            if warning:
-                out += _wrap("Warning: ", _safe_text(warning, 300), style="boldyellow")
+            % round(MIN_SAVING_FRACTION * 100)))
     out.append("")
     out.append(sty("bold", "Current routes") + " (model · effort · context, source):")
     width = term_width()
@@ -3648,11 +4100,12 @@ def render_action_required(ctx, rows):
     return out
 
 
-def render_review(ctx, rows, targets, pending, heading):
+def render_review(ctx, rows, targets, pending, heading, table=True):
     """The mapping table to check in /model: every route (current ->
     proposed), then each proposed model ONCE with its route(s), the exact
     reasoning level(s) it needs, price and rationale, and what is still
-    pending. Your answers so far are listed (this run only; not saved)."""
+    pending. Your answers so far are listed (this run only; not saved).
+    table=False omits the route table (the draft table is shown instead)."""
     review = ctx.get("review") or blank_review()
     by_route = {t["route"]: t for t in targets}
     out = [""] + _wrap("", heading, indent="", body_style="bold")
@@ -3668,9 +4121,10 @@ def render_review(ctx, rows, targets, pending, heading):
             status += " (your option #%d)" % t["alternative"]
         table_rows.append([row["label"], _route_text(row["current"]), _route_text(t["values"]),
                            "%s -> %s" % (_money(t["current_cost"]), _money(t["cost"])), status])
-    out += _table(["Route", "Current (model · effort · context)", "Proposed", "Blended $/1M", "Decision"], table_rows,
-                  cell_style=lambda _r, c, text: (("boldyellow" if "confirm" in text else "boldgreen")
-                                                  if c == 4 and text.startswith("CHANGE") else None))
+    if table:
+        out += _table(["Route", "Current (model · effort · context)", "Proposed", "Blended $/1M", "Decision"],
+                      table_rows, cell_style=lambda _r, c, text: (("boldyellow" if "confirm" in text else "boldgreen")
+                                                                  if c == 4 and text.startswith("CHANGE") else None))
     if targets:
         out.append("")
         out.append("Proposed models (each listed once):")
@@ -3826,6 +4280,341 @@ def render_final(effective, defaults, changed_keys, heading):
     out += _table(["Route", "Model", "Effort", "Context", "Source", "Status"], rows,
                   cell_style=lambda _r, c, text: "boldgreen" if c == 5 and text == "CHANGED" else None)
     return out
+
+
+# ------------------------------------------------------ draft rendering ---
+
+def _compact_values(values):
+    text = "%s %s" % (values["model"], values["reasoning_effort"])
+    return text + " long" if values["context_tier"] == "long_context" else text
+
+
+def _pct_text(new, cur):
+    if new is None or cur is None or cur <= 0:
+        return "n/a"
+    diff = new - cur
+    if abs(diff) < 1e-12:
+        return "same"
+    return "%+.0f%%" % (100.0 * diff / cur)
+
+
+def _pending_text(alt):
+    return " and ".join(t for c, t in ((REASON_AVAILABILITY, "its availability in /model"),
+                                       (REASON_CAPABILITY, "reasoning level '%s'" % alt["values"]["reasoning_effort"]))
+                        if c in alt["pending"])
+
+
+def draft_evidence_text(alt):
+    """Plain summary of draft_evidence() for one option (tradeoffs said so)."""
+    kind, higher, lower = draft_evidence(alt)
+    bench = alt.get("benchmark") or {}
+    if kind == "none":
+        text = "no fresh comparable third-party metric at this route's exact levels separates the two models"
+        if any(not e.get("setup_matches") for e in bench.get("fresh") or []):
+            text += " (pages measured at another or unstated effort are context only)"
+        return text
+    if kind == "favours":
+        return ("fresh third-party metrics at this route's exact levels: %d higher for it, none lower (reference only, "
+                "not proof of quality)" % higher)
+    if kind == "adverse":
+        return ("TRADEOFF — fresh third-party metrics at this route's exact levels: %d higher for the CURRENT model, "
+                "none for it" % lower)
+    return ("TRADEOFF — fresh third-party metrics at this route's exact levels point both ways (%d higher for it, %d "
+            "higher for the current model%s)" % (higher, lower, "; the aggregators' composites disagree"
+                                                 if bench.get("providers_disagree") else ""))
+
+
+def draft_basis_text(alt, basis):
+    """Why a row drafts this option — which KIND of fact it rests on."""
+    if basis == "alignment":
+        return alternative_why(alt)
+    if basis == "benchmark":
+        return ("the only option that fresh reviewed third-party metrics at this route's exact reasoning levels score "
+                "higher (%d metric(s)) and lower on none — reference only, not proof of quality; %s"
+                % (draft_evidence(alt)[1], _delta_text(alt["cost"], alt["current_cost"])))
+    if basis == "official":
+        return ("documented official differentiator at the SAME official price (no comparable third-party metric "
+                "separates the models): " + "; ".join(alt["differentiators"]))
+    if basis == "savings":
+        return ((alt["saving_text"] or "cheaper") + " — a price fact only, NOT a quality claim (no comparable "
+                "third-party metric separates the models)")
+    text = "your pick from o: " + alternative_why(alt)
+    if draft_evidence(alt)[0] in ("adverse", "mixed"):
+        text += "; " + draft_evidence_text(alt)
+    return text
+
+
+def _not_drafted_text(alt):
+    kind = draft_evidence(alt)[0]
+    if kind in ("adverse", "mixed"):
+        return "never drafted automatically: tradeoff (see third-party)"
+    if kind == "favours":
+        return "not drafted: several options have favourable third-party metrics — no automatic ranking between them"
+    if "official" in alt["bases"] and "saving" not in alt["bases"]:
+        return "not drafted: its documented advantage comes at a different official price"
+    return "not drafted automatically"
+
+
+def _draft_status(ctx, i, row, d, alt):
+    if is_pinned(ctx["effective"][row["key"]]):
+        return "pinned"
+    pend = " · check /model" if alt is not None and alt["pending"] and d["decision"] != "kept" else ""
+    if d["decision"] == "accepted":
+        text = "ACCEPTED" + pend
+    elif d["decision"] == "open":
+        text = "draft" + pend + (" · revised" if d["flag"] == "revised" else "")
+    elif d["flag"] == "exhausted":
+        text = "kept · no further draft"
+    elif d["values"] is not None:
+        text = "kept · draft not accepted"
+    elif row["alternatives"]:
+        text = "kept · options: o %d" % i
+    elif ctx["global_block"]:
+        text = "kept · blocked"
+    else:
+        text = "kept · no option"
+    return text
+
+
+def _fit_table(headers, rows, wrap_cols, width, indent="  ", cell_style=None):
+    """A column table whose `wrap_cols` cells may wrap onto continuation
+    lines (word-wise, never breaking a word) so it fits `width` visible
+    columns; every other column (e.g. model identities) is never wrapped or
+    cut. Widths are computed on plain text, styles are applied after
+    padding (ANSI-safe). None when even the narrowest wrapped layout (each
+    wrapped column as wide as its longest word or header) does not fit."""
+    import textwrap
+    n = len(headers)
+    natural = [max([len(headers[c])] + [len(r[c]) for r in rows]) for c in range(n)]
+    floor = list(natural)
+    for c in wrap_cols:
+        floor[c] = max([len(headers[c])] + [len(w) for r in rows for w in r[c].split()])
+    sep = 2 * (n - 1) + len(indent)
+    if sum(floor) + sep > width:
+        return None
+    widths = list(floor)
+    spare = width - sep - sum(widths)
+    while spare > 0:
+        need = [(natural[c] - widths[c], -c) for c in wrap_cols if widths[c] < natural[c]]
+        if not need:
+            break
+        widths[-max(need)[1]] += 1
+        spare -= 1
+    out = [indent + sty("bold", "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip()),
+           indent + "  ".join("-" * w for w in widths)]
+    for r, row in enumerate(rows):
+        parts = [textwrap.wrap(cell, width=widths[c], break_long_words=False, break_on_hyphens=False) or [""]
+                 if c in wrap_cols else [cell] for c, cell in enumerate(row)]
+        for k in range(max(len(p) for p in parts)):
+            cells = []
+            for c in range(n):
+                text = parts[c][k] if k < len(parts[c]) else ""
+                name = cell_style(r, c, row[c]) if (cell_style and text) else None
+                pad = " " * (widths[c] - len(text)) if c < n - 1 else ""
+                cells.append(sty(name, text) + pad)
+            out.append((indent + "  ".join(cells)).rstrip())
+    return out
+
+
+def render_draft_table(ctx, rows, draft, by_route, heading):
+    """The compact numbered mapping: EVERY route (stable row numbers), its
+    current values, the drafted values (or keep), the blended price change,
+    the short basis, how many alternatives `o` can show, and the status.
+    A column table on a normal wide terminal (price, basis and status cells
+    wrap onto continuation lines when needed; route keys and model ·
+    effort cells never wrap), else one short block per row."""
+    data, live = [], []
+    for i, (row, d) in enumerate(zip(rows, draft["rows"]), 1):
+        alt = by_route.get(row["key"])
+        shown_alt = alt if (alt is not None and d["decision"] != "kept") else None
+        if shown_alt is None:
+            new, price, basis = "keep", _money(row.get("current_cost")), "-"
+        else:
+            new = _compact_values(shown_alt["values"])
+            price = "%s -> %s (%s)" % (_money(shown_alt["current_cost"]), _money(shown_alt["cost"]),
+                                       _pct_text(shown_alt["cost"], shown_alt["current_cost"]))
+            basis = DRAFT_BASIS_LABELS[d["basis"]]
+        data.append([str(i), row["key"], _compact_values(row["current"]), new, price, basis,
+                     str(len(row["alternatives"])) if row["alternatives"] else "-",
+                     _draft_status(ctx, i, row, d, alt)])
+        live.append(shown_alt is not None)
+    headers = ["#", "Route", "Current", "Draft", "$/1M", "Basis", "Opt", "Status"]
+
+    def status_style(text):
+        if text.startswith("ACCEPTED"):
+            return "boldgreen"
+        if text.startswith("draft"):
+            return "boldyellow" if "check" in text or "revised" in text else "boldcyan"
+        return "dim"
+    out = [""] + _wrap("", heading, indent="", body_style="bold")
+    table = _fit_table(headers, data, (4, 5, 7), term_width(), cell_style=lambda r, c, text: (
+        status_style(text) if c == 7 else ("boldcyan" if c == 3 and live[r] else None)))
+    if table is not None:
+        return out + table
+    for r, cells in enumerate(data):
+        out += _wrap("%s " % cells[0], "%s — %s%s" % (cells[1], cells[7], (" · %s alternative(s)" % cells[6])
+                                                     if cells[6] != "-" else ""),
+                     indent="  ", style="bold", body_style=status_style(cells[7]), hang=4)
+        out += _wrap("now:   ", "%s · $%s/1M" % (cells[2], _money(rows[r].get("current_cost"))), indent="      ",
+                     style="dim", hang=7)
+        if live[r]:
+            out += _wrap("draft: ", "%s · $%s · %s" % (cells[3], cells[4], cells[5]), indent="      ",
+                         style="boldcyan", hang=7)
+    return out
+
+
+def render_draft_notes(ctx, rows, draft, by_route):
+    """One short line per drafted/accepted row: what kind of fact the draft
+    rests on (alignment / benchmark / documented same-price advantage /
+    savings / your pick), price above the long-context threshold, what is
+    still to confirm; plus revised/exhausted rows and uncorrectable drift."""
+    out = []
+    for i, (row, d) in enumerate(zip(rows, draft["rows"]), 1):
+        alt = by_route.get(row["key"])
+        texts = []
+        if alt is not None and d["decision"] != "kept":
+            text = "%s: %s" % (DRAFT_BASIS_LABELS[d["basis"]], draft_basis_text(alt, d["basis"]))
+            if alt["long_route"]:
+                text += "; above the long-context threshold $%s -> $%s (%s)" % (
+                    _money(alt["current_long"]), _money(alt["long_cost"]),
+                    _delta_text(alt["long_cost"], alt["current_long"]))
+            if alt["pending"]:
+                text += "; to confirm after you accept it: %s" % _pending_text(alt)
+            if d["flag"] == "revised":
+                text = "REVISED after your /model answers — " + text
+            texts.append(text)
+        elif d["flag"] == "exhausted":
+            texts.append("no further recommendable candidate (every ranked option was already shown or is excluded) "
+                         "— kept%s" % ("; o %d lists the other options with their tradeoffs" % i
+                                       if row["alternatives"] else ""))
+        if row.get("drift") and not any("alignment" in a["bases"] for a in row["alternatives"]):
+            texts.append("effort/context %s · %s differ from the shipped baseline %s · %s and cannot be corrected "
+                         "right now (d shows why; copilot-model-refresh.py reset --yes returns all managed overrides "
+                         "to the shipped defaults)" % (row["current"]["reasoning_effort"],
+                                                      row["current"]["context_tier"], row["drift"]["effort"],
+                                                      row["drift"]["context"]))
+        for text in texts:
+            out += _wrap("%d " % i, "%s — %s" % (row["key"], _safe_text(text, 700)), indent="  ", style="boldcyan",
+                         hang=4)
+    if out:
+        out = [""] + _wrap("", "Why (short; d shows the full evidence):", indent="", body_style="bold") + out
+    return out
+
+
+def render_draft_legend():
+    return [""] + _wrap("Basis: ", "Alignment = the same model back at the route's shipped effort/context · Benchmark "
+                                   "= the only option fresh third-party metrics at this route's exact reasoning levels "
+                                   "favour (none lower; reference only) · Documented, same price = an official "
+                                   "documented differentiator at identical official rates · Savings (price only) = "
+                                   ">= %d%% lower official price, NOT a quality claim · Your pick = chosen by you with "
+                                   "o. Nothing is called best quality. $/1M = toolkit blended assumption (Default "
+                                   "tier), not your bill; 'long' = long_context tier. Third-party numbers never gate "
+                                   "anything; d shows every source and caution."
+                        % round(MIN_SAVING_FRACTION * 100), indent="", style="bold", body_style="dim")
+
+
+def render_draft_options(ctx, rows, draft, only_row=None):
+    """`o` / `o ROW`: every offered alternative per route (ROW.K), with
+    price, why it is offered, whether/why it is drafted, third-party
+    evidence (tradeoffs labelled; sources with `o ROW`) and what is still to
+    confirm. Read-only; never labelled best quality."""
+    out = [""] + _wrap("Alternatives", " — your explicit choice: o ROW.K drafts one for that row (still only a draft "
+                                       "until you accept it with a and confirm with yes):", indent="", style="bold")
+    listed = False
+    for i, row in enumerate(rows, 1):
+        if only_row is not None and i != only_row:
+            continue
+        if not row["alternatives"]:
+            if only_row is not None:
+                out += _wrap("Row %d " % i, "%s — no alternative: %s" % (row["label"], _safe_text(
+                    row.get("alternatives_note") or row["reason"], 300)), indent="  ", style="boldcyan", hang=4)
+            continue
+        listed = True
+        d = draft["rows"][i - 1]
+        ranking = draft_ranking(ctx, row)
+        out.append("")
+        out += _wrap("Row %d " % i, "%s — current %s · $%s/1M" % (row["label"], _route_text(row["current"]),
+                                                                 _money(row.get("current_cost"))),
+                     indent="  ", style="boldcyan", hang=4)
+        for k, alt in enumerate(row["alternatives"], 1):
+            ranked = [b for a, b in ranking if a is alt]
+            tags = []
+            if d["values"] == alt["values"] and d["decision"] != "kept":
+                tags.append("the row's current draft")
+            tags.append(("draft basis: " + DRAFT_BASIS_LABELS[ranked[0]]) if ranked else _not_drafted_text(alt))
+            if alt["values"] in d["shown"]:
+                tags.append("already shown")
+            price = "$%s/1M (%s)" % (_money(alt["cost"]), _delta_text(alt["cost"], alt["current_cost"]))
+            if alt["long_route"]:
+                price += ", above the long-context threshold $%s (%s)" % (
+                    _money(alt["long_cost"]), _delta_text(alt["long_cost"], alt["current_long"]))
+            out += _wrap("%d.%d " % (i, k), "%s · %s · %s" % (_route_text(alt["values"]), price, "; ".join(tags)),
+                         indent="    ", style="bold", hang=4)
+            ind = "        "
+            out += _wrap("why offered: ", alternative_why(alt), indent=ind, style="bold")
+            if "alignment" not in alt["bases"]:
+                kind = draft_evidence(alt)[0]
+                out += _wrap("third-party: ", draft_evidence_text(alt), indent=ind,
+                             style="boldyellow" if kind in ("adverse", "mixed") else "magenta")
+                if only_row is not None:
+                    out += _bench_lines(alt, row["current"]["reasoning_effort"], {}, ind, 3)
+            if alt["pending"]:
+                out += _wrap("still to confirm: ", "%s — asked only after you accept it" % _pending_text(alt),
+                             indent=ind, style="yellow")
+    if not listed and only_row is None:
+        out += _wrap("", "none — no route has an eligible alternative right now (d shows why).", indent="  ")
+    out += [""] + _wrap("", "The mapping table above is unchanged. o ROW adds the third-party sources for one row.",
+                        indent="", body_style="dim")
+    return out
+
+
+def render_draft_next(phase, proposal_id_hint=True):
+    texts = {
+        "choose": ("a = accept all draft changes · a 1,3 = accept only those rows (other unaccepted drafts are kept) · "
+                   "k 1,3 = keep rows unchanged · r 1,3 = repropose those rows (r alone = again, same rows) · o = "
+                   "alternatives, o ROW = one row with sources, o ROW.K = draft that alternative · d = full details · "
+                   "q or Enter = cancel. Nothing is applied before the final exact yes."),
+        "verify": "confirm the ACCEPTED models below in Copilot CLI's /model picker (only those are asked); nothing is "
+                  "applied before the final exact yes.",
+        "final": "type yes to apply exactly the ACCEPTED rows · e = edit the table · anything else cancels.",
+        "none": "nothing to apply — every route keeps its current model.",
+    }
+    text = texts[phase]
+    if proposal_id_hint and phase in ("choose", "final"):
+        text += (" (Scripted: copilot-model-refresh.py draft --proposal-id ID --do 'a 1,3'"
+                 + (" / apply --proposal-id ID" if phase == "final" else "") + ".)")
+    return [""] + _wrap("Next: ", text, indent="", style="boldcyan")
+
+
+def render_draft_step(ctx, rows, draft, by_route, st, legend=False):
+    """Everything shown after a draft step, by phase: the table, the short
+    why per drafted row, then the /model checks (verify), the effective
+    routing IF you type yes (final) or the kept routing (none)."""
+    phase = st["phase"]
+    heads = {"choose": "Draft mapping — every route (row numbers never change; Opt = alternatives, see o ROW):",
+             "verify": "Accepted mapping — only the ACCEPTED rows are checked next:",
+             "final": "Accepted mapping — ready for your final yes (kept rows do not change):",
+             "none": "Mapping — nothing to apply:"}
+    out = render_draft_table(ctx, rows, draft, by_route, heads[phase])
+    out += render_draft_notes(ctx, rows, draft, by_route)
+    if legend:
+        out += render_draft_legend()
+    if phase == "verify":
+        out += render_review(ctx, rows, st["targets"], st["pending"], "Accepted models to check in Copilot CLI's "
+                                                                      "/model picker:", table=False)
+    elif phase == "final":
+        if not st["route_changes"] and st["sync"]:
+            out += [""] + _wrap("Note: ", "no model change is accepted, but the generated routing files are out of "
+                                          "sync with your pins/overrides; yes re-syncs them.", indent="",
+                                style="boldyellow")
+        out += render_final(st["plan"]["effective"], ctx["defaults"], set(st["route_changes"]),
+                            "Effective routing IF you type yes (only the ACCEPTED rows change; categorical fit and "
+                            "official price facts — not measured or equal quality):")
+    elif phase == "none":
+        out += render_final(ctx["effective"], ctx["defaults"], set(),
+                            "No routing change to apply (no row accepted or none offered) — every route keeps its "
+                            "current model; nothing was changed. Final effective routing (kept):")
+    return out + render_draft_next(phase)
 
 
 def unassessed_and_new(ctx):
@@ -4337,10 +5126,12 @@ def _check_proposal_lifetime_and_seal(paths, doc, now):
 
 
 def _freeze_proposal(ctx, rows, alternatives, selected, new_overrides, plan, route_changes, created_epoch,
-                     expires_epoch):
+                     expires_epoch, draft=None):
     """Seal and write the (single) pending proposal. A review proposal also
     seals your review answers (ctx["review"]); it is applicable only once
-    nothing is pending (re-derived and checked again by apply)."""
+    nothing is pending (re-derived and checked again by apply). A draft
+    proposal also seals the draft table state (validated and re-derived on
+    every later command; `selected` = exactly its accepted rows)."""
     proposal_id = secrets.token_hex(8)
     doc = {
         "schema_version": SCHEMA_VERSION, "kind": PROPOSAL_KIND, "format": PROPOSAL_FORMAT,
@@ -4350,6 +5141,7 @@ def _freeze_proposal(ctx, rows, alternatives, selected, new_overrides, plan, rou
         "snapshot_id": ctx["snapshot"]["snapshot_id"], "evidence_digest": evidence_digest(ctx, rows),
         "alternatives": _frozen_alternatives(alternatives), "selected": sorted(selected),
         "review": review_doc(ctx.get("review")), "policy": ctx.get("policy", DEFAULT_POLICY),
+        "draft": copy.deepcopy(draft),
     }
     doc["seal"] = _proposal_seal(_proposal_key(ctx["paths"], create=True), doc)
     atomic_write_bytes(ctx["paths"].proposal, json_bytes(doc))
@@ -4383,9 +5175,133 @@ def _policy_from_args(args):
     return "cost-led" if getattr(args, "cost_led", False) else DEFAULT_POLICY
 
 
+def _draft_targets(rows, draft, by_route):
+    """(accepted options, review targets) — targets cover ONLY accepted
+    rows, so only those are ever checked with you."""
+    accepted = _accepted_alts(draft, by_route)
+    targets = review_targets(rows, accepted)
+    index = {r["key"]: i for i, r in enumerate(ROUTES, 1)}
+    by_key = {d["route"]: d for d in draft["rows"]}
+    for t in targets:
+        d = by_key.get(t["route"])
+        t["alternative"] = None
+        if d is not None and d["basis"] is not None:
+            t["why"] = "accepted row %d — %s" % (index[t["route"]], DRAFT_BASIS_LABELS[d["basis"]])
+    return accepted, targets
+
+
+def _draft_state(ctx, rows, draft, by_route):
+    """Everything the next draft step depends on, computed without writing:
+    the accepted options, overrides/plan they give, what is still to check,
+    and the displayed phase (choose | verify | final | none)."""
+    accepted, targets = _draft_targets(rows, draft, by_route)
+    new_overrides = derive_overrides(rows, ctx["state"], ctx["defaults"], accepted)
+    plan = plan_outputs(ctx, new_overrides)
+    pending = review_pending(targets)
+    sync = plan["settings_changed"] is not None and _sync_needed(ctx, plan)
+    if draft["phase"] == "choose":
+        phase = "choose"
+    elif has_pending(pending):
+        phase = "verify"
+    elif accepted or sync:
+        phase = "final"
+    else:
+        phase = "none"
+    return {"accepted": accepted, "targets": targets, "overrides": new_overrides, "plan": plan,
+            "pending": pending, "sync": sync, "phase": phase, "route_changes": [t["route"] for t in targets],
+            "proposal_id": None}
+
+
+def _freeze_draft(paths, ctx, rows, alternatives, draft, by_route, created_epoch, expires_epoch):
+    """Seal the draft state as the new pending proposal (new id, the
+    ORIGINAL creation/expiry), or drop the pending proposal when nothing is
+    left to apply (phase none)."""
+    st = _draft_state(ctx, rows, draft, by_route)
+    if st["phase"] == "none":
+        with contextlib.suppress(OSError):
+            os.unlink(paths.proposal)
+        return st
+    problem = preflight(ctx, st["plan"])
+    if problem:
+        with contextlib.suppress(OSError):
+            os.unlink(paths.proposal)
+        raise RefreshError("these changes cannot be applied: %s; nothing was changed" % problem, EXIT_REFUSED)
+    st["proposal_id"] = _freeze_proposal(ctx, rows, alternatives, [a["n"] for a in st["accepted"]],
+                                         st["overrides"], st["plan"], st["route_changes"], created_epoch,
+                                         expires_epoch, draft=draft)
+    return st
+
+
+def _print_draft_lines(st, draft):
+    """Draft machine lines (validated tokens only; never coloured):
+    DRAFT<TAB>phase<TAB>open<TAB>accepted always; in verify/final also the
+    review lines for the ACCEPTED rows (CHECK/LEVEL, REVIEW, SELECTED =
+    accepted count); PROPOSAL<TAB>id unless phase is none. No ALTERNATIVE
+    lines (rows are addressed by table number)."""
+    n_open, n_accepted = _draft_counts(draft)
+    pending = st["pending"]
+    if st["phase"] in ("verify", "final"):
+        for model_id in sorted(pending["check"]):
+            print("CHECK\t%s\t%s" % (model_id, ",".join(pending["check"][model_id])))
+        for model_id in sorted(pending["levels"]):
+            for effort in EFFORTS:
+                if effort in pending["levels"][model_id]:
+                    print("LEVEL\t%s\t%s" % (model_id, effort))
+        print("REVIEW\t%s" % ("pending" if st["phase"] == "verify" else "complete"))
+        print("SELECTED\t%d" % n_accepted)
+    print("DRAFT\t%s\t%d\t%d" % (st["phase"], n_open, n_accepted))
+    if st["proposal_id"]:
+        print("PROPOSAL\t%s" % st["proposal_id"])
+
+
+def _propose_draft(paths, ctx, now, details=False):
+    """`propose --review --draft`: evaluate (balanced, review mode), draft
+    one change per route with draft_ranking(), show the compact table first
+    and freeze the draft (nothing selected). No change at all and nothing to
+    re-sync: the table, the kept routing and DRAFT<TAB>none (no proposal)."""
+    rows = evaluate(ctx)
+    alternatives = number_alternatives(rows)
+    unassessed, new_models, priced = unassessed_and_new(ctx)
+    remember_seen(paths, priced, ctx["snapshot"]["snapshot_id"], now)
+    draft = initial_draft(ctx, rows)
+    if not alternatives:
+        draft["phase"] = "confirm"  # nothing to choose: straight to final (re-sync) or none
+    by_route, problem = draft_alternatives(ctx, rows, draft)
+    if problem:
+        raise RefreshError("internal error: the draft does not match its own evaluation (%s); nothing was changed"
+                           % problem)
+    out = _overview_header(ctx, "Subagent model routing — DRAFT mapping (a proposal only: nothing is selected or "
+                                "applied until you accept rows and then type yes)")
+    if new_models:
+        out += _wrap("New: ", "%d model(s) new in the official pricing since your last refresh: %s (d shows them)"
+                     % (len(new_models), ", ".join(sorted(new_models))), style="bold")
+    st = _draft_state(ctx, rows, draft, by_route)
+    problem = preflight(ctx, st["plan"]) if st["phase"] != "none" else None
+    if problem:
+        with contextlib.suppress(OSError):
+            os.unlink(paths.proposal)
+        st["phase"] = "none"
+        out += render_draft_table(ctx, rows, draft, by_route, "Draft mapping — every route:")
+        out += ["", "These changes cannot be applied: %s." % problem]
+        out += render_final(ctx["effective"], ctx["defaults"], set(), "Final effective routing (kept, nothing "
+                                                                     "changed):")
+        print("\n".join(out))
+        return EXIT_REFUSED
+    st = _freeze_draft(paths, ctx, rows, alternatives, draft, by_route, now, now + PROPOSAL_TTL_SECONDS)
+    out += render_draft_step(ctx, rows, draft, by_route, st, legend=bool(alternatives))
+    if details:
+        out += render_proposal(ctx, rows, unassessed, new_models)
+    print("\n".join(out))
+    _print_draft_lines(st, draft)
+    return EXIT_OK if (_draft_counts(draft)[0] or st["phase"] == "final") else EXIT_NO_CHANGES
+
+
 def cmd_preview(paths, args, now, freeze=False):
     review_mode = freeze and getattr(args, "review", False)
     details = getattr(args, "details", False)
+    draft_mode = freeze and getattr(args, "draft", False)
+    if draft_mode and (not review_mode or _policy_from_args(args) != "balanced"):
+        raise RefreshError("--draft needs --review and the balanced policy (not --cost-led); nothing was changed")
     with refresh_lock(paths):
         note = recover_journal(paths)
         if note:
@@ -4400,6 +5316,8 @@ def cmd_preview(paths, args, now, freeze=False):
             print("Error: no valid official pricing snapshot is available; routing was left unchanged.",
                   file=sys.stderr)
             return EXIT_ERROR
+        if draft_mode:
+            return _propose_draft(paths, ctx, now, details)
         rows, new_overrides, plan, lines, priced, alternatives = _evaluate_and_render(
             ctx, details=details, review_mode=review_mode, freeze=freeze)
         print("\n".join(lines))
@@ -4499,6 +5417,10 @@ def _load_proposal(paths, proposal_id, now):
     validate_review(doc["review"])
     if doc.get("policy") not in POLICIES:
         raise RefreshError("malformed proposal (policy)", EXIT_REFUSED)
+    if "draft" not in doc:
+        raise RefreshError("malformed proposal (draft)", EXIT_REFUSED)
+    if validate_draft(doc["draft"]) is not None and (doc["review"] is None or doc["policy"] != "balanced"):
+        raise RefreshError("malformed proposal (a draft needs review mode and the balanced policy)", EXIT_REFUSED)
     return doc
 
 
@@ -4557,6 +5479,10 @@ def cmd_select(paths, args, now):
         if note:
             print("Note: %s." % note)
         doc = _load_proposal(paths, args.proposal_id, now)
+        if doc["draft"] is not None:
+            raise RefreshError("proposal %s is a draft mapping: change it with `draft --proposal-id ID --do ...` "
+                               "(select is for plain proposals); nothing was selected" % doc["proposal_id"],
+                               EXIT_REFUSED)
         ctx = build_context(paths, now, refresh=None)
         rows, alternatives = _verify_proposal_evidence(paths, doc, ctx)
         by_n = {a["n"]: a for a in alternatives}
@@ -4656,6 +5582,12 @@ def cmd_review(paths, args, now):
         rows, alternatives = _verify_proposal_evidence(paths, doc, ctx)
         by_n = {a["n"]: a for a in alternatives}
         selected = [by_n[n] for n in doc["selected"]]
+        draft = validate_draft(doc["draft"])
+        if draft is not None:
+            _check_draft(paths, ctx, rows, draft, doc["selected"])
+            if draft["phase"] != "confirm":
+                raise RefreshError("the draft table of proposal %s is not accepted yet (accept rows with draft --do a "
+                                   "first); nothing was changed" % doc["proposal_id"], EXIT_REFUSED)
         pending = review_pending(review_targets(rows, selected))
         if not has_pending(pending):
             raise RefreshError("nothing in proposal %s is waiting for your answer; nothing was changed"
@@ -4695,6 +5627,8 @@ def cmd_review(paths, args, now):
         ctx["review"] = new_review
         rows = evaluate(ctx)
         alternatives = number_alternatives(rows)
+        if draft is not None:
+            return _review_draft(paths, ctx, doc, draft, rows, alternatives, new_review["round"])
         # Selections are carried only by identity (same route and exact
         # values) into the renumbered table; anything no longer offered is
         # dropped. Old option numbers are never reused.
@@ -4759,6 +5693,84 @@ def cmd_review(paths, args, now):
     return EXIT_OK
 
 
+def _review_draft(paths, ctx, doc, draft, rows, alternatives, review_round):
+    """Draft branch of `review`, after your answers were folded into the
+    re-evaluation: only rows whose drafted/accepted identity is no longer
+    possible are re-drafted (and must be accepted again — back to the
+    table); every other row, and every accepted identity, is preserved."""
+    new, revised = reconcile_draft(ctx, rows, draft)
+    new["step"] = draft["step"] + 1
+    if new["step"] > MAX_DRAFT_STEPS:
+        with contextlib.suppress(OSError):
+            os.unlink(paths.proposal)
+        raise RefreshError("refused: more than %d draft steps; nothing was applied — run p again" % MAX_DRAFT_STEPS,
+                           EXIT_REFUSED)
+    new = validate_draft(new)
+    by_route = _check_draft(paths, ctx, rows, new, None)
+    st = _freeze_draft(paths, ctx, rows, alternatives, new, by_route, doc["created_epoch"], doc["expires_epoch"])
+    out = ["", "Review round %d — your answers are used for this copilot-s p run only (never saved). Recomputed "
+               "from the same frozen prices and official evidence (nothing re-fetched)." % review_round]
+    if revised:
+        out += _wrap("Revised: ", "row(s) %s — the accepted or drafted model is no longer possible after your "
+                                  "answers, so each was re-drafted with the next ranked candidate not shown before "
+                                  "(or kept when none is left) and must be accepted again; every other row is "
+                                  "unchanged." % ", ".join(str(i) for i in revised), indent="", style="boldyellow")
+    out += render_draft_step(ctx, rows, new, by_route, st)
+    print("\n".join(out))
+    _print_draft_lines(st, new)
+    return EXIT_NO_CHANGES if st["phase"] == "none" else EXIT_OK
+
+
+def cmd_draft(paths, args, now):
+    """One command on the draft table (a | a ROWS | k ROWS | r | r ROWS | o |
+    o ROW | o ROW.K | e). Cache-only: re-derives and re-validates the sealed
+    draft first; a change writes a NEW sealed proposal (new id, same
+    expiry) — never any routing file. A command that is not valid now
+    changes nothing (exit 5, same proposal and machine lines again)."""
+    with refresh_lock(paths):
+        note = recover_journal(paths)
+        if note:
+            print("Note: %s." % note)
+        doc = _load_proposal(paths, args.proposal_id, now)
+        if doc["draft"] is None:
+            raise RefreshError("proposal %s is not a draft mapping (made without --draft); nothing was changed"
+                               % doc["proposal_id"], EXIT_REFUSED)
+        ctx = build_context(paths, now, refresh=None)
+        rows, alternatives = _verify_proposal_evidence(paths, doc, ctx)
+        draft = validate_draft(doc["draft"])
+        by_route = _check_draft(paths, ctx, rows, draft, doc["selected"])
+        try:
+            verb, row_list, option = parse_draft_command(args.do)
+            new, msgs = apply_draft_command(ctx, rows, draft, verb, row_list, option)
+        except DraftInputError as ex:
+            st = _draft_state(ctx, rows, draft, by_route)
+            st["proposal_id"] = doc["proposal_id"]
+            print("\n".join(_wrap("Not accepted: ", "%s — nothing changed; the table above still applies."
+                                  % _safe_text(str(ex), 240), indent="", style="boldyellow")))
+            _print_draft_lines(st, draft)
+            return EXIT_INPUT
+        if new is None:
+            # Read-only listing (o / o ROW): same proposal, same lines.
+            st = _draft_state(ctx, rows, draft, by_route)
+            st["proposal_id"] = doc["proposal_id"]
+            print("\n".join(msgs))
+            _print_draft_lines(st, draft)
+            return EXIT_OK
+        new["step"] = draft["step"] + 1
+        if new["step"] > MAX_DRAFT_STEPS:
+            with contextlib.suppress(OSError):
+                os.unlink(paths.proposal)
+            raise RefreshError("refused: more than %d draft steps; nothing was applied — run p again"
+                               % MAX_DRAFT_STEPS, EXIT_REFUSED)
+        new = validate_draft(new)
+        new_by_route = _check_draft(paths, ctx, rows, new, None)
+        st = _freeze_draft(paths, ctx, rows, alternatives, new, new_by_route, doc["created_epoch"],
+                           doc["expires_epoch"])
+        print("\n".join(msgs + render_draft_step(ctx, rows, new, new_by_route, st)))
+        _print_draft_lines(st, new)
+        return EXIT_NO_CHANGES if st["phase"] == "none" else EXIT_OK
+
+
 def cmd_apply(paths, args, now):
     with refresh_lock(paths):
         note = recover_journal(paths)
@@ -4775,6 +5787,18 @@ def cmd_apply(paths, args, now):
         rows, alternatives = _verify_proposal_evidence(paths, doc, ctx)
         by_n = {a["n"]: a for a in alternatives}
         selected = [by_n[n] for n in doc["selected"]]
+        draft = validate_draft(doc["draft"])
+        if draft is not None:
+            # A draft is a proposal only: just a table whose rows were
+            # accepted (no unaccepted draft row left) can be applied, and
+            # the sealed selection must be exactly those accepted rows.
+            _check_draft(paths, ctx, rows, draft, doc["selected"])
+            if draft["phase"] != "confirm" or _draft_counts(draft)[0]:
+                with contextlib.suppress(OSError):
+                    os.unlink(paths.proposal)
+                raise RefreshError("refused: the draft table has not been accepted (draft rows are proposals only — "
+                                   "accept rows, answer the checks, then apply); nothing was applied — run p again",
+                                   EXIT_REFUSED)
         if has_pending(review_pending(review_targets(rows, selected))):
             # A tentative review proposal is never directly applicable.
             with contextlib.suppress(OSError):
@@ -4798,9 +5822,14 @@ def cmd_apply(paths, args, now):
             os.unlink(paths.proposal)
     changed = set(doc.get("route_changes", [])) | set(changed_keys)
     out = ["Applied. Backups of replaced files: %s" % paths.backups]
+    index = {r["key"]: i for i, r in enumerate(ROUTES, 1)}
     for alt in selected:
-        out.append("Included your selected option #%d: %s -> %s." % (
-            alt["n"], alt["route"], _route_text(alt["values"])))
+        if draft is not None:
+            out.append("Included your accepted row %d: %s -> %s." % (
+                index[alt["route"]], alt["route"], _route_text(alt["values"])))
+        else:
+            out.append("Included your selected option #%d: %s -> %s." % (
+                alt["n"], alt["route"], _route_text(alt["values"])))
     if any(k in new_overrides for k in AGENT_NAMES) or plan["settings_changed"]:
         out.append("Native /subagents settings updated for agent default routes (values you set yourself were left "
                    "untouched).")
@@ -4887,6 +5916,7 @@ def _peek_proposal(paths, proposal_id, now):
         return None, "the proposal has no valid policy"
     try:
         validate_review(doc.get("review"))
+        validate_draft(doc.get("draft"))
     except RefreshError as ex:
         return None, _safe_text(ex, 120)
     return doc, None
@@ -4929,7 +5959,7 @@ def cmd_details(paths, args, now):
             "%s — its inputs or evidence changed since it was shown, so numbers below may differ and the proposal "
             "will be refused at select/apply (run p again)." % doc["proposal_id"]),
             style="bold" if same else "boldyellow")
-        if doc.get("selected"):
+        if doc.get("selected") and doc.get("draft") is None:
             out += _wrap("Selected so far: ", ", ".join("#%d" % n for n in doc["selected"]), style="bold")
     unassessed, new_models, _priced = unassessed_and_new(ctx)
     out += render_proposal(ctx, rows, unassessed, new_models)
@@ -4937,6 +5967,19 @@ def cmd_details(paths, args, now):
         out += render_action_required(ctx, rows)
     out += ["", sty("bold", "===== Recap (same options as above) =====")]
     out += render_overview(ctx, rows, recap=True)
+    if doc is not None and doc.get("draft") is not None:
+        draft = validate_draft(doc["draft"])
+        by_route, problem = draft_alternatives(ctx, rows, draft)
+        if problem is None:
+            out += render_draft_table(ctx, rows, draft, by_route, "Draft mapping of proposal %s (read-only; the "
+                                                                  "draft ranking per row is: alignment, the only "
+                                                                  "benchmark-favoured option, documented advantage "
+                                                                  "at the same price, then savings):"
+                                      % doc["proposal_id"])
+            out += render_draft_notes(ctx, rows, draft, by_route)
+            out += render_draft_legend()
+        else:
+            out += _wrap("Note: ", "the draft table cannot be shown: %s" % problem, style="boldyellow")
     print("\n".join(out))
     return EXIT_OK
 
@@ -5092,7 +6135,20 @@ def main(argv=None, now=None):
                            help="Review mode (copilot-s p): also propose candidates pending only your /model "
                                 "availability or exact reasoning-level answer; such a TENTATIVE proposal cannot be "
                                 "applied until `review` has recorded every answer; prints CHECK/LEVEL/REVIEW lines")
+            p.add_argument("--draft", action="store_true",
+                           help="With --review (balanced only; copilot-s p): show a compact numbered DRAFT mapping "
+                                "of every route (at most one ranked change each, none selected) and freeze it; change "
+                                "it with `draft --do`; prints DRAFT<TAB>phase<TAB>open<TAB>accepted")
         p.set_defaults(func=(lambda f: (lambda pa, a, n: cmd_preview(pa, a, n, freeze=f)))(freeze))
+    p = sub.add_parser("draft", help="One command on a draft mapping: a | a ROWS | k ROWS | r | r ROWS | o | o ROW | "
+                                     "o ROW.K | e (cache only; writes a NEW sealed proposal, never routing files; "
+                                     "exit 5 = command not accepted, nothing changed)")
+    p.add_argument("--proposal-id", required=True)
+    p.add_argument("--do", required=True, metavar="COMMAND",
+                   help="a = accept all draft changes; a 1,3 = accept only those rows (other unaccepted drafts are "
+                        "kept); k 1,3 = keep rows; r 1,3 = repropose rows (r = same rows again); o / o ROW = list "
+                        "alternatives; o ROW.K = draft that alternative; e = edit an accepted table again")
+    p.set_defaults(func=cmd_draft)
     p = sub.add_parser("review", help="Answer a review proposal's pending questions (session-only answers sealed in "
                                       "a NEW proposal; never saved elsewhere; no routing writes)")
     p.add_argument("--proposal-id", required=True)

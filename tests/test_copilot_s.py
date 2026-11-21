@@ -2048,7 +2048,7 @@ class TestRTKAutomaticPublication(BaseHomeTestCase):
 
 
 class TestModelRefreshMenu(BaseHomeTestCase):
-    """Strict PTY scripts: no implicit Enter, no real helper/network/CLI."""
+    """Explicit legacy cost-led PTY scripts; balanced drafts covered below."""
 
     setUp = TestContextMetricsSessionManager.setUp
     CONTEXT_SUMMARY = TestContextMetricsSessionManager.CONTEXT_SUMMARY
@@ -2064,6 +2064,8 @@ class TestModelRefreshMenu(BaseHomeTestCase):
     AVAILABLE = "Are all these proposed models available in /model? [y/N]:"
     UNAVAILABLE = "Enter cancels):"
     REVIEW_ID = "1111111111111111"
+    LEGACY_PROPOSE = ["propose", "--review", "--cost-led"]
+    REFRESH_POLICY = "cost-led"
 
     def _refresh_env(self, extra=None):
         helper = os.path.join(self.home, "fake-refresh.py")
@@ -2078,9 +2080,9 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 "def real_helper():\n"
                 " os.environ['COPILOT_TASK_REPORT_HELPER']=os.environ['REAL_REPORT_HELPER']\n"
                 " runpy.run_path(os.environ['REAL_REFRESH_HELPER'],run_name='__main__')\n"
-                "if args[0] in ('propose','review','select') and os.environ.get('REFRESH_STEPS'):\n"
+                "if args[0] in ('propose','review','select','draft') and os.environ.get('REFRESH_STEPS'):\n"
                 " with open(os.environ['REFRESH_LOG']) as f: calls=[json.loads(line) for line in f]\n"
-                " index=sum(c[0] in ('propose','review','select') for c in calls)-1\n"
+                " index=sum(c[0] in ('propose','review','select','draft') for c in calls)-1\n"
                 " steps=json.loads(os.environ['REFRESH_STEPS'])\n"
                 " if index>=len(steps): print('unexpected extra review command'); sys.exit(9)\n"
                 " step=steps[index]\n"
@@ -2125,6 +2127,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
             )
         additions = {
             "COPILOT_MODEL_REFRESH_HELPER": helper, "REFRESH_LOG": self.refresh_log,
+            "COPILOT_MODEL_REFRESH_POLICY": self.REFRESH_POLICY,
             "REAL_REFRESH_HELPER": os.path.join(REPO_ROOT, "bin", "copilot-model-refresh.py"),
             "REAL_REPORT_HELPER": TASK_HELPER,
         }
@@ -2267,7 +2270,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         ])
         self.assertEqual(status, 0, out)
         self.assertEqual(self._calls(), [
-            ["propose", "--review"], ["apply", "--proposal-id", self.PROPOSAL_ID]])
+            self.LEGACY_PROPOSE, ["apply", "--proposal-id", self.PROPOSAL_ID]])
         self.assertIn("Final effective routing", out)
         self.assertNotIn("PROPOSAL\t", out, "machine marker must not leak into display")
         self.assertNotIn("Session name (Enter for automatic):", out)
@@ -2296,7 +2299,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 ])
                 self.assertEqual(status, 0, out)
                 self.assertEqual(self._calls(), [
-                    ["propose", "--review"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+                    self.LEGACY_PROPOSE, ["discard", "--proposal-id", self.PROPOSAL_ID]])
                 self.assertIn("Cancelled", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
 
@@ -2313,7 +2316,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                     (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
                 ])
                 self.assertEqual(status, 0, out)
-                self.assertEqual(self._calls(), [["propose", "--review"]] + ([] if rc == 3 else [["status"]]))
+                self.assertEqual(self._calls(), [self.LEGACY_PROPOSE] + ([] if rc == 3 else [["status"]]))
                 self.assertNotIn("Type 'yes'", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
 
@@ -2345,7 +2348,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                     (self.EMPTY_PROMPT, "q\n"),
                 ])
                 self.assertEqual(status, 0, out)
-                self.assertEqual(self._calls(), [["propose", "--review"], ["status"]])
+                self.assertEqual(self._calls(), [self.LEGACY_PROPOSE, ["status"]])
                 self._assert_final_ten_route_table(out)
                 self.assertNotIn("Type 'yes'", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
@@ -2421,7 +2424,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 ])
                 self.assertEqual(status, 0, out)
                 self.assertEqual(self._calls(), [
-                    ["propose", "--review"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
+                    self.LEGACY_PROPOSE, ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
                     [command, "--proposal-id", selected_id]])
                 self.assertIn("+$2.00/1M, +20%", out)
                 self.assertNotIn("PROPOSAL\t", out)
@@ -2440,7 +2443,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 ])
                 self.assertEqual(status, 0, out)
                 self.assertEqual(self._calls(), [
-                    ["propose", "--review"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+                    self.LEGACY_PROPOSE, ["discard", "--proposal-id", self.PROPOSAL_ID]])
                 self.assertNotIn("Type 'yes' to apply", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
 
@@ -2456,7 +2459,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 ])
                 self.assertEqual(status, 0, out)
                 self.assertEqual(self._calls(), [
-                    ["propose", "--review"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1,2"],
+                    self.LEGACY_PROPOSE, ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1,2"],
                     ["discard", "--proposal-id", self.PROPOSAL_ID], ["status"]])
                 self.assertNotIn("Type 'yes' to apply", out)
                 self.assertFalse(os.path.exists(self.copilot_log))
@@ -2473,7 +2476,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         def checked_before_final_yes():
             self.assertEqual(self._routing_snapshot(), before)
             self.assertEqual(self._calls(), [
-                ["propose", "--review"],
+                self.LEGACY_PROPOSE,
                 ["review", "--proposal-id", self.PROPOSAL_ID, "--available-all"]])
             return "yes\n"
 
@@ -2515,7 +2518,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         self.assertEqual(out.count("Not among the proposed models listed above:"), 2)
         self.assertEqual(out.count("MAPPING TABLE:"), 3)
         self.assertEqual(self._calls(), [
-            ["propose", "--review"],
+            self.LEGACY_PROPOSE,
             ["review", "--proposal-id", self.PROPOSAL_ID, "--unavailable", "fixture-cheap"],
             ["review", "--proposal-id", self.REVIEW_ID, "--available-all"],
             ["discard", "--proposal-id", "2222222222222222"]])
@@ -2535,7 +2538,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 status, out = self._scripted_tty(env, actions)
                 self.assertEqual(status, 0, out)
                 self.assertEqual(self._calls(), [
-                    ["propose", "--review"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+                    self.LEGACY_PROPOSE, ["discard", "--proposal-id", self.PROPOSAL_ID]])
                 self.assertNotIn("Type 'yes'", out)
                 self.assertEqual(self._routing_snapshot(), before)
 
@@ -2556,7 +2559,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 actions += [(self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n")]
                 status, out = self._scripted_tty(env, actions)
                 self.assertEqual(status, 0, out)
-                calls = [["propose", "--review"]]
+                calls = [self.LEGACY_PROPOSE]
                 if level_answer is not None:
                     calls += [["review", "--proposal-id", self.PROPOSAL_ID,
                                "--level", "fixture-cheap:xhigh=" + level_answer]]
@@ -2581,7 +2584,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         ])
         self.assertEqual(status, 0, out)
         self.assertEqual(self._calls(), [
-            ["propose", "--review"],
+            self.LEGACY_PROPOSE,
             ["review", "--proposal-id", self.PROPOSAL_ID, "--unavailable", "fixture-cheap"]])
         self.assertNotIn("Does /model offer reasoning level", out)
         self.assertNotIn("Type 'yes'", out)
@@ -2601,7 +2604,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         ])
         self.assertEqual(status, 0, out)
         self.assertEqual(self._calls(), [
-            ["propose", "--review"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
+            self.LEGACY_PROPOSE, ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
             ["review", "--proposal-id", self.REVIEW_ID, "--available-all"],
             ["apply", "--proposal-id", "2222222222222222"]])
         self.assertIn("YOU selected", out)
@@ -2670,7 +2673,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                     env, actions, forbidden=(self.AVAILABLE, "Does /model offer reasoning level", self.CONFIRM))
                 self.assertEqual(status, 0, out)
                 self.assertIn("malformed review output", out)
-                expected = [["propose", "--review"]]
+                expected = [self.LEGACY_PROPOSE]
                 if recompute:
                     expected += [["review", "--proposal-id", self.PROPOSAL_ID, "--available-all"]]
                 expected += [["discard", "--proposal-id", current_id], ["status"]]
@@ -2686,7 +2689,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         ])
         self.assertEqual(status, 0, out)
         self.assertEqual(self._calls(), [
-            ["propose", "--review"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+            self.LEGACY_PROPOSE, ["discard", "--proposal-id", self.PROPOSAL_ID]])
         self.assertNotIn("(Enter skips):", out)
         self.assertNotIn("VERIFY\t", out)
         self.assertEqual(self._routing_snapshot(), before)
@@ -2711,7 +2714,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
 
 
 class TestBalancedRefreshMenuDetails(BaseHomeTestCase):
-    """New menu behavior, sharing fixtures only (not duplicating old tests)."""
+    """Preserved explicit option/details path under the legacy cost-led policy."""
 
     def test_details_d_and_D_keep_proposal_then_selection_and_exact_yes(self):
         env = self._refresh_env({"REFRESH_ALTS": "1", "REFRESH_RC": "3"})
@@ -2724,7 +2727,7 @@ class TestBalancedRefreshMenuDetails(BaseHomeTestCase):
         ])
         self.assertEqual(status, 0, out)
         self.assertEqual(self._calls(), [
-            ["propose", "--review"],
+            self.LEGACY_PROPOSE,
             ["details", "--proposal-id", self.PROPOSAL_ID],
             ["details", "--proposal-id", self.PROPOSAL_ID],
             ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
@@ -2764,7 +2767,7 @@ class TestBalancedRefreshMenuDetails(BaseHomeTestCase):
         self.assertEqual(status, 0, out)
         self.assertLess(out.index(self.OPTIONS), out.index(self.AVAILABLE))
         self.assertEqual(self._calls(), [
-            ["propose", "--review"],
+            self.LEGACY_PROPOSE,
             ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
             ["review", "--proposal-id", second, "--available-all",
              "--level", "gpt-6.2-sol:xhigh=yes"],
@@ -2790,7 +2793,7 @@ class TestBalancedRefreshMenuDetails(BaseHomeTestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("renumbered", out)
         self.assertEqual(self._calls(), [
-            ["propose", "--review"],
+            self.LEGACY_PROPOSE,
             ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
             ["review", "--proposal-id", second, "--unavailable", "gpt-6.2-sol"],
             ["select", "--proposal-id", third, "--choose", "2"],
@@ -2954,6 +2957,214 @@ for _name in tuple(vars(TestModelRefreshMenu)):
     if not _name.startswith("test_") and _name not in ("__dict__", "__weakref__", "__module__", "__doc__"):
         if _name not in vars(TestBalancedRefreshMenuDetails):
             setattr(TestBalancedRefreshMenuDetails, _name, getattr(TestModelRefreshMenu, _name))
+
+
+class TestDraftRefreshMenu(BaseHomeTestCase):
+    """Balanced p state machine, strict PTY and fail-closed protocol checks."""
+
+    REFRESH_POLICY = "balanced"
+    TABLE = "q/Enter = cancel:"
+    FINAL = "anything else cancels:"
+    DRAFT_PROPOSE = ["propose", "--review", "--draft"]
+
+    def reply(self, phase="choose", opened=10, accepted=0, proposal_id="0123456789abcdef",
+              checks=(), levels=(), rc=0, extra=()):
+        lines = ["DRAFT MAPPING: # Route | Current | Draft | Basis | Status",
+                 "1 discovery | old-fixture | new-fixture | Savings (price only) | draft"]
+        lines += ["CHECK\t%s\ttester" % m for m in checks]
+        lines += ["LEVEL\t%s\t%s" % p for p in levels]
+        if phase in ("verify", "final"):
+            lines += ["REVIEW\t" + ("pending" if phase == "verify" else "complete"),
+                      "SELECTED\t%d" % accepted]
+        lines += ["DRAFT\t%s\t%d\t%d" % (phase, opened, accepted)]
+        if proposal_id:
+            lines += ["PROPOSAL\t" + proposal_id]
+        lines += list(extra)
+        return {"lines": lines, "rc": rc}
+
+    def test_default_table_before_acceptance_then_checks_then_exact_yes(self):
+        second, third = "2222222222222222", "3333333333333333"
+        env = self._review_env([
+            self.reply(), self.reply("verify", 0, 10, second, ("new-fixture",)),
+            self.reply("final", 0, 10, third),
+        ])
+        env.pop("COPILOT_MODEL_REFRESH_POLICY")
+        before = self._routing_snapshot()
+
+        def no_early_apply():
+            self.assertEqual(self._routing_snapshot(), before)
+            self.assertFalse(any(c[0] == "apply" for c in self._calls()))
+            return "yes\n"
+
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.TABLE, "a\n"), (self.AVAILABLE, "y\n"),
+            (self.FINAL, no_early_apply), (self.PAUSE, self._assert_no_launch_at_pause),
+            (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertLess(out.index("# Route | Current | Draft"), out.index(self.TABLE))
+        self.assertLess(out.index(self.TABLE), out.index(self.AVAILABLE))
+        self.assertLess(out.index(self.AVAILABLE), out.index(self.FINAL))
+        self.assertEqual(self._calls(), [
+            self.DRAFT_PROPOSE, ["draft", "--proposal-id", self.PROPOSAL_ID, "--do", "a"],
+            ["review", "--proposal-id", second, "--available-all"],
+            ["apply", "--proposal-id", third],
+        ])
+        for marker in ("DRAFT\t", "CHECK\t", "REVIEW\t", "SELECTED\t", "PROPOSAL\t"):
+            self.assertNotIn(marker, out)
+
+    def test_partial_accept_final_edit_keep_subset_and_reaccept(self):
+        ids = ["%016x" % i for i in range(2, 6)]
+        env = self._review_env([
+            self.reply(), self.reply("final", 0, 2, ids[0]),
+            self.reply("choose", 0, 2, ids[1]), self.reply("choose", 0, 1, ids[2]),
+            self.reply("final", 0, 1, ids[3]),
+        ])
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.TABLE, "a 1,3\n"), (self.FINAL, "e\n"),
+            (self.TABLE, "k 1\n"), (self.TABLE, "a\n"), (self.FINAL, "yes\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual([c[-1] for c in self._calls() if c[0] == "draft"], ["a 1,3", "e", "k 1", "a"])
+        self.assertEqual(self._calls()[-1], ["apply", "--proposal-id", ids[3]])
+        self.assertEqual(sum(c[0] == "propose" for c in self._calls()), 1)
+
+    def test_reproposal_repeat_new_subset_inspection_invalid_command_and_cached_details(self):
+        ids = ["%016x" % i for i in range(2, 7)]
+        steps = [self.reply()] + [self.reply(proposal_id=i) for i in ids]
+        env = self._review_env(steps)
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.TABLE, "d\n"), (self.TABLE, "r 1,3\n"),
+            (self.TABLE, "r\n"), (self.TABLE, "r 2\n"), (self.TABLE, "o 2\n"),
+            (self.TABLE, "o 2.1\n"), (self.TABLE, "not-a-command\n"), (self.TABLE, "q\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual([c[-1] for c in self._calls() if c[0] == "draft"],
+                         ["r 1,3", "r", "r 2", "o 2", "o 2.1"])
+        self.assertEqual(self._calls()[1], ["details", "--proposal-id", self.PROPOSAL_ID])
+        self.assertEqual(self._calls()[-1], ["discard", "--proposal-id", ids[-1]])
+        self.assertIn("Not a table command", out)
+        self.assertFalse(any(c[0] in ("apply", "select", "record-verified") for c in self._calls()))
+
+    def test_rejected_shared_model_skips_level_then_returns_to_reaccept_replacement(self):
+        ids = ["%016x" % i for i in range(2, 6)]
+        env = self._review_env([
+            self.reply(), self.reply("verify", 0, 10, ids[0], ("new-fixture",),
+                                    (("new-fixture", "high"),)),
+            self.reply("choose", 2, 8, ids[1]),
+            self.reply("verify", 0, 10, ids[2], ("replacement-fixture",)),
+            self.reply("final", 0, 10, ids[3]),
+        ])
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.TABLE, "a\n"), (self.AVAILABLE, "n\n"),
+            (self.UNAVAILABLE, "new-fixture\n"), (self.TABLE, "a 1,3\n"),
+            (self.AVAILABLE, "y\n"), (self.FINAL, "yes\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertNotIn("Does /model offer reasoning level 'high'", out)
+        self.assertEqual(self._calls()[2], ["review", "--proposal-id", ids[0], "--unavailable", "new-fixture"])
+        self.assertEqual(self._calls()[3], ["draft", "--proposal-id", ids[1], "--do", "a 1,3"])
+        self.assertEqual(self._calls()[-1], ["apply", "--proposal-id", ids[3]])
+
+    def test_choose_cancel_enter_eof_and_final_nonexact_yes_never_apply(self):
+        for phase, answer in (("choose", "\n"), ("choose", "q\n"), ("choose", "\x04"),
+                              ("final", "\n"), ("final", "\x04"), ("final", "y\n"),
+                              ("final", "YES\n"), ("final", " yes\n"), ("final", "yes \n")):
+            with self.subTest(phase=phase, answer=repr(answer)):
+                env = self._review_env([self.reply(phase, 10 if phase == "choose" else 0,
+                                                   0 if phase == "choose" else 1)])
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), (self.TABLE if phase == "choose" else self.FINAL, answer),
+                    (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [
+                    self.DRAFT_PROPOSE, ["discard", "--proposal-id", self.PROPOSAL_ID]])
+
+    def protocol(self, lines):
+        env = self._review_env([{"lines": lines}])
+        result = run(["bash", "-c",
+                      'source "$1"; run_model_refresh_helper propose; printf "PROTOCOL=%s\\n" "$MR_PROTOCOL_OK"',
+                      "_", self.sourceable()], env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_valid_draft_protocol_phases_including_zero_change_sync_final(self):
+        for step in (self.reply(), self.reply("choose", 0, 0),
+                     self.reply("choose", 1, 9), self.reply("choose", 0, 10),
+                     self.reply("verify", 0, 1, checks=("new-fixture",)),
+                     self.reply("verify", 0, 10, checks=("new-fixture",)),
+                     self.reply("final", 0, 1), self.reply("final", 0, 0),
+                     self.reply("final", 0, 10),
+                     self.reply("none", 0, 0, None, rc=3)):
+            with self.subTest(lines=step["lines"]):
+                self.assertIn("PROTOCOL=true", self.protocol(step["lines"]))
+
+    def test_malformed_draft_protocol_is_rejected(self):
+        base = self.reply()["lines"]
+        cases = [
+            ["DRAFT\tchoose\t10\t0", "DRAFT\tchoose\t10\t0", "PROPOSAL\t" + self.PROPOSAL_ID],
+            ["DRAFT\tunknown\t0\t0", "PROPOSAL\t" + self.PROPOSAL_ID],
+            ["DRAFT\tchoose\t0", "PROPOSAL\t" + self.PROPOSAL_ID],
+            ["DRAFT\tchoose\t-1\t0", "PROPOSAL\t" + self.PROPOSAL_ID],
+            ["DRAFT\tchoose\t1\t0\textra", "PROPOSAL\t" + self.PROPOSAL_ID],
+            self.reply(extra=("REVIEW\tcomplete", "SELECTED\t0"))["lines"],
+            self.reply(extra=("VERIFY\tneeded",))["lines"],
+            self.reply(extra=("ALTERNATIVE\t1\ttester\tnew-fixture",))["lines"],
+            self.reply("verify", 1, 1, checks=("new-fixture",))["lines"],
+            self.reply("verify", 0, 1)["lines"],
+            self.reply("final", 0, 1, checks=("new-fixture",))["lines"],
+            self.reply("none", 0, 0)["lines"],
+            self.reply("none", 1, 0, None)["lines"],
+            self.reply("none", 0, 0, None, extra=("REVIEW\tcomplete", "SELECTED\t0"))["lines"],
+            self.reply("verify", 0, 1, None, checks=("new-fixture",))["lines"],
+            [line.replace("SELECTED\t1", "SELECTED\t0")
+             for line in self.reply("verify", 0, 1, checks=("new-fixture",))["lines"]],
+            [line.replace("SELECTED\t1", "SELECTED\t0")
+             for line in self.reply("final", 0, 1)["lines"]],
+            [line for line in self.reply("final", 0, 1)["lines"]
+             if not line.startswith(("REVIEW\t", "SELECTED\t"))],
+            [line for line in base if not line.startswith("PROPOSAL\t")],
+        ]
+        for lines in cases:
+            with self.subTest(lines=lines):
+                self.assertIn("PROTOCOL=false", self.protocol(lines))
+
+    def test_impossible_open_accepted_counts_fail_closed(self):
+        cases = [
+            self.reply("choose", 11, 0), self.reply("choose", 1, 10),
+            self.reply("choose", 0, 11), self.reply("none", 0, 1, None),
+            self.reply("verify", 0, 0, checks=("new-fixture",)),
+            self.reply("final", 0, 11),
+        ]
+        for step in cases:
+            with self.subTest(lines=step["lines"]):
+                self.assertIn("PROTOCOL=false", self.protocol(step["lines"]))
+
+    def test_bad_protocol_or_unsafe_id_on_recompute_never_asks_or_applies(self):
+        for bad in (self.reply(extra=("VERIFY\tneeded",)),
+                    self.reply(proposal_id="../../unsafe"),
+                    self.reply("final", 1, 1)):
+            with self.subTest(bad=bad):
+                env = self._review_env([self.reply(), bad])
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), (self.TABLE, "a\n"),
+                    (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertNotIn("Type 'yes'", out)
+                self.assertFalse(any(c[0] == "apply" for c in self._calls()))
+                self.assertEqual(self._calls()[-1], ["status"])
+
+
+for _name in tuple(vars(TestModelRefreshMenu)):
+    if not _name.startswith("test_") and _name not in ("__dict__", "__weakref__", "__module__", "__doc__"):
+        if _name not in vars(TestDraftRefreshMenu):
+            setattr(TestDraftRefreshMenu, _name, getattr(TestModelRefreshMenu, _name))
+TestDraftRefreshMenu.sourceable = TestBalancedRefreshMenuDetails.sourceable
 
 
 class TestModelRefreshDistribution(BaseHomeTestCase):

@@ -1811,31 +1811,35 @@ purge_session_quarantine() {
 # --- Subagent model refresh (menu option p) ---
 # Fetches CURRENT official GitHub Copilot prices, the official model
 # capability pages and the reviewed third-party comparison pages via
-# copilot-model-refresh.py (`propose --review`; balanced policy by default,
-# `--cost-led` only when COPILOT_MODEL_REFRESH_POLICY=cost-led). The helper
-# prints a compact overview FIRST: every route's current model, then the
-# numbered options (none preselected) with official prices and third-party
-# evidence/cautions. You pick option numbers (at most one per route), `d`
-# shows the full details view (cached copies only, read-only), Enter picks
-# none. Only then is anything still unverified about a model YOU selected
-# asked: "Are all these proposed models available in /model? [y/N]". On No
-# you name the unavailable ones (checked against the displayed list;
-# Enter/EOF cancels). For each exact reasoning level the helper cannot verify
-# from saved/source-backed evidence you answer y/N for that model and level
-# (No = the model is not used where that level is needed; never downgraded).
-# The helper keeps your answers only inside the sealed proposal for this run
-# (nothing is saved), recomputes the mapping from the same frozen
-# prices/evidence, and the loop repeats until nothing is pending (bounded;
-# every round answers something). If an answer drops one of your selections,
-# the renumbered options are offered again (at most 3 selection rounds).
-# In cost-led mode the helper's own proposed changes are checked the same
-# way before the options are offered. Only a fully checked proposal reaches
-# the separate exact `yes` (default No) that applies it; the helper refuses
-# if any input or evidence changed. Every outcome (applied, cancelled, no
-# changes, offline/failed) shows the effective routing and waits for Enter,
-# then the caller returns to the menu — never launches `copilot`.
-# (Saving a /model record for later runs stays available separately:
-# copilot-model-refresh.py record-verified.)
+# copilot-model-refresh.py. Balanced policy (default): `propose --review
+# --draft` prints ONE compact numbered table first — every route, its
+# current model, a DRAFTED change or keep (the helper's fixed ranking:
+# same-model alignment, the only option fresh exact-effort third-party
+# metrics favour, a documented official advantage at the same official
+# price, then an official >= 10% saving labelled as price only), the price
+# change, a short basis, the number of alternatives and the status. The
+# draft is a proposal only: you accept all draft changes (`a`) or only some
+# rows (`a 1,3`), keep rows (`k 1,3`), repropose rows (`r 1,3`, then `r`
+# again on the same rows), list/pick alternatives (`o`, `o ROW`, `o ROW.K`),
+# see the read-only details (`d`) or cancel (`q`/Enter/EOF — never an
+# acceptance). See model_refresh_draft_flow below. Only ACCEPTED rows are
+# then checked: "Are all these proposed models available in /model? [y/N]",
+# on No the unavailable IDs (checked against the displayed list; Enter/EOF
+# cancels), and y/N for each exact reasoning level the helper cannot verify
+# from saved/source-backed evidence (No = not used where that level is
+# needed; never downgraded). An answer that rules out an accepted model
+# re-drafts only the rows using it, which you accept again; every other
+# row is kept as it was. Answers live only inside the sealed proposal for
+# this run (nothing is saved). Only an accepted, fully checked table
+# reaches the separate exact `yes` (`e` edits the table again, anything
+# else cancels); the helper refuses if any input or evidence changed or the
+# draft does not match. COPILOT_MODEL_REFRESH_POLICY=cost-led keeps the
+# legacy loop (`propose --review --cost-led`: the helper's own proposed
+# changes are checked, numbered options may be selected, then `yes`).
+# Every outcome (applied, cancelled, no changes, offline/failed) shows the
+# effective routing and waits for Enter, then the caller returns to the
+# menu — never launches `copilot`. (Saving a /model record for later runs
+# stays available separately: copilot-model-refresh.py record-verified.)
 #
 # Colour: the helper's stdout is captured below, so it cannot see the
 # terminal. copilot-s decides here, from ITS stdout, and forwards only
@@ -1902,10 +1906,11 @@ show_model_routing_status() {
 # line, and records the machine lines in MR_* globals. Exact invariants: at
 # most one PROPOSAL; exactly one REVIEW and exactly one SELECTED whenever
 # either appears; unique ALTERNATIVE numbers, CHECK models and LEVEL
-# model+effort pairs. Any malformed, duplicated, contradictory or
-# inconsistent machine line sets MR_PROTOCOL_OK=false (the caller then fails
-# closed and never reaches a question or apply). Returns the helper's exit
-# status.
+# model+effort pairs; at most one DRAFT<TAB>phase<TAB>open<TAB>accepted, and
+# with it the per-phase rules checked below. Any malformed, duplicated,
+# contradictory or inconsistent machine line sets MR_PROTOCOL_OK=false (the
+# caller then fails closed and never reaches a question or apply). Returns
+# the helper's exit status.
 MR_PROPOSAL_ID=""
 MR_ALTERNATIVES=()
 MR_CHECK=()
@@ -1915,16 +1920,25 @@ MR_REVIEW=""
 MR_SELECTED=0
 MR_PROTOCOL_OK=true
 MR_CANCELLED=false
+# Draft table (balanced menu p): DRAFT<TAB>phase<TAB>open<TAB>accepted.
+MR_DRAFT_PHASE=""
+MR_DRAFT_OPEN=0
+MR_DRAFT_ACCEPTED=0
 MODEL_REFRESH_MAX_ROUNDS=20
 MR_MODEL_RE='^[a-z0-9]([a-z0-9.-]{0,78}[a-z0-9])?$'
 MR_EFFORT_RE='^(none|minimal|low|medium|high|xhigh|max)$'
 MR_ROUTES_RE='^[a-z0-9._-]+(,[a-z0-9._-]+)*$'
+MR_DRAFT_PHASE_RE='^(choose|verify|final|none)$'
+MR_COUNT_RE='^[0-9]{1,2}$'
+# Number of routes in the draft table (copilot-model-refresh.py ROUTES): open
+# + accepted rows can never exceed it.
+MR_DRAFT_ROUTES=10
 # One route key (e.g. tester, test-reviewer, coder.small_casual) and one
 # positive option number without leading zeros (1-999).
 MR_ROUTE_RE='^[a-z][a-z0-9_-]{0,39}(\.[a-z][a-z0-9_]{0,39})?$'
 MR_OPTION_RE='^[1-9][0-9]{0,2}$'
 run_model_refresh_helper() {
-  local out="" rc=0 line tab=$'\t' rest f1 f2 f3 selected_seen=false
+  local out="" rc=0 line tab=$'\t' rest f1 f2 f3 selected_seen=false verify_seen=false
   MR_PROPOSAL_ID=""
   MR_ALTERNATIVES=()
   MR_CHECK=()
@@ -1933,6 +1947,9 @@ run_model_refresh_helper() {
   MR_REVIEW=""
   MR_SELECTED=0
   MR_PROTOCOL_OK=true
+  MR_DRAFT_PHASE=""
+  MR_DRAFT_OPEN=0
+  MR_DRAFT_ACCEPTED=0
   out=$(COPILOT_MODEL_REFRESH_COLOR="$MR_COLOR" COLUMNS="$MR_COLUMNS" python3 "$MODEL_REFRESH_HELPER" "$@") || rc=$?
   while IFS= read -r line; do
     case "$line" in
@@ -2001,7 +2018,27 @@ run_model_refresh_helper() {
         fi
         ;;
       "VERIFY${tab}needed")
-        : # plain propose only; the menu asks about proposed models instead
+        verify_seen=true # plain propose only; the menu asks about proposed models instead
+        ;;
+      "DRAFT${tab}"*)
+        # Exactly DRAFT<TAB>phase<TAB>open<TAB>accepted, at most once.
+        rest="${line#"DRAFT${tab}"}"
+        f1="${rest%%"${tab}"*}"
+        f2="" f3=""
+        if [[ "$rest" == *"${tab}"* ]]; then
+          rest="${rest#*"${tab}"}"
+          f2="${rest%%"${tab}"*}"
+          if [[ "$rest" == *"${tab}"* ]]; then
+            f3="${rest#*"${tab}"}"
+          fi
+        fi
+        if [[ -z "$MR_DRAFT_PHASE" && "$f1" =~ $MR_DRAFT_PHASE_RE && "$f2" =~ $MR_COUNT_RE && "$f3" =~ $MR_COUNT_RE ]]; then
+          MR_DRAFT_PHASE="$f1"
+          MR_DRAFT_OPEN=$((10#$f2))
+          MR_DRAFT_ACCEPTED=$((10#$f3))
+        else
+          MR_PROTOCOL_OK=false
+        fi
         ;;
       *)
         echo "$line"
@@ -2018,6 +2055,41 @@ run_model_refresh_helper() {
   fi
   if [[ "$MR_REVIEW" != "pending" ]] && [[ ${#MR_CHECK[@]} -gt 0 || ${#MR_LEVELS[@]} -gt 0 ]]; then
     MR_PROTOCOL_OK=false
+  fi
+  # Draft output: never ALTERNATIVE/VERIFY lines; open + accepted rows never
+  # exceed the route count; per phase exactly the review lines and PROPOSAL
+  # it needs (choose: none of the review lines, any possible open/accepted
+  # split; verify: REVIEW pending for at least one ACCEPTED row, no open row;
+  # final: REVIEW complete, no open row, SELECTED = accepted rows — 0 only
+  # for a re-sync of the generated files; none: no proposal, no open or
+  # accepted row).
+  if [[ -n "$MR_DRAFT_PHASE" ]]; then
+    if [[ ${#MR_ALTERNATIVES[@]} -gt 0 || "$verify_seen" == "true" ]] \
+      || [[ $MR_DRAFT_OPEN -gt $MR_DRAFT_ROUTES || $MR_DRAFT_ACCEPTED -gt $MR_DRAFT_ROUTES ]] \
+      || [[ $((MR_DRAFT_OPEN + MR_DRAFT_ACCEPTED)) -gt $MR_DRAFT_ROUTES ]]; then
+      MR_PROTOCOL_OK=false
+    fi
+    case "$MR_DRAFT_PHASE" in
+      choose)
+        if [[ -n "$MR_REVIEW" || "$selected_seen" == "true" || -z "$MR_PROPOSAL_ID" ]]; then
+          MR_PROTOCOL_OK=false
+        fi
+        ;;
+      verify|final)
+        if [[ -z "$MR_PROPOSAL_ID" || $MR_DRAFT_OPEN -ne 0 || "$selected_seen" != "true" ]] \
+          || [[ $MR_SELECTED -ne $MR_DRAFT_ACCEPTED ]] \
+          || [[ "$MR_DRAFT_PHASE" == "verify" && ( "$MR_REVIEW" != "pending" || $MR_DRAFT_ACCEPTED -lt 1 ) ]] \
+          || [[ "$MR_DRAFT_PHASE" == "final" && "$MR_REVIEW" != "complete" ]]; then
+          MR_PROTOCOL_OK=false
+        fi
+        ;;
+      none)
+        if [[ -n "$MR_PROPOSAL_ID" || -n "$MR_REVIEW" || "$selected_seen" == "true" ]] \
+          || [[ $MR_DRAFT_OPEN -ne 0 || $MR_DRAFT_ACCEPTED -ne 0 ]]; then
+          MR_PROTOCOL_OK=false
+        fi
+        ;;
+    esac
   fi
   return "$rc"
 }
@@ -2156,6 +2228,134 @@ model_refresh_review_round() {
   return "$rc"
 }
 
+# Draft table loop (balanced menu p; `propose --review --draft`). The helper
+# owns every decision: it prints the compact numbered mapping of all routes
+# (one drafted change or keep per route, nothing selected) and seals the
+# draft state in the proposal; this loop only reads your command and passes
+# it on. Phases (from DRAFT<TAB>phase):
+#   choose — a (accept all drafts) | a ROWS | k ROWS | r [ROWS] |
+#            o [ROW[.K]] go to `draft --do`; d shows the read-only details;
+#            q, Enter or EOF cancels (never accepts). A command the helper
+#            does not accept (exit 5) changes nothing; you are asked again.
+#   verify — only the ACCEPTED rows' unverified models/levels are asked
+#            (same questions as before); an answer that rules a model out
+#            re-drafts only the rows using it and returns to the table.
+#   final  — exact `yes` applies the accepted rows; e edits the table;
+#            anything else (Enter/EOF) cancels.
+#   none   — nothing to apply (the helper printed the kept routing).
+# Bounded (MODEL_REFRESH_MAX_DRAFT_STEPS); every failure fails closed with
+# the current routing shown; never launches `copilot`.
+MODEL_REFRESH_MAX_DRAFT_STEPS=60
+MR_DRAFT_CMD_RE='^[AaKkRrOoEe]( +[0-9][0-9 ,.]{0,60})?$'
+model_refresh_draft_flow() {
+  local rc=0 proposal_id="" failed="" cancelled=false applied=false steps=0 cmd="" confirm="" apply_rc=0
+  run_model_refresh_helper propose --review --draft || rc=$?
+  echo ""
+  while true; do
+    if [[ $rc -ne 0 && $rc -ne 3 && $rc -ne 5 ]]; then
+      failed="Model refresh did not complete (exit $rc)"
+      break
+    fi
+    if [[ "$MR_PROTOCOL_OK" != "true" || -z "$MR_DRAFT_PHASE" ]]; then
+      failed="Model refresh returned malformed draft output"
+      break
+    fi
+    if [[ "$MR_DRAFT_PHASE" == "none" ]]; then
+      break # nothing to apply: the helper already printed the kept routing
+    fi
+    if [[ ! "$MR_PROPOSAL_ID" =~ ^[0-9a-f]{16}$ ]]; then
+      failed="Model refresh returned no valid proposal"
+      break
+    fi
+    proposal_id="$MR_PROPOSAL_ID"
+    steps=$((steps + 1))
+    if [[ $steps -gt $MODEL_REFRESH_MAX_DRAFT_STEPS ]]; then
+      echo -e "${RED}Too many steps — nothing was applied.${RESET}" >&2
+      cancelled=true
+      break
+    fi
+    rc=0
+    case "$MR_DRAFT_PHASE" in
+      verify)
+        model_refresh_review_round || rc=$?
+        if [[ "$MR_CANCELLED" == "true" ]]; then
+          cancelled=true
+          break
+        fi
+        ;;
+      final)
+        echo -ne "${YELLOW}Type 'yes' to apply exactly the ACCEPTED rows (official price facts and categorical fit, not measured quality), e to edit the table, anything else cancels: ${RESET}"
+        confirm=""
+        if ! model_refresh_read confirm; then
+          cancelled=true
+          break
+        fi
+        if [[ "$confirm" == "yes" ]]; then
+          applied=true
+          break
+        fi
+        if [[ "$confirm" == "e" || "$confirm" == "E" ]]; then
+          run_model_refresh_helper draft --proposal-id "$proposal_id" --do e || rc=$?
+          echo ""
+          continue
+        fi
+        cancelled=true
+        break
+        ;;
+      choose)
+        echo -ne "${YELLOW}Table: a = accept all, a ROWS, k ROWS, r [ROWS], o [ROW[.K]], d = details, q/Enter = cancel: ${RESET}"
+        cmd=""
+        if ! model_refresh_read cmd; then
+          cancelled=true
+          break
+        fi
+        # Trim surrounding blanks; squeeze nothing else (the helper parses).
+        cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+        cmd="${cmd%"${cmd##*[![:space:]]}"}"
+        case "$cmd" in
+          ""|q|Q)
+            cancelled=true
+            break
+            ;;
+          d|D)
+            model_refresh_show_details "$proposal_id"
+            continue
+            ;;
+        esac
+        if [[ ! "$cmd" =~ $MR_DRAFT_CMD_RE ]]; then
+          echo -e "${DIM}Not a table command — use a, a 1,3, k 1,3, r, r 1,3, o, o 3, o 3.2, d or q. Nothing changed.${RESET}"
+          continue
+        fi
+        run_model_refresh_helper draft --proposal-id "$proposal_id" --do "$cmd" || rc=$?
+        echo ""
+        ;;
+      *)
+        failed="Model refresh returned an unknown draft phase"
+        break
+        ;;
+    esac
+  done
+
+  if [[ -n "$failed" ]]; then
+    echo -e "${RED}${failed} — subagent routing unchanged.${RESET}" >&2
+    model_refresh_discard_latest "$proposal_id"
+    show_model_routing_status
+  elif [[ "$cancelled" == "true" ]]; then
+    if [[ "$proposal_id" =~ ^[0-9a-f]{16}$ ]]; then
+      model_refresh_direct discard --proposal-id "$proposal_id" || true
+    else
+      show_model_routing_status
+    fi
+  elif [[ "$applied" == "true" ]]; then
+    model_refresh_direct apply --proposal-id "$proposal_id" || apply_rc=$?
+    if [[ $apply_rc -ne 0 ]]; then
+      echo -e "${RED}Apply did not complete (exit $apply_rc) — see the message above; current routing:${RESET}" >&2
+      show_model_routing_status
+    fi
+  fi
+  return 0
+}
+
 refresh_model_routing() {
   if [[ ! -f "$MODEL_REFRESH_HELPER" ]]; then
     echo -e "${RED}Model refresh helper not found at $MODEL_REFRESH_HELPER — subagent routing unchanged. Set COPILOT_MODEL_REFRESH_HELPER or re-run the installer.${RESET}" >&2
@@ -2169,9 +2369,10 @@ refresh_model_routing() {
   fi
 
   local -a propose_args=(propose --review)
+  local draft_mode=true
   case "${COPILOT_MODEL_REFRESH_POLICY:-balanced}" in
     balanced|"") ;;
-    cost-led) propose_args+=(--cost-led) ;;
+    cost-led) propose_args+=(--cost-led); draft_mode=false ;;
     *)
       echo -e "${RED}COPILOT_MODEL_REFRESH_POLICY must be 'balanced' or 'cost-led' — subagent routing unchanged.${RESET}" >&2
       pause_for_menu
@@ -2181,6 +2382,12 @@ refresh_model_routing() {
   model_refresh_terminal_setup
 
   echo -e "\n${CYAN}Fetching current official GitHub Copilot prices, model capability docs and the reviewed third-party comparison pages (fixed public URLs; no cookies, credentials, settings or model data are sent — the sites see an ordinary request from your IP address)...${RESET}"
+  if [[ "$draft_mode" == "true" ]]; then
+    model_refresh_draft_flow
+    echo ""
+    pause_for_menu
+    return 0
+  fi
   local rc=0 proposal_id="" selection="" select_rc=0 rounds=0 failed="" cancelled=false
   local offered="" alt_n confirm="" apply_rc=0 alt_rounds=0 selected_before=0 reoffer=false details_shown=0
   run_model_refresh_helper "${propose_args[@]}" || rc=$?
@@ -2195,7 +2402,7 @@ refresh_model_routing() {
       failed="Model refresh did not complete (exit $rc)"
       break
     fi
-    if [[ "$MR_PROTOCOL_OK" != "true" || -z "$MR_REVIEW" ]]; then
+    if [[ "$MR_PROTOCOL_OK" != "true" || -z "$MR_REVIEW" || -n "$MR_DRAFT_PHASE" ]]; then
       failed="Model refresh returned malformed review output"
       break
     fi
@@ -2682,22 +2889,23 @@ ${BOLD}Features:${RESET}
     official model capability pages (fixed docs.github.com URLs) plus a
     short reviewed list of public third-party benchmark comparison pages
     (fixed URLs, automatic GET; no cookies, credentials, settings or model
-    data are sent, the sites see an ordinary request from your IP; reference only —
-    they can make an option visible, never choose one). Balanced by
-    default: NOTHING is changed or preselected. A compact overview comes
-    first: every route with its current model, then numbered options per
-    route (>= 10% cheaper ones, and others backed by an official
-    differentiator or a fresh third-party comparison of that exact pair)
-    with official prices, third-party scores as reported (source, date,
-    effort/harness when stated) and cautions. Enter option numbers (at most
-    one per route), \`d\` for the full details view (all models, rejected
-    candidates, raw rates; cached copies only), or Enter for none. Only a
-    model you selected is then checked with you: available in /model [y/N]
-    and y/N for an exact reasoning level it cannot verify (answers used for
-    that run only, never saved); if an answer drops a selection you may
-    choose again. Local overrides are applied only after a separate
-    \`yes\` (default No). Shipped defaults are never edited; your own
-    /subagents values are never overwritten. Undo with:
+    data are sent, the sites see an ordinary request from your IP; reference
+    only). Balanced by default: ONE compact numbered table comes first —
+    every route, its current model, a DRAFTED change or keep, price change,
+    short basis (Alignment / Benchmark / Documented, same price / Savings =
+    price only, never a quality claim), alternatives count and status.
+    The draft is only a proposal: \`a\` accepts all draft changes, \`a 1,3\`
+    only those rows (other drafts kept), \`k 1,3\` keeps rows, \`r 1,3\`
+    reproposes rows (\`r\` = again on the same rows, never repeating a
+    candidate), \`o\` / \`o ROW\` lists alternatives and \`o ROW.K\` drafts
+    one, \`d\` shows the full details (cached copies only), \`q\` or Enter
+    cancels. Only ACCEPTED rows are then checked with you: available in
+    /model [y/N] and y/N for an exact reasoning level it cannot verify
+    (answers used for that run only, never saved); a model you rule out
+    re-drafts only its rows, which you accept again. Local overrides are
+    applied only after a separate \`yes\` (\`e\` edits the table, anything
+    else cancels). Shipped defaults are never edited; your own /subagents
+    values are never overwritten. Undo with:
     copilot-model-refresh.py reset --yes
   - Prompts to keep/rename/delete a session when \`copilot\` exits
   - For sessions created by copilot-s from now on: shows the context fill
@@ -2738,7 +2946,7 @@ ${BOLD}Environment:${RESET}
   COPILOT_MODEL_REFRESH_DOCS_FETCH  Set to 0 to stop menu p fetching the capability docs (cached copy only)
   COPILOT_MODEL_REFRESH_BENCHMARKS_FETCH  Set to 0 to stop menu p fetching third-party comparisons (cached copy only)
   COPILOT_MODEL_REFRESH_POLICY   cost-led = legacy menu p behaviour (cheapest eligible >= 10% saving proposed
-                                 automatically, still confirmed with yes); default/balanced = options only
+                                 automatically, still confirmed with yes); default/balanced = draft table
   NO_COLOR                       Disable colour in the menu p overview (also off when not a terminal or TERM=dumb)
   COPILOT_SESSION_REPORT_HELPER  Override the path to copilot-session-report.py
   COPILOT_SESSION_REPORTS_DIR    Override where per-launch run records are kept

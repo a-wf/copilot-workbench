@@ -741,7 +741,7 @@ layers confirmed local overrides on top of them.
   The policy is sealed in the proposal and part of the evidence digest.
   In balanced mode the cost-led decision below is still computed but never
   proposed (its evidence lines are dropped): every route keeps its model
-  unless the user selects an option.
+  unless the user accepts a draft row (menu `p`, below) or selects an option.
 - **Decision.** Proposals require a pricing snapshot under 24h old and an
   unexpired catalog (or, when it has expired, fresh live evidence for every
   parsed section; per model, catalog-based facts still fail closed). A
@@ -811,7 +811,8 @@ layers confirmed local overrides on top of them.
   `TERM=dumb`, never on machine lines; widths and wrapping are computed on
   plain text (`COLUMNS` wins; a pipe without it is not wrapped), and words
   are never broken.
-- **Review mode (`propose --review`, what menu `p` runs).** A candidate
+- **Review mode (`propose --review`; menu `p` adds `--draft` in the balanced
+  policy, below, and runs it without in the cost-led policy).** A candidate
   whose ONLY failing gates are availability and/or the exact reasoning
   level (user-fixable codes) is kept as tentatively eligible and may be
   proposed; every other gate, pins, the 10% rule and "never an automatic
@@ -836,7 +837,59 @@ layers confirmed local overrides on top of them.
   `apply` refuses any proposal that still has pending items. Saved
   availability/level evidence is always reused first; `record-verified`
   remains a separate command.
-- **Two-phase apply.** `propose` writes `pending-proposal.json` (format 4,
+- **Draft mapping (`propose --review --draft`, balanced menu `p`).** The
+  first view is ONE compact numbered table of all ten routes (row number =
+  route order, never renumbered): current values, a DRAFTED change or
+  `keep`, blended price change, short basis, number of explicit
+  alternatives and status (pinned / kept / draft / ACCEPTED / still to
+  check); on a normal wide terminal it is a column table whose price, basis
+  and status cells may wrap onto continuation lines (route keys and model ·
+  effort cells never wrap or get cut; widths computed on plain text before
+  colour), and only when even that does not fit, one short block per row.
+  Nothing is
+  selected. `draft_ranking()` (versioned, `DRAFT_RANKING_VERSION`) only
+  ranks a route's offered options (every hard gate, pin and the 10% rule
+  already applied; pending only availability/exact level): (1)
+  `alignment`; (2) `benchmark` — the ONLY option whose fresh third-party
+  metrics at the route's exact stated levels are ≥ 1 higher and none lower
+  with no aggregator disagreement; then, only when no such comparable
+  metric separates the pair, (3) `official` — a documented differentiator
+  at IDENTICAL official rates (Default tier; on long_context routes also
+  the above-threshold tier and threshold, never imputed), more
+  differentiators first, then ID; (4) `savings` — ≥ 10% cheaper, cheapest
+  first, labelled a price fact, never a quality claim. Adverse or mixed
+  comparable metrics, several favoured options and documented advantages
+  at another price are never drafted automatically (reachable with `o`,
+  labelled as tradeoffs, never "best"); effort-mismatched/unstated pages
+  stay context only. `draft --proposal-id ID --do CMD` (cache-only, under
+  the lock) re-derives the proposal, re-validates the sealed draft and
+  applies one command: `a` (accept every open draft row), `a ROWS` (accept
+  those; other OPEN rows become kept; earlier accepted rows stay), `k
+  ROWS`, `r [ROWS]` (next ranked identity not in the row's shown history;
+  the subset is remembered; exhausted → kept with the reason; no
+  cycling), `o` / `o ROW` (read-only listing), `o ROW.K` (draft that
+  option; basis = its ranking basis or `manual`) and `e` (accepted table →
+  editable again). An invalid command exits 5 and changes nothing. The
+  sealed `draft` object holds the ranking version, phase (`choose` |
+  `confirm`), a step counter (≤ 60), the remembered subset, and per route
+  the decision (`open` | `accepted` | `kept`), drafted identity
+  (model/effort/context), basis, flag (`revised` | `exhausted`) and every
+  identity shown (≤ 40); it is validated strictly (enums, ranges,
+  duplicates, route order, phase consistency), every drafted identity must
+  be an offered option of its route in the re-derivation with exactly the
+  ranked basis, and the sealed `selected` must equal the accepted rows —
+  otherwise the proposal is dropped and refused. Only ACCEPTED rows become
+  review targets (`CHECK`/`LEVEL`); `review` folds the answers in, then
+  `reconcile_draft()` re-drafts ONLY rows whose identity is no longer
+  offered (next unseen ranked candidate, flag `revised`, back to the table
+  for re-acceptance) and preserves every other row, decision and answer.
+  Machine lines: `DRAFT<TAB>choose|verify|final|none<TAB>open<TAB>accepted`
+  (once; no ALTERNATIVE/VERIFY lines), plus `REVIEW`/`SELECTED` (= accepted
+  rows) and `CHECK`/`LEVEL` in verify/final, and `PROPOSAL` unless `none`.
+  `select` refuses a draft; `apply` additionally refuses a draft that is
+  not in the confirm phase or still has an open row. No routing, settings,
+  pin or availability file is written before the final `yes`.
+- **Two-phase apply.** `propose` writes `pending-proposal.json` (format 5,
   15 min TTL; older formats are refused) with digests of settings, state,
   user config, verified record, routing defaults, catalog, capability
   evidence, third-party comparison cache (registry digest + per-page record
@@ -844,7 +897,8 @@ layers confirmed local overrides on top of them.
   output digests, an evidence digest (pricing snapshot and status,
   capability digest incl. freshness, third-party digest, policy, catalog,
   availability records, local date, each route's decision and options with
-  their bases), the sealed `policy` and the numbered options. `select
+  their bases), the sealed `policy`, the numbered options and the sealed
+  `draft` (null for a plain proposal). `select
   --proposal-id --choose N[,N]` re-derives everything cache-only, refuses
   on any difference, and writes a NEW proposal (same expiry) whose
   overrides add the chosen options (one per route; the choice replaces any
@@ -859,8 +913,8 @@ layers confirmed local overrides on top of them.
   HMAC-SHA256 seal keyed by a private random `model-refresh/.proposal-key`
   (0600; created on first `propose`); `select`/`apply` refuse a broken
   seal, a creation time in the future, or an expiry other than exactly
-  creation + 15 min (`select` keeps the original creation/expiry and
-  re-seals). Models listed only in a stale/future-dated cached page stay in
+  creation + 15 min (`select`, `review` and `draft` keep the original
+  creation/expiry and re-seal). Models listed only in a stale/future-dated cached page stay in
   the model list as unknown with a note; their facts are never used. The commit writes a journal and per-file backups,
   re-checks each file's digest immediately before replacing it, defers
   SIGINT/SIGTERM/SIGHUP, and rolls back on failure; an interrupted commit is

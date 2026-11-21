@@ -16,6 +16,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -3595,7 +3596,8 @@ class TestBalancedBenchmarkRefresh(LiveRefreshCase):
             self.assertIn(route["label"], out)
         self.assertNotIn("irrelevant remote winner", out)
         self.assertNotIn("Synthetic fixture tasks", out)
-        self.assertEqual(doc["format"], 4)
+        self.assertEqual(doc["format"], 5)
+        self.assertIsNone(doc["draft"], "plain helper proposals retain explicit selection")
         self.assertIn("benchmarks", doc["digests"])
 
     def test_details_are_full_cached_read_only_and_match_numbering(self):
@@ -4215,6 +4217,625 @@ class TestBalancedBenchmarkRefresh(LiveRefreshCase):
         self.assertEqual(rc, 4, out + err)
         self.assertIn("evidence", err)
         self.assertEqual(self.protected_bytes(), before)
+
+
+class TestDraftMapping(LiveRefreshCase):
+    """The balanced p transaction, using real parsers and synthetic transport.
+
+    Stable table rows are ROUTES order, not the renumberable option numbers.
+    All writes and availability answers stay inside the temporary HOME.
+    """
+
+    TEST_POLICY = None
+    TEST_DETAILS = False
+    machine = TestProposalScopedReview.machine
+    frozen = TestProposalScopedReview.frozen
+    protected_bytes = TestProposalScopedReview.protected_bytes
+    whole_home = TestBalancedBenchmarkRefresh.whole_home
+
+    def setUp(self):
+        super().setUp()
+        self.config.pop("available_models")
+        self.save_config()
+        self.markdown = self.live_prices(new=5, cheap=6)
+        self.b, error = self.mod.load_benchmark_module()
+        self.assertIsNone(error)
+        self.benchmark_fetches = []
+        self.benchmark_pages = {}
+        self.mod.BENCHMARK_FETCHER = self.fetch_benchmarks
+        self.before = self.protected_bytes()
+        self.clock = NOW
+
+    def fetch_benchmarks(self, url, timeout, max_bytes):
+        self.benchmark_fetches.append(url)
+        pair = next(p for p in self.b.PAIRS if p["url"] == url)
+        # Other/unspecified effort is context only, not evidence of quality.
+        return self.benchmark_pages.get(url, comparison_fixture(pair, efforts=("max", "max")))
+
+    def draft(self):
+        rc, out, err = self.cli("propose", "--review", "--draft")
+        self.assertEqual(rc, 0, out + err)
+        doc = self.frozen(out)
+        self.assertEqual(doc["format"], 5)
+        self.assertEqual(doc["policy"], "balanced")
+        self.assertEqual(self.protected_bytes(), self.before)
+        return doc, out
+
+    def step(self, doc, command, expected_rc=0):
+        self.clock += 1
+        rc, out, err = self.cli("draft", "--proposal-id", doc["proposal_id"],
+                                "--do", command, now=self.clock)
+        self.assertEqual(rc, expected_rc, out + err)
+        self.assertEqual(self.protected_bytes(), self.before)
+        return (self.frozen(out) if self.machine(out, "PROPOSAL") else None), out
+
+    def answer(self, doc, *args):
+        self.clock += 1
+        rc, out, err = self.cli("review", "--proposal-id", doc["proposal_id"],
+                                *args, now=self.clock)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.protected_bytes(), self.before)
+        return self.frozen(out), out
+
+    def row(self, doc, route):
+        return next(r for r in doc["draft"]["rows"] if r["route"] == route)
+
+    def index(self, route):
+        return next(i for i, r in enumerate(self.mod.ROUTES, 1) if r["key"] == route)
+
+    def calls(self):
+        return (list(self.fetches), list(self.docs_fetches), list(self.benchmark_fetches))
+
+    def assert_original(self, first, doc, evidence=True):
+        for field in ("created_epoch", "expires_epoch", "digests", "snapshot_id"):
+            self.assertEqual(first[field], doc[field], field)
+        if evidence:
+            self.assertEqual(first["evidence_digest"], doc["evidence_digest"])
+
+    def test_first_draft_is_unselected_full_numbered_mapping_before_any_check(self):
+        doc, out = self.draft()
+        self.assertEqual(doc["selected"], [])
+        self.assertEqual(doc["overrides"], {})
+        self.assertEqual(doc["route_changes"], [])
+        self.assertEqual(self.machine(out, "DRAFT"), [["choose", "10", "0"]])
+        for marker in ("CHECK", "LEVEL", "REVIEW", "SELECTED", "ALTERNATIVE", "VERIFY"):
+            self.assertEqual(self.machine(out, marker), [], marker)
+        section = out.split("Draft mapping — every route", 1)[1].split("Why (short", 1)[0]
+        for i, route in enumerate(self.mod.ROUTES, 1):
+            self.assertRegex(section, r"(?m)^\s+%d\s+%s\b" % (i, route["key"].replace(".", r"\.")))
+        # Unspecified width may use a wide native table; narrower terminals
+        # currently use blocks. Validate the actual model/price cells here,
+        # leaving the explicit user table requirement to the next test.
+        self.assertIn("gpt-6-luna", section)
+        self.assertIn(NEW, section)
+        self.assertIn("10.00", section)
+        self.assertIn("5.00", section)
+        self.assertLess(out.index("Draft mapping — every route"), out.index("a = accept all"))
+        self.assertIn("Savings (price only)", out)
+        self.assertIn("NOT a quality claim", out)
+        self.assertEqual(tuple(map(len, self.calls())), (1, 2, 4))
+
+    def test_requested_mapping_is_rendered_as_a_table_not_only_route_blocks(self):
+        # User requested a mapping table BEFORE choice, not just a heading
+        # that calls individually wrapped blocks a table.
+        with mock.patch.dict(os.environ, {"COLUMNS": "140"}):
+            _, out = self.draft()
+        section = out.split("Draft mapping — every route", 1)[1].split("Why (short", 1)[0]
+        self.assertRegex(section, r"(?m)^\s*#\s+Route\s+Current\s+Draft\s+")
+
+    def test_wrapped_table_preserves_cells_width_and_alignment_with_color(self):
+        tables = []
+        for color in ("never", "always"):
+            with self.subTest(color=color), mock.patch.dict(os.environ, {
+                "COLUMNS": "140", "TERM": "xterm", "NO_COLOR": "",
+                self.mod.COLOR_ENV: color,
+            }):
+                _, out = self.draft()
+                if color == "always":
+                    self.assertIn("\x1b[", out)
+                else:
+                    self.assertNotIn("\x1b", out)
+                plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+                section = plain.split("Draft mapping — every route", 1)[1].split("Why (short", 1)[0]
+                lines = section.splitlines()
+                header_index = next(i for i, line in enumerate(lines) if re.match(r"^\s*#\s+Route\s+", line))
+                header = lines[header_index]
+                headers = ("#", "Route", "Current", "Draft", "$/1M", "Basis", "Opt", "Status")
+                starts = [header.index(h) for h in headers]
+                groups = []
+                for line in lines[header_index + 2:]:
+                    if not line.strip():
+                        continue
+                    self.assertLessEqual(len(line), 140, line)
+                    if line[starts[0]:starts[1]].strip():
+                        groups.append([])
+                    self.assertTrue(groups, line)
+                    groups[-1].append([
+                        line[start:starts[c + 1] if c + 1 < len(starts) else None].strip()
+                        for c, start in enumerate(starts)
+                    ])
+                self.assertEqual(len(groups), 10)
+                self.assertTrue(any(len(group) > 1 for group in groups), "fixture must exercise wrapping")
+                for i, (route, group) in enumerate(zip(self.mod.ROUTES, groups), 1):
+                    cells = [" ".join(line[c] for line in group if line[c]) for c in range(len(headers))]
+                    values = self.defaults[route["key"]]
+                    suffix = " long" if values["context_tier"] == "long_context" else ""
+                    self.assertEqual(cells, [
+                        str(i), route["key"], "%s %s%s" % (values["model"], values["reasoning_effort"], suffix),
+                        "%s %s%s" % (NEW, values["reasoning_effort"], suffix),
+                        "10.00 -> 5.00 (-50%)", "Savings (price only)", "2", "draft · check /model",
+                    ])
+                    for c in (0, 1, 2, 3, 6):
+                        self.assertTrue(all(not line[c] for line in group[1:]),
+                                        "identity/option columns must not wrap")
+                tables.append(lines[header_index:])
+                self.assertLess(plain.index("Draft mapping — every route"), plain.index("a = accept all"))
+                self.assertIn("blended assumption", plain)
+                for line in out.splitlines():
+                    if line.startswith(("DRAFT\t", "PROPOSAL\t")):
+                        self.assertNotIn("\x1b", line)
+        self.assertEqual(tables[0], tables[1], "ANSI styling must not alter visible column padding")
+
+    def test_narrow_fallback_keeps_every_route_and_untruncated_model_identity(self):
+        with mock.patch.dict(os.environ, {"COLUMNS": "80", self.mod.COLOR_ENV: "never"}):
+            _, out = self.draft()
+        section = out.split("Draft mapping — every route", 1)[1].split("Why (short", 1)[0]
+        self.assertNotRegex(section, r"(?m)^\s*#\s+Route\s+Current\s+Draft\s+")
+        self.assertIn("now:", section)
+        self.assertIn("draft:", section)
+        for i, route in enumerate(self.mod.ROUTES, 1):
+            self.assertRegex(section, r"(?m)^\s+%d\s+%s\b" % (i, re.escape(route["key"])))
+            self.assertIn(self.defaults[route["key"]]["model"], section)
+        self.assertIn(NEW, section)
+        self.assertLess(out.index("Draft mapping — every route"), out.index("a = accept all"))
+
+    def test_zero_accepted_final_is_real_generated_routing_reconciliation_not_verification(self):
+        # Start from the existing test-owned managed-state fixture, then
+        # make a native effort pin that leaves the generated files stale.
+        TestBalancedBenchmarkRefresh.install_managed_drift(self)
+        settings = self.read_json(self.paths.settings)
+        settings["subagents"]["agents"]["planner"]["effortLevel"] = "high"
+        self.write_json(self.paths.settings, settings)
+        self.before = self.protected_bytes()
+        doc, _ = self.draft()
+        doc, _ = self.step(doc, "k 1,2,3,4,5,6,7,8,9,10")
+        final, out = self.step(doc, "a")
+        self.assertEqual(self.machine(out, "DRAFT"), [["final", "0", "0"]])
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        self.assertEqual(self.machine(out, "SELECTED"), [["0"]])
+        self.assertEqual(self.machine(out, "CHECK"), [])
+        self.assertEqual(final["route_changes"], [])
+        self.assertIn("yes re-syncs them", out)
+        rc, out, err = self.cli("apply", "--proposal-id", final["proposal_id"], now=self.clock + 1)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read_json(self.paths.settings)["subagents"]["agents"]["planner"]["effortLevel"],
+                         "high")
+        # Generated routing intentionally does not freeze native pin values:
+        # null/OMIT delegates the field to the live setting asserted above.
+        self.assertIsNone(self.read_json(self.paths.effective)["routes"]["planner"]["values"]["reasoning_effort"])
+        rc, live, err = self.cli("status", "--instructions", now=self.clock + 1)
+        self.assertEqual(rc, 0, live + err)
+        self.assertEqual(self.live_routes(live)["planner"]["reasoning_effort"], "OMIT")
+
+    def test_accept_all_then_verify_and_apply_only_after_separate_confirmation(self):
+        first, _ = self.draft()
+        accepted, out = self.step(first, "a")
+        self.assertEqual(self.machine(out, "DRAFT"), [["verify", "0", "10"]])
+        self.assertEqual(set(accepted["route_changes"]), set(self.defaults))
+        self.assertEqual(self.machine(out, "CHECK"), [[NEW, ",".join(self.defaults)]])
+        self.assertEqual(self.machine(out, "LEVEL"), [])
+        calls = self.calls()
+        checked, out = self.answer(accepted, "--available-all")
+        self.assertEqual(self.machine(out, "DRAFT"), [["final", "0", "10"]])
+        self.assertEqual(self.machine(out, "CHECK"), [])
+        self.assert_original(first, checked, evidence=False)
+        rc, out, err = self.cli("apply", "--proposal-id", checked["proposal_id"], now=self.clock + 1)
+        self.assertEqual(rc, 0, out + err)
+        live = self.read_json(self.paths.effective)["routes"]
+        for key in self.defaults:
+            self.assertEqual(live[key]["values"], dict(self.defaults[key], model=NEW))
+        self.assertEqual(self.calls(), calls)
+        self.assertFalse(Path(self.paths.verified).exists())
+        self.assertEqual(self.read_json(self.paths.user_config), self.config)
+        self.assertEqual(self.read_json(self.paths.settings)["subagents"]["agents"]["unrelated-agent"],
+                         {"model": "human-choice"})
+
+    def test_partial_accept_edit_withdraw_and_apply_preserves_other_accepted_row(self):
+        first, _ = self.draft()
+        a, b = self.index("planner"), self.index("tester")
+        selected, out = self.step(first, "a %d,%d" % (a, b))
+        self.assertEqual(self.machine(out, "DRAFT"), [["verify", "0", "2"]])
+        self.assertEqual(self.row(selected, "coder")["decision"], "kept")
+        checked, _ = self.answer(selected, "--available-all")
+        edit, _ = self.step(checked, "e")
+        self.assertEqual(self.row(edit, "tester"), self.row(checked, "tester"))
+        withdrawn, _ = self.step(edit, "k %d" % a)
+        self.assertEqual(self.row(withdrawn, "planner")["decision"], "kept")
+        final, out = self.step(withdrawn, "a")
+        self.assertEqual(self.machine(out, "DRAFT"), [["final", "0", "1"]])
+        self.assertEqual(final["route_changes"], ["tester"])
+        self.assertEqual(final["review"], checked["review"])
+        self.assert_original(first, final, evidence=False)
+        rc, out, err = self.cli("apply", "--proposal-id", final["proposal_id"], now=self.clock + 1)
+        self.assertEqual(rc, 0, out + err)
+        routes = self.read_json(self.paths.effective)["routes"]
+        self.assertEqual(routes["tester"]["values"], dict(self.defaults["tester"], model=NEW))
+        self.assertEqual(routes["planner"]["values"], self.defaults["planner"])
+        self.assertEqual(routes["coder"]["values"], self.defaults["coder"])
+
+    def test_reproposal_remembers_exact_subset_preserves_approval_and_exhausts(self):
+        first, _ = self.draft()
+        checked, _ = self.step(first, "a")
+        checked, _ = self.answer(checked, "--available-all")
+        edit, _ = self.step(checked, "e")
+        keep = self.row(edit, "tester")
+        calls = self.calls()
+        second, _ = self.step(edit, "r 1,3")
+        self.assertEqual(second["draft"]["subset"], [1, 3])
+        self.assertEqual(self.row(second, "tester"), keep)
+        for i in (1, 3):
+            self.assertEqual(second["draft"]["rows"][i - 1]["values"]["model"], CHEAP)
+            self.assertEqual(second["draft"]["rows"][i - 1]["decision"], "open")
+        exhausted, out = self.step(second, "r")
+        for i in (1, 3):
+            self.assertIsNone(exhausted["draft"]["rows"][i - 1]["values"])
+            self.assertEqual(exhausted["draft"]["rows"][i - 1]["flag"], "exhausted")
+        self.assertIn("no further recommendable candidate", out)
+        self.assertEqual(self.row(exhausted, "tester"), keep)
+        self.assertEqual(exhausted["review"], checked["review"])
+        third, _ = self.step(exhausted, "r 2")
+        self.assertEqual(third["draft"]["subset"], [2])
+        fourth, _ = self.step(third, "r")
+        self.assertEqual(fourth["draft"]["rows"][1]["flag"], "exhausted")
+        self.assert_original(first, fourth, evidence=False)
+        self.assertEqual(self.calls(), calls)
+
+    def test_invalid_commands_are_effect_free_and_inspection_is_read_only(self):
+        doc, _ = self.draft()
+        for command in ("r", "k", "a 0", "a 11", "a 1,1", "o 1.99", "e", "yes",
+                        "r 01", "o 1,2", "a; echo unsafe", "r " + "1" * 65):
+            with self.subTest(command=command):
+                before = self.whole_home()
+                same, out = self.step(doc, command, expected_rc=5)
+                self.assertEqual(same, doc)
+                self.assertEqual(self.whole_home(), before)
+                self.assertIn("Not accepted:", out)
+        for command in ("o", "o 3"):
+            with self.subTest(command=command):
+                before = self.whole_home()
+                same, out = self.step(doc, command)
+                self.assertEqual(same, doc)
+                self.assertEqual(self.whole_home(), before)
+                self.assertIn("o ROW.K", out)
+                self.assertEqual(self.machine(out, "ALTERNATIVE"), [])
+                if command == "o 3":
+                    self.assertIn("https://www.benchleader.com/compare/gpt-6-1-sol-vs-gpt-6-2-sol", out)
+        picked, _ = self.step(doc, "o 3.2")
+        self.assertEqual(picked["draft"]["rows"][2]["values"]["model"], CHEAP)
+        self.assertEqual(picked["draft"]["rows"][2]["decision"], "open")
+
+    def test_keep_everything_then_accept_is_noop_and_removes_proposal(self):
+        doc, _ = self.draft()
+        doc, _ = self.step(doc, "k 1,2,3,4,5,6,7,8,9,10")
+        final, out = self.step(doc, "a", expected_rc=3)
+        self.assertIsNone(final)
+        self.assertEqual(self.machine(out, "DRAFT"), [["none", "0", "0"]])
+        self.assertIn("Final effective routing", out)
+        self.assertFalse(Path(self.paths.proposal).exists())
+
+    def test_direct_apply_and_review_and_legacy_select_cannot_bypass_draft_acceptance(self):
+        for phase in ("choose", "verify"):
+            with self.subTest(phase=phase):
+                doc, _ = self.draft()
+                if phase == "verify":
+                    doc, _ = self.step(doc, "a")
+                rc, out, err = self.cli("apply", "--proposal-id", doc["proposal_id"])
+                self.assertEqual(rc, 4, out + err)
+                self.assertIn("not been accepted" if phase == "choose" else "not confirmed", err)
+                self.assertEqual(self.protected_bytes(), self.before)
+        doc, _ = self.draft()
+        for command, args in (("review", ("--available-all",)), ("select", ("--choose", "1"))):
+            with self.subTest(command=command):
+                rc, out, err = self.cli(command, "--proposal-id", doc["proposal_id"], *args)
+                self.assertEqual(rc, 4, out + err)
+                self.assertEqual(self.protected_bytes(), self.before)
+
+    def test_shared_model_no_replaces_all_using_rows_only_and_reaccepts_replacements(self):
+        doc, _ = self.draft()
+        # Row 1 explicitly uses the second candidate; all other rows use NEW.
+        doc, _ = self.step(doc, "o 1.2")
+        doc, _ = self.step(doc, "a")
+        survivor = doc["draft"]["rows"][0]
+        calls = self.calls()
+        revised, out = self.answer(doc, "--unavailable", NEW)
+        self.assertEqual(revised["draft"]["rows"][0], survivor)
+        self.assertEqual(revised["review"]["available"], [CHEAP])
+        self.assertEqual(revised["review"]["rejected"], [NEW])
+        self.assertEqual(self.machine(out, "DRAFT"), [["choose", "9", "1"]])
+        for row in revised["draft"]["rows"][1:]:
+            self.assertEqual(row["values"]["model"], CHEAP)
+            self.assertEqual(row["decision"], "open")
+        self.assertTrue(all(a["values"]["model"] != NEW for a in revised["alternatives"]))
+        accepted, out = self.step(revised, "a")
+        self.assertEqual(self.machine(out, "DRAFT"), [["final", "0", "10"]])
+        self.assertEqual(self.machine(out, "CHECK"), [], "CHEAP was already checked")
+        self.assertEqual(self.calls(), calls)
+        self.assert_original(doc, accepted, evidence=False)
+
+    def test_effort_no_only_redrafts_matching_pair_and_preserves_other_yes_answers(self):
+        self.config["verified_capabilities"]["models"].pop(NEW)
+        self.save_config()
+        self.before = self.protected_bytes()
+        doc, _ = self.draft()
+        doc, out = self.step(doc, "a")
+        levels = self.machine(out, "LEVEL")
+        self.assertEqual({p[1] for p in levels}, {"low", "medium", "high", "xhigh"})
+        flags = ["--available-all"]
+        for mid, effort in levels:
+            flags += ["--level", "%s:%s=%s" % (mid, effort, "no" if effort == "xhigh" else "yes")]
+        revised, out = self.answer(doc, *flags)
+        tester = self.row(revised, "tester")
+        self.assertEqual(tester["values"], dict(self.defaults["tester"], model=CHEAP))
+        self.assertEqual(tester["decision"], "open")
+        for row in revised["draft"]["rows"]:
+            if row["route"] != "tester":
+                self.assertEqual(row, self.row(doc, row["route"]))
+        self.assertEqual(revised["review"]["levels"][NEW]["medium"], True)
+        self.assertEqual(revised["review"]["levels"][NEW]["xhigh"], False)
+        doc, out = self.step(revised, "a")
+        self.assertEqual(self.machine(out, "CHECK"), [[CHEAP, "tester"]])
+        final, out = self.answer(doc, "--available-all")
+        self.assertEqual(self.machine(out, "DRAFT"), [["final", "0", "10"]])
+
+    def test_details_uses_cache_and_is_read_only_even_with_tampered_or_expired_draft(self):
+        doc, _ = self.draft()
+        calls = self.calls()
+        for kind in ("valid", "tamper", "expired"):
+            with self.subTest(kind=kind):
+                saved = copy.deepcopy(doc)
+                if kind == "tamper":
+                    saved["draft"]["rows"][0]["decision"] = "accepted"
+                self.write_json(self.paths.proposal, saved)
+                before = self.whole_home()
+                rc, out, err = self.cli("details", "--proposal-id", doc["proposal_id"],
+                                        now=NOW + 901 if kind == "expired" else NOW)
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn("===== Details (full report) =====", out)
+                self.assertEqual(self.whole_home(), before)
+                self.assertEqual(self.calls(), calls)
+                self.assertEqual(self.machine(out, "PROPOSAL"), [])
+
+    def test_superseded_stale_expired_and_tampered_drafts_refuse_without_fetch_or_routing_write(self):
+        for kind in ("superseded", "settings", "pricing", "benchmarks", "tamper", "expiry"):
+            with self.subTest(kind=kind):
+                doc, _ = self.draft()
+                calls = self.calls()
+                if kind == "superseded":
+                    self.step(doc, "r 1")
+                elif kind == "settings":
+                    self.write_json(self.paths.settings, dict(self.initial_settings, theme="changed"))
+                elif kind in ("pricing", "benchmarks"):
+                    path = self.pricing.official_pricing_cache_path() if kind == "pricing" else self.paths.benchmarks
+                    self.write_json(path, {})
+                elif kind == "tamper":
+                    doc["draft"]["subset"] = [1]
+                    self.write_json(self.paths.proposal, doc)
+                before = self.protected_bytes()
+                rc, out, err = self.cli("draft", "--proposal-id", doc["proposal_id"], "--do", "a",
+                                        now=NOW + 901 if kind == "expiry" else self.clock)
+                self.assertEqual(rc, 4, out + err)
+                self.assertEqual(self.protected_bytes(), before)
+                self.assertEqual(self.calls(), calls)
+                # Restore test-owned inputs for the next independent case.
+                self.write_json(self.paths.settings, self.initial_settings)
+                self.before = self.protected_bytes()
+
+    def test_signed_inconsistent_draft_or_selection_fails_closed(self):
+        mutations = (
+            ("accepted-no-selection", lambda d: d["draft"]["rows"][0].update(decision="accepted")),
+            ("open-confirm", lambda d: d["draft"].update(phase="confirm")),
+            ("unknown-phase", lambda d: d["draft"].update(phase="final")),
+            ("duplicate-subset", lambda d: d["draft"].update(subset=[1, 1])),
+            ("boolean-step", lambda d: d["draft"].update(step=True)),
+            ("wrong-basis", lambda d: d["draft"]["rows"][0].update(basis="benchmark")),
+            ("unknown-values", lambda d: d["draft"]["rows"][0]["values"].update(model="not-offered")),
+            ("extended-expiry", lambda d: d.update(expires_epoch=d["expires_epoch"] + 60)),
+        )
+        for kind, mutate in mutations:
+            with self.subTest(kind=kind):
+                doc, _ = self.draft()
+                mutate(doc)
+                key = Path(self.paths.proposal_key).read_bytes().strip()
+                body = {k: v for k, v in doc.items() if k != "seal"}
+                doc["seal"] = hmac.new(key, json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                                     ensure_ascii=True).encode("ascii"), hashlib.sha256).hexdigest()
+                self.write_json(self.paths.proposal, doc)
+                rc, out, err = self.cli("draft", "--proposal-id", doc["proposal_id"], "--do", "a")
+                self.assertEqual(rc, 4, out + err)
+                self.assertEqual(self.protected_bytes(), self.before)
+
+    def test_pins_are_kept_and_not_selectable_or_reproposable(self):
+        settings = copy.deepcopy(self.initial_settings)
+        settings["subagents"]["agents"]["coder"] = {"model": "native-fixture-pin"}
+        self.write_json(self.paths.settings, settings)
+        self.config["pins"] = {"tester": {"model": CHEAP}}
+        self.save_config()
+        self.before = self.protected_bytes()
+        doc, _ = self.draft()
+        for route in ("coder", "tester"):
+            self.assertEqual(self.row(doc, route)["decision"], "kept")
+            self.assertIsNone(self.row(doc, route)["values"])
+            for verb in ("r", "o"):
+                _, out = self.step(doc, "%s %s" % (verb, str(self.index(route)) + (".1" if verb == "o" else "")),
+                                   expected_rc=5)
+                self.assertIn("pinned", out)
+
+
+class TestDraftRecommendationPolicy(LiveRefreshCase):
+    """Policy tests on evaluated eligible options, not external model claims."""
+
+    TEST_POLICY = None
+    TEST_DETAILS = False
+
+    def setUp(self):
+        super().setUp()
+        self.b, error = self.mod.load_benchmark_module()
+        self.assertIsNone(error)
+        self.benchmark_fetches = []
+        self.benchmark_efforts = {"gpt-6.1-sol": "xhigh", NEW: "xhigh",
+                                  "claude-sonnet-5.5": "high", "gpt-6.1-terra": "high"}
+        self.benchmark_pages = {}
+        self.mod.BENCHMARK_FETCHER = self.fetch_benchmarks
+        self.markdown = self.live_prices(new=12, cheap=15, new_long=18)
+
+    def source_metrics(self, current="70%", candidate="80%", effort="xhigh", extra=()):
+        # Each subcase changes the fixture page. Remove the preceding case's
+        # cache so the real five-minute reuse policy cannot hide that change.
+        Path(self.paths.benchmarks).unlink(missing_ok=True)
+        for pair in self.b.PAIRS:
+            if pair["provider"] == "benchleader":
+                self.benchmark_pages[pair["url"]] = comparison_fixture(
+                    pair, efforts=(effort, effort),
+                    values=(("Terminal-Bench", "Terminal-Bench", current, candidate), *extra))
+
+    def ranking(self, key="tester", ages=None, benchmark_age=0):
+        ctx = self.context(ages, benchmark_age)
+        row = self.rows(ctx)[key]
+        return ctx, row, self.mod.draft_ranking(ctx, row)
+
+    def test_unique_fresh_exact_effort_nonregressive_benchmark_precedes_savings(self):
+        self.markdown = self.live_prices(new=12, cheap=5)
+        self.source_metrics()
+        ctx, row, ranked = self.ranking()
+        self.assertEqual([(a["model"], basis) for a, basis in ranked],
+                         [(NEW, "benchmark"), (CHEAP, "savings")])
+        alt = ranked[0][0]
+        self.assertEqual(self.mod.draft_evidence(alt), ("favours", 1, 0))
+        rows = self.mod.evaluate(ctx)
+        self.mod.number_alternatives(rows)
+        text = "\n".join(self.mod.render_draft_options(
+            ctx, rows, self.mod.initial_draft(ctx, rows),
+            self.mod.ROUTES.index(self.mod.ROUTE_BY_KEY["tester"]) + 1))
+        for token in ("70%", "80%", "page updated", "same levels", "reference"):
+            self.assertIn(token, text)
+        cache = self.read_json(self.paths.benchmarks)
+        for pair in self.b.PAIRS:
+            if "gpt-6.1-sol" in {mid for mid, _ in pair["models"]}:
+                self.assertIn(pair["page"], text)
+            record = cache["records"][pair["id"]]
+            self.assertEqual(record["url"], pair["url"])
+            self.assertEqual(record["content_sha256"],
+                             hashlib.sha256(self.benchmark_pages.get(pair["url"]) or comparison_fixture(
+                                 pair, efforts=tuple(self.benchmark_efforts[mid] for mid, _ in pair["models"]))
+                             ).hexdigest())
+        self.assertTrue(row["alternatives"])
+
+    def test_equal_comparable_results_still_recommend_price_only_savings(self):
+        self.markdown = self.live_prices(new=5, cheap=6)
+        self.source_metrics(current="80%", candidate="80%")
+        _, _, ranked = self.ranking()
+        alt, basis = ranked[0]
+        self.assertEqual((alt["model"], basis), (NEW, "savings"))
+        self.assertEqual(self.mod.draft_evidence(alt), ("none", 0, 0))
+        self.assertIn("NOT", self.mod.draft_basis_text(alt, basis))
+
+    def test_adverse_and_mixed_comparable_metrics_are_never_automatic_savings(self):
+        self.markdown = self.live_prices(new=5, cheap=6)
+        for kind, a, b, extra in (
+            ("adverse", "80%", "70%", ()),
+            ("mixed", "70%", "80%", (("SWE Atlas v1.1", "Scale AI SEAL", "90%", "60%"),)),
+        ):
+            with self.subTest(kind=kind):
+                self.source_metrics(a, b, extra=extra)
+                _, row, ranked = self.ranking()
+                alt = next(x for x in row["alternatives"] if x["model"] == NEW)
+                self.assertIn("saving", alt["bases"])
+                self.assertEqual(self.mod.draft_evidence(alt)[0], kind)
+                self.assertNotIn(NEW, [x["model"] for x, _ in ranked])
+                self.assertIn("tradeoff", self.mod._not_drafted_text(alt))
+
+    def test_wrong_effort_or_stale_results_do_not_sell_quality_or_block_independent_savings(self):
+        self.markdown = self.live_prices(new=5, cheap=6)
+        for effort, age in (("max", 0), ("xhigh", 8 * DAY)):
+            with self.subTest(effort=effort, age=age):
+                self.source_metrics("80%", "70%", effort)
+                _, _, ranked = self.ranking(benchmark_age=age)
+                self.assertEqual((ranked[0][0]["model"], ranked[0][1]), (NEW, "savings"))
+
+    def test_equal_official_rates_and_documented_advantage_precede_cheaper_neutral_option(self):
+        self.markdown = self.live_prices(new=10, cheap=5)
+        self.doc_facts["gpt-6.1-sol"]["copilot_cli_client"] = "Not included"
+        _, _, ranked = self.ranking("planner")
+        # Several synthetic included-client candidates share the same
+        # advantage and price; deterministic ID order resolves their tie.
+        self.assertEqual(ranked[0][1], "official")
+        self.assertIn((NEW, "official"), [(a["model"], b) for a, b in ranked])
+        official = [a["model"] for a, b in ranked if b == "official"]
+        self.assertEqual(official, sorted(official))
+        self.assertTrue(ranked[0][0]["differentiators"])
+        self.assertIn((CHEAP, "savings"), [(a["model"], b) for a, b in ranked])
+
+    def test_official_advantage_at_different_price_is_explicit_only_and_manual_pickable(self):
+        self.markdown = self.live_prices(new=12, cheap=15, new_long=18)
+        self.doc_facts["gpt-6.1-sol"]["copilot_cli_client"] = "Not included"
+        ctx, row, ranked = self.ranking("planner")
+        alt = next(a for a in row["alternatives"] if a["model"] == NEW)
+        self.assertIn("official", alt["bases"])
+        self.assertNotIn(NEW, [a["model"] for a, _ in ranked])
+        rows = self.mod.evaluate(ctx)
+        draft = self.mod.initial_draft(ctx, rows)
+        i = next(i for i, r in enumerate(rows, 1) if r["key"] == "planner")
+        k = next(k for k, a in enumerate(rows[i - 1]["alternatives"], 1) if a["model"] == NEW)
+        manual, _ = self.mod.apply_draft_command(ctx, rows, draft, "o", None, (i, k))
+        self.assertEqual(manual["rows"][i - 1]["basis"], "manual")
+        self.assertEqual(manual["rows"][i - 1]["decision"], "open")
+        self.assertEqual(manual["rows"][i - 1]["values"], dict(self.defaults["planner"], model=NEW))
+
+    def test_long_context_same_price_and_savings_require_both_real_tiers(self):
+        self.doc_facts["gpt-6.1-sol"]["copilot_cli_client"] = "Not included"
+        for default, long, expected in ((10, None, True), (10, 18, False), (5, 18, False), (5, 5, True)):
+            with self.subTest(default=default, long=long):
+                self.markdown = self.live_prices(new=default, cheap=15, new_long=long)
+                _, _, ranked = self.ranking("planner")
+                self.assertEqual(NEW in [a["model"] for a, _ in ranked], expected)
+        # A weighted tie is not equality of the official rates themselves.
+        ctx, _, _ = self.ranking("tester")
+        snap = copy.deepcopy(ctx["snapshot"])
+        rates = snap["models"]["gpt-6.1-sol"]["tiers"]["default"]
+        snap["models"][NEW]["tiers"]["default"] = dict(rates, input=rates["input"] + 1)
+        self.assertFalse(self.mod._same_official_price(snap, "gpt-6.1-sol", NEW, False))
+
+    def test_multiple_distinct_favourable_candidates_have_no_automatic_benchmark_winner(self):
+        self.markdown = self.live_prices(new=5, cheap=6)
+        self.source_metrics()
+        ctx, row, _ = self.ranking()
+        # Unit fixture: two separately eligible identities with equally
+        # favourable measured evidence; the ranking must not break quality
+        # ties with price. Real provider parsing/provenance is covered above.
+        row = copy.deepcopy(row)
+        new = next(a for a in row["alternatives"] if a["model"] == NEW)
+        cheap = next(a for a in row["alternatives"] if a["model"] == CHEAP)
+        cheap["benchmark"] = copy.deepcopy(new["benchmark"])
+        ranked = self.mod.draft_ranking(ctx, row)
+        self.assertEqual(ranked, [])
+        cheap["benchmark"]["providers_disagree"] = True
+        ranked = self.mod.draft_ranking(ctx, row)
+        self.assertEqual([(a["model"], b) for a, b in ranked], [(NEW, "benchmark")])
+
+    def test_deterministic_price_ties_use_model_id_and_alignment_has_priority(self):
+        self.markdown = self.live_prices(new=5, cheap=5)
+        _, _, ranked = self.ranking("planner")
+        self.assertEqual([a["model"] for a, _ in ranked], sorted([CHEAP, NEW]))
+        TestBalancedBenchmarkRefresh.install_managed_drift(self)
+        ctx = self.mod.build_context(self.paths, NOW)
+        row = self.rows(ctx)["planner"]
+        ranked = self.mod.draft_ranking(ctx, row)
+        self.assertEqual((ranked[0][0]["model"], ranked[0][1]), ("gpt-6.1-sol", "alignment"))
+
+
+# Share the established benchmark fixtures without inheriting their tests.
+for _name in ("fetch_benchmarks", "context", "whole_home"):
+    setattr(TestDraftRecommendationPolicy, _name, getattr(TestBalancedBenchmarkRefresh, _name))
 
 
 if __name__ == "__main__":

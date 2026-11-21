@@ -6,6 +6,56 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — menu `p`: one numbered draft mapping table, accept all/some rows, repropose rows (model-live-refresh-c4)
+
+- **Draft table first.** Balanced menu `p` now runs
+  `copilot-model-refresh.py propose --review --draft`: after the normal
+  official pricing/capability refresh and the allowlisted third-party
+  fetch, ONE compact numbered table lists all ten routes (row number =
+  fixed route order) with current model/effort, a DRAFTED change or keep,
+  blended price change, short basis, alternatives count and status
+  (pinned/kept/draft/ACCEPTED/check). On a normal wide terminal it is a
+  column table (price/basis/status cells wrap; model cells never do); only
+  a terminal too narrow for that gets one block per row; colour/no-colour rules are unchanged. Every later step is
+  cache-only. The draft is a proposal only — nothing is selected.
+- **Draft ranking (versioned, among each route's already-gated options
+  only).** Alignment (same model back at the baseline effort/context);
+  then the ONLY option fresh third-party metrics at the route's exact
+  stated levels favour (none lower, no aggregator disagreement); then, only
+  when no comparable metric separates the two models, a documented official
+  differentiator at identical official rates (both tiers on long_context
+  routes, never imputed), else the cheapest >= 10% official saving,
+  labelled "Savings (price only)" — never a quality claim. Adverse/mixed
+  comparisons, several favoured options and documented advantages at
+  another price are never drafted automatically; they stay reachable via
+  `o`, labelled as tradeoffs. Gates, pins, the 10% rule and the current
+  fallback are unchanged.
+- **Commands.** `a` accept all draft changes; `a 1,3` accept only those
+  rows (other unaccepted drafts kept); `k 1,3` keep; `r 1,3` repropose
+  those rows with their next ranked candidate never shown before (`r`
+  repeats on the remembered rows; exhausted rows are kept with the reason;
+  no cycling); `o` / `o ROW` list alternatives, `o ROW.K` drafts one; `d`
+  details; `q`/Enter/EOF cancels (never accepts). New helper command
+  `draft --proposal-id ID --do CMD` (exit 5 = not accepted, nothing
+  changed).
+- **Checks only for accepted rows.** The existing `/model` availability and
+  exact-level questions now cover only ACCEPTED rows; an answer that rules
+  out a model re-drafts only the rows using it (back to the table for
+  re-acceptance) and keeps every other row and answer. The final view
+  offers exact `yes` (apply), `e` (edit the table again) or anything else
+  (cancel).
+- **Safety.** Proposal format 5 seals the draft state (ranking version,
+  phase, step counter, remembered rows, per-route decision/identity/basis/
+  shown history); it is strictly validated and re-derived on every
+  command, the sealed selection must equal the accepted rows, `apply`
+  refuses an unaccepted or still-pending draft, `select` refuses drafts,
+  older formats are refused. Nothing is written to routing, settings,
+  pins or availability files before the final `yes`. New machine line
+  `DRAFT<TAB>choose|verify|final|none<TAB>open<TAB>accepted` (no
+  `ALTERNATIVE` lines for drafts); `copilot-s` validates it per phase and
+  fails closed. The cost-led policy and the plain
+  preview/propose/select/review/apply contracts are unchanged.
+
 ### Changed — menu `p`: balanced options (nothing preselected), automatic third-party comparisons, compact colour overview (model-live-refresh-c3)
 
 - **Balanced policy (new default).** `copilot-model-refresh.py propose` /

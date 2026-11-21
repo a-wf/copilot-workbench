@@ -91,13 +91,15 @@ sessions may need a reload or restart.
   subagent route against the current official GitHub Copilot prices and the
   current official model capability pages (with a dated, sourced catalog
   as fallback), plus a short reviewed list of public third-party benchmark
-  comparison pages shown as reference only. Balanced by default: a compact,
-  colour-highlighted overview lists every route and numbered options
-  (cheaper ones, and others backed by an official differentiator or a
-  third-party comparison of that exact pair) with official prices and
-  cautions; **nothing is preselected**, you choose by number, and local
-  overrides are applied only after you type `yes`. The full report (all
-  models, rejected candidates, raw rates) is an optional details view.
+  comparison pages shown as reference only. Balanced by default: one
+  compact, colour-highlighted numbered **draft mapping** table of every
+  route (drafted change or keep, price change, short basis — alignment,
+  benchmark, documented advantage at the same price, or savings labelled
+  as price only); the draft is only a proposal — **nothing is selected**:
+  `a` accepts all, `a 1,3` only those rows, `k`/`r` keep or repropose rows,
+  `o` shows the other alternatives, and local overrides are applied only
+  after a final `yes`. The full report (all models, rejected candidates,
+  raw rates) is an optional details view.
   Shipped defaults and your own `/subagents` values are never overwritten.
 - **Automatic per-task usage reports** — every session exit appends
   token counts, model-call time, reasoning-effort intent, and an estimated
@@ -515,12 +517,18 @@ or partial, 130 interrupted.
 Menu option `p) Refresh subagent models from current prices` (also offered
 when there are no saved sessions — there, Enter still starts a new session
 and `p` returns to that menu instead of launching anything) runs
-`copilot-model-refresh.py propose --review` in the **balanced** policy (the
-default): nothing is changed or preselected automatically — you choose
-options by number. The legacy **cost-led** policy (the cheapest eligible
-saving of at least 10% proposed automatically, still applied only after
-`yes`) remains available with `COPILOT_MODEL_REFRESH_POLICY=cost-led` for
-`p`, or `--cost-led` on the helper.
+`copilot-model-refresh.py propose --review --draft` in the **balanced**
+policy (the default): it fetches the model list, prices and comparisons,
+then shows ONE numbered **draft mapping** table of every route — a draft
+is only a proposal; nothing is selected or applied until you accept rows
+and then type `yes`. The flow is: fetch → draft table → accept all / some
+rows, keep rows, or repropose rows (as often as you like, on the same rows)
+→ check only the accepted models in `/model` → final `yes` → the subagent
+models are updated. The legacy **cost-led** policy (the cheapest eligible
+saving of at least 10% proposed automatically, then numbered options,
+still applied only after `yes`) remains available with
+`COPILOT_MODEL_REFRESH_POLICY=cost-led` for `p`, or `--cost-led` on the
+helper.
 
 1. **Current prices.** It fetches the official
    [models and pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
@@ -557,13 +565,64 @@ saving of at least 10% proposed automatically, still applied only after
    `gpt-6.2-sol`). See [Third-party comparisons](#third-party-comparisons-in-menu-p)
    below for what is fetched, how it is parsed and its limits. They can
    make an option *visible*; they never choose, gate or apply anything.
-4. **Overview first.** The output starts with a compact, change-first
-   overview: the state of each source (official pricing, official docs,
-   third-party pages, your availability record, any blocking warning),
-   every one of the ten routes — the seven custom agents,
-   `coder (small/casual)`, `reviewer (stronger override)` and the built-in
-   `task` route — with its current model · effort · context, source and
-   whether it has options, then the **numbered options**. Each option shows
+4. **Draft table first.** The output starts with one line per source
+   (official pricing, official docs, third-party pages, your availability
+   record, any blocking warning) and then ONE compact numbered table of
+   all ten routes — the seven custom agents, `coder.small_casual`,
+   `reviewer.stronger` and the built-in `task` route; the row number is the
+   route's fixed position and never changes. Each row shows the current
+   model + effort (`long` = long_context tier), the **drafted** change or
+   `keep`, the blended $/1M change, a short **basis**, how many explicit
+   alternatives exist (`Opt`) and the status (pinned, kept with the
+   reason, `draft`, `ACCEPTED`, `check /model` when the model or level
+   still has to be confirmed after you accept it). A short "why" line per
+   drafted row and a legend follow. On a normal wide terminal (e.g. 140
+   columns) it is a column table whose price, basis and status cells wrap
+   onto a second line when needed (model cells never wrap or get cut);
+   only a terminal too narrow even for that shows one short block per row. Pinned and blocked routes stay in
+   the table as kept. The draft per route is the first of (only among the
+   route's offered options, so every gate below still applies):
+   - **Alignment** — the same model back at the route's shipped
+     effort/context (when they drifted);
+   - **Benchmark** — the ONLY option that fresh reviewed third-party
+     metrics measured at this route's exact reasoning levels (stated by
+     the source) score higher on at least one comparable metric and lower
+     on none, with no aggregator disagreement (reference only, never proof
+     of quality);
+   - when no such comparable metric separates the two models (true for
+     most routes today: the pages are measured at other or unstated
+     efforts, so they are context only): **Documented, same price** — an
+     official documented differentiator at identical official rates (both
+     tiers on long_context routes; no price is ever imputed; more
+     differentiators first, then model ID), otherwise **Savings (price
+     only)** — the cheapest option at least 10% cheaper on official rates,
+     a price fact and never a quality claim.
+
+   Options whose comparable metrics favour the current model (adverse) or
+   point both ways (mixed), several favoured options, and documented
+   advantages at a different price are never drafted automatically — you
+   reach them with `o` (labelled as tradeoffs; nothing is ever called best
+   quality). At the prompt:
+   - `a` accepts all draft changes; `a 1,3` accepts only rows 1 and 3 and
+     keeps the other draft rows unchanged (rows you accepted earlier stay
+     accepted);
+   - `k 1,3` keeps those rows unchanged;
+   - `r 1,3` reproposes only rows 1 and 3 with their next ranked candidate
+     never shown before and remembers them; `r` alone reproposes the same
+     rows again. There is no cycling: when a row has no further ranked
+     candidate it is kept and the table says so (`o ROW` still lists the
+     other options with their tradeoffs);
+   - `o` lists every route's alternatives as `ROW.K` (price, why offered,
+     third-party summary, what is still to confirm), `o 3` one row with
+     its third-party sources, `o 3.2` drafts that alternative for row 3
+     (still only a draft until you accept it);
+   - `d` shows the full details view; `q`, Enter or Ctrl-D cancels (never
+     an acceptance). A command that is not valid changes nothing and you
+     are asked again.
+
+   The longer per-option view below is what `o` and the details view show.
+   (In the cost-led policy the overview instead lists the **numbered
+   options** after the routes.) Each option shows
    current → option, the blended price change in $ and % (and above the
    long-context threshold), the exact official rates of both models (input,
    cached input, cache write, output; long-context tier rates), why it is
@@ -600,10 +659,11 @@ saving of at least 10% proposed automatically, still applied only after
    **drift** line, and when the current model passes every gate at the
    baseline values a same-model **alignment** option corrects it (selected,
    checked and confirmed like any other option). Nothing is
-   preselected and no recommendation is implied: at the prompt you type
-   option numbers (at most one per route), `d` for the details view, or
-   Enter for none (every route keeps its model). Pinned routes and routes
-   with an unknown current price get no options.
+   preselected and no quality recommendation is implied (the draft
+   table's ranking above only decides which option is drafted first). In
+   the cost-led policy you type option numbers (at most one per route), `d`
+   for the details view, or Enter for none. Pinned routes and routes with
+   an unknown current price get no options.
 6. **Details view (optional).** `d` at the prompt, `copilot-model-refresh.py
    details [--proposal-id ID]` or `propose/preview --details` prints the
    full report: for each route the reason and evidence for every
@@ -627,13 +687,14 @@ saving of at least 10% proposed automatically, still applied only after
    request, no lock, nothing written, the pending proposal untouched (with
    `--proposal-id` it uses that proposal's sealed policy, answers and
    selection read-only and says whether its numbers still match).
-7. **Check YOUR selected models in `/model`.** `copilot-s` runs the helper in
+7. **Check YOUR accepted models in `/model`.** `copilot-s` runs the helper in
    review mode: an option blocked *only* by availability or an exact
-   reasoning level you have not verified is still offered, marked
-   "still to confirm" (every other gate below still applies) — and you are
-   asked about it only if you select it.
-   After your selection it lists each selected (or, in the cost-led policy,
-   proposed) model once — its route(s), the exact reasoning
+   reasoning level you have not verified is still offered (and may be
+   drafted), marked "check /model" / "still to confirm" (every other gate
+   below still applies) — and you are asked about it only once you accept
+   its row (cost-led: select it).
+   After you accept the table it lists each accepted (or, in the cost-led
+   policy, proposed/selected) model once — its route(s), the exact reasoning
    level(s) it needs, blended price and why — and asks **"Are all these
    proposed models available in /model? [y/N]"**. On No you type only the
    unavailable IDs from that list (spaces/commas; anything else is
@@ -643,24 +704,31 @@ saving of at least 10% proposed automatically, still applied only after
    (No = that model is not used where the level is needed; never
    downgraded). The helper then recomputes the mapping from the same frozen
    prices and evidence (an unavailable model is excluded for the rest of
-   that run, even if an older record lists it) and asks again only about
-   new proposals, until nothing is pending; if no replacement remains, every
-   route keeps its model. If an answer removes one of your selections, the
-   renumbered options are offered again (at most three selection rounds;
-   numbers entered then replace the whole selection, Enter keeps what is
-   left). Your answers live only inside the sealed proposal
+   that run, even if an older record lists it). In the draft table, ONLY
+   the rows using a model you ruled out (or a level you said is not
+   offered) are re-drafted with their next ranked candidate (or kept when
+   none is left), marked revised, and the table is shown again so you
+   accept them again before they are checked; every other row — drafted,
+   kept or accepted — and every answer you gave stays as it was. (Cost-led:
+   if an answer removes one of your selections, the renumbered options are
+   offered again, at most three selection rounds.) Your answers live only inside the sealed proposal
    for that run — never in `verified-models.json`, `user-config.json` or
    any routing file — and a tentative proposal can never be applied. To
    save a `/model` record for later runs instead, run
    `copilot-model-refresh.py record-verified` (interactive; saved to
    `~/.copilot/model-refresh/verified-models.json`, dated, valid 30 days,
    only after you type `yes`).
-8. **Confirm.** Only a fully checked proposal is offered, and changes are
-   applied only after you type exactly `yes` (anything else, Enter, or EOF
-   cancels). The proposal is frozen with
+8. **Confirm.** Only an accepted, fully checked table is offered: the
+   final view shows the accepted table and the effective routing IF you
+   type yes. Changes are applied only after you type exactly `yes`; `e`
+   returns to the table to edit it (withdraw a row with `k`, repropose with
+   `r`, accept again), anything else, Enter, or EOF cancels. The proposal is frozen with
    digests of everything it read plus an evidence digest (including the
-   policy and the third-party comparison cache and registry); `apply` (and
-   `select`/`review`) re-derive every decision from the cached evidence —
+   policy and the third-party comparison cache and registry) and the sealed
+   draft table (each row's decision, drafted model/effort/context, basis,
+   every candidate already shown, the remembered rows, the phase and the
+   ranking version); `apply` (and `select`/`review`/`draft`) re-derive every
+   decision from the cached evidence —
    never re-fetching — and refuse, changing nothing, if `settings.json`,
    the refresh state, your user config or verified record, the routing
    defaults, the catalog, the capability evidence or third-party
@@ -670,7 +738,9 @@ saving of at least 10% proposed automatically, still applied only after
    15 min (measured from its real creation; a future-dated or extended
    proposal is refused), was altered (proposals are sealed with a private
    key in `~/.copilot/model-refresh/.proposal-key`), was made by an older
-   version, or was already applied. Every outcome — applied, cancelled,
+   version, was already applied, or — for a draft — has a row that is not
+   accepted yet, an accepted model still to check, or a draft row that does
+   not match the re-derivation. Every outcome — applied, cancelled,
    no changes, failed — prints the final effective routing (after a failure
    via `status`; if even that cannot read its inputs, an explicit
    "unavailable" message instead of a guessed table) and waits for Enter
@@ -852,7 +922,12 @@ copies only) prints machine lines
 `REVIEW<TAB>pending|complete` and `SELECTED<TAB>count`, and `review
 --proposal-id ID (--available-all | --unavailable IDS) [--level
 MODEL:EFFORT=yes|no ...]` answers them (a proposal with anything pending is
-never applicable); `select --proposal-id ID --choose 1,2` chooses options
+never applicable); `propose --review --draft` (balanced only) prints the
+draft table with `DRAFT<TAB>choose|verify|final|none<TAB>open<TAB>accepted`
+instead of `ALTERNATIVE` lines, and `draft --proposal-id ID --do 'a 1,3'`
+(also `a`, `k ROWS`, `r [ROWS]`, `o [ROW[.K]]`, `e`) changes it (new id;
+exit 5 = command not accepted, nothing changed), with `review`/`apply` as
+above; `select --proposal-id ID --choose 1,2` chooses options
 (it replaces any earlier selection of that proposal; new id); `details
 [--proposal-id ID] [--cost-led]` is the read-only full report;
 `record-verified` is interactive and refuses to run without a terminal.
@@ -1849,7 +1924,7 @@ Verify the pipeline is loaded:
 | Legacy company fixed per-request policy (inactive) | `~/.copilot/task-reports/request-pricing.json` | copied from `config/request-pricing.json` on first install (only if absent); unused |
 | Executables install prefix | `scripts/install.sh --prefix DIR` | `~/.local/bin` |
 | Install method | `scripts/install.sh --copy` | symlink |
-| Subagent model refresh (menu `p`) | `copilot-model-refresh.py` (+ `copilot_model_benchmarks.py` next to it); state, backups, capability and third-party comparison caches, your `user-config.json` and `verified-models.json` (recorded with `copilot-model-refresh.py record-verified`) in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated fallback catalog `~/.copilot/model-role-catalog.json`; `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` / `COPILOT_MODEL_REFRESH_BENCHMARKS_FETCH=0` stop the capability-page / third-party fetch; `COPILOT_MODEL_REFRESH_POLICY=cost-led` restores the legacy cost-led `p`; `NO_COLOR` disables colour | balanced: no overrides, nothing preselected; options need your verified availability list or your answer for the model you select |
+| Subagent model refresh (menu `p`) | `copilot-model-refresh.py` (+ `copilot_model_benchmarks.py` next to it); state, backups, capability and third-party comparison caches, your `user-config.json` and `verified-models.json` (recorded with `copilot-model-refresh.py record-verified`) in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated fallback catalog `~/.copilot/model-role-catalog.json`; `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` / `COPILOT_MODEL_REFRESH_BENCHMARKS_FETCH=0` stop the capability-page / third-party fetch; `COPILOT_MODEL_REFRESH_POLICY=cost-led` restores the legacy cost-led `p`; `NO_COLOR` disables colour | balanced: no overrides, a draft table with nothing selected; accepted rows need your verified availability list or your answer for the accepted model |
 | Model refresh helper path | `COPILOT_MODEL_REFRESH_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-model-refresh.py` |
 | Per-launch session reports | `COPILOT_SESSION_REPORTS_DIR` env var | `~/.copilot/session-reports` (never pruned automatically) |
 | Session report helper path | `COPILOT_SESSION_REPORT_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-session-report.py` |
