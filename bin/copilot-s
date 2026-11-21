@@ -1809,12 +1809,18 @@ purge_session_quarantine() {
 }
 
 # --- Subagent model refresh (menu option p) ---
-# Fetches CURRENT official GitHub Copilot prices via copilot-model-refresh.py,
-# shows the current/proposed routing table, and applies the frozen proposal
-# only after an exact `yes` (default No). The helper refuses to apply if any
-# input changed since the table was shown. Every outcome (applied, cancelled,
-# no changes, offline/failed) prints the final effective routing and waits for
-# Enter, then the caller returns to the menu — never launches `copilot`.
+# Fetches CURRENT official GitHub Copilot prices and the official model
+# capability pages via copilot-model-refresh.py, shows every model in view,
+# the current/proposed routing table and any OPTIONAL alternatives, and
+# applies the frozen proposal only after an exact `yes` (default No). The
+# helper refuses to apply if any input or evidence changed since the table was
+# shown. Optional steps, each skipped by Enter: `v` records what you verified
+# in Copilot CLI's /model picker (the helper saves it only after its own exact
+# `yes`, then the proposal is re-evaluated once), and choosing optional
+# alternatives by number (never pre-selected; they still need the final
+# `yes`). Every outcome (applied, cancelled, no changes, offline/failed)
+# prints the final effective routing and waits for Enter, then the caller
+# returns to the menu — never launches `copilot`.
 pause_for_menu() {
   local _ignored=""
   echo -ne "${DIM}Press Enter to return to the menu...${RESET}"
@@ -1834,6 +1840,50 @@ show_model_routing_status() {
   return 0
 }
 
+# Runs one helper command that may emit machine lines, prints every other
+# line, and records the machine lines in MR_* globals. Returns the helper's
+# exit status.
+MR_PROPOSAL_ID=""
+MR_VERIFY=false
+MR_ALTERNATIVES=()
+run_model_refresh_helper() {
+  local out="" rc=0 line tab=$'\t' rest
+  MR_PROPOSAL_ID=""
+  MR_VERIFY=false
+  MR_ALTERNATIVES=()
+  out=$(python3 "$MODEL_REFRESH_HELPER" "$@") || rc=$?
+  while IFS= read -r line; do
+    if [[ "$line" == "PROPOSAL${tab}"* ]]; then
+      MR_PROPOSAL_ID="${line#"PROPOSAL${tab}"}"
+    elif [[ "$line" == "ALTERNATIVE${tab}"* ]]; then
+      rest="${line#"ALTERNATIVE${tab}"}"
+      if [[ "${rest%%"${tab}"*}" =~ ^[0-9]{1,3}$ ]]; then
+        MR_ALTERNATIVES+=("${rest%%"${tab}"*}")
+      fi
+    elif [[ "$line" == "VERIFY${tab}needed" ]]; then
+      MR_VERIFY=true
+    else
+      echo "$line"
+    fi
+  done <<< "$out"
+  return "$rc"
+}
+
+# 0 = the selection is a comma-separated list of offered alternative numbers.
+model_refresh_selection_valid() {
+  local selection="$1" n found alt
+  [[ "$selection" =~ ^[0-9]{1,3}(,[0-9]{1,3})*$ ]] || return 1
+  local IFS=','
+  for n in $selection; do
+    found=false
+    for alt in "${MR_ALTERNATIVES[@]}"; do
+      [[ "$alt" == "$n" ]] && found=true
+    done
+    [[ "$found" == "true" ]] || return 1
+  done
+  return 0
+}
+
 refresh_model_routing() {
   if [[ ! -f "$MODEL_REFRESH_HELPER" ]]; then
     echo -e "${RED}Model refresh helper not found at $MODEL_REFRESH_HELPER — subagent routing unchanged. Set COPILOT_MODEL_REFRESH_HELPER or re-run the installer.${RESET}" >&2
@@ -1846,39 +1896,93 @@ refresh_model_routing() {
     return 0
   fi
 
-  echo -e "\n${CYAN}Fetching current official GitHub Copilot prices...${RESET}"
-  local out="" rc=0 line proposal_id="" tab=$'\t'
-  out=$(python3 "$MODEL_REFRESH_HELPER" propose) || rc=$?
+  echo -e "\n${CYAN}Fetching current official GitHub Copilot prices and model capability docs...${RESET}"
+  local rc=0 proposal_id="" answer="" selection="" select_rc=0 has_alternatives=false selected=false
+  run_model_refresh_helper propose || rc=$?
   echo ""
-  while IFS= read -r line; do
-    if [[ "$line" == "PROPOSAL${tab}"* ]]; then
-      proposal_id="${line#"PROPOSAL${tab}"}"
-    else
-      echo "$line"
-    fi
-  done <<< "$out"
 
-  if [[ $rc -eq 3 ]]; then
+  # Optional, once: record what you verified in /model, then re-evaluate.
+  if [[ "$MR_VERIFY" == "true" ]] && [[ $rc -eq 0 || $rc -eq 3 ]]; then
+    echo -ne "${YELLOW}Type 'v' to record the models/reasoning levels you verified in Copilot CLI's /model picker (Enter skips): ${RESET}"
+    prompt_read answer
+    if [[ "$answer" == "v" || "$answer" == "V" ]]; then
+      local record_rc=0
+      python3 "$MODEL_REFRESH_HELPER" record-verified < /dev/tty || record_rc=$?
+      if [[ $record_rc -eq 0 ]]; then
+        if [[ "$MR_PROPOSAL_ID" =~ ^[0-9a-f]{16}$ ]]; then
+          python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$MR_PROPOSAL_ID" >/dev/null 2>&1 || true
+        fi
+        echo -e "\n${CYAN}Re-evaluating with your new record...${RESET}"
+        rc=0
+        run_model_refresh_helper propose || rc=$?
+        echo ""
+      else
+        echo -e "${DIM}Nothing was recorded; continuing with the evaluation above.${RESET}"
+      fi
+    fi
+  fi
+
+  proposal_id="$MR_PROPOSAL_ID"
+  [[ ${#MR_ALTERNATIVES[@]} -gt 0 ]] && has_alternatives=true
+
+  if [[ $rc -eq 3 && "$has_alternatives" != "true" ]]; then
     : # No changes: the helper already printed the final (kept) routing.
-  elif [[ $rc -ne 0 ]]; then
+  elif [[ $rc -ne 0 && $rc -ne 3 ]]; then
     echo -e "${RED}Model refresh did not complete (exit $rc) — subagent routing unchanged.${RESET}" >&2
     show_model_routing_status
   elif [[ ! "$proposal_id" =~ ^[0-9a-f]{16}$ ]]; then
     echo -e "${RED}Model refresh returned no valid proposal — subagent routing unchanged.${RESET}" >&2
     show_model_routing_status
   else
-    echo ""
-    echo -ne "${YELLOW}Type 'yes' to apply these subagent routing changes (categorical fit, not measured quality; anything else cancels): ${RESET}"
-    local confirm="" apply_rc=0
-    prompt_read confirm
-    if [[ "$confirm" == "yes" ]]; then
-      python3 "$MODEL_REFRESH_HELPER" apply --proposal-id "$proposal_id" || apply_rc=$?
-      if [[ $apply_rc -ne 0 ]]; then
-        echo -e "${RED}Apply did not complete (exit $apply_rc) — see the message above; current routing:${RESET}" >&2
-        show_model_routing_status
+    # Optional alternatives: never pre-selected; Enter keeps none.
+    if [[ "$has_alternatives" == "true" ]]; then
+      local offered="" alt_n
+      for alt_n in "${MR_ALTERNATIVES[@]}"; do
+        offered+="${offered:+, }#$alt_n"
+      done
+      echo -ne "${YELLOW}Optional alternatives ${offered} (some may cost more; never chosen automatically). Enter numbers to include (e.g. 1 or 1,2), or Enter for none: ${RESET}"
+      selection=""
+      prompt_read selection
+      selection="${selection// /}"
+      if [[ -n "$selection" ]]; then
+        if model_refresh_selection_valid "$selection"; then
+          select_rc=0
+          run_model_refresh_helper select --proposal-id "$proposal_id" --choose "$selection" || select_rc=$?
+          if [[ $select_rc -ne 0 || ! "$MR_PROPOSAL_ID" =~ ^[0-9a-f]{16}$ ]]; then
+            echo -e "${RED}Selecting the alternatives did not complete (exit $select_rc) — nothing was applied.${RESET}" >&2
+            python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" >/dev/null 2>&1 || true
+            show_model_routing_status
+            echo ""
+            pause_for_menu
+            return 0
+          fi
+          proposal_id="$MR_PROPOSAL_ID"
+          selected=true
+        else
+          echo -e "${DIM}Not a list of offered numbers — no alternative was selected.${RESET}"
+        fi
       fi
-    else
+    fi
+    if [[ $rc -eq 3 && "$selected" != "true" ]]; then
+      # Nothing proposed by default and nothing selected: drop the no-op proposal.
       python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" || true
+    else
+      echo ""
+      if [[ "$selected" == "true" ]]; then
+        echo -e "${YELLOW}This includes the optional alternatives YOU selected (see their price impact above).${RESET}"
+      fi
+      echo -ne "${YELLOW}Type 'yes' to apply these subagent routing changes (categorical fit, not measured quality; anything else cancels): ${RESET}"
+      local confirm="" apply_rc=0
+      prompt_read confirm
+      if [[ "$confirm" == "yes" ]]; then
+        python3 "$MODEL_REFRESH_HELPER" apply --proposal-id "$proposal_id" || apply_rc=$?
+        if [[ $apply_rc -ne 0 ]]; then
+          echo -e "${RED}Apply did not complete (exit $apply_rc) — see the message above; current routing:${RESET}" >&2
+          show_model_routing_status
+        fi
+      else
+        python3 "$MODEL_REFRESH_HELPER" discard --proposal-id "$proposal_id" || true
+      fi
     fi
   fi
   echo ""
@@ -2257,11 +2361,19 @@ ${BOLD}Features:${RESET}
     copilot-session-cleanup.py purge-list | purge-preview --batch <batch>
       | purge --batch <batch>   (same for copilot-report-cleanup.py)
   - Refresh subagent models (menu \`p\`, also offered when there are no
-    sessions): fetches the CURRENT official GitHub Copilot prices, shows
-    the current vs proposed model/effort/context per subagent route with
-    rates, reasons and evidence, and applies local overrides only after
-    you type \`yes\` (default No). Shipped defaults are never edited; your
-    own /subagents values are never overwritten. Undo with:
+    sessions): fetches the CURRENT official GitHub Copilot prices and the
+    official model capability pages (fixed docs.github.com URLs; cached,
+    dated evidence — stale or unrecognized evidence never authorizes a
+    change), lists every model in view with price, documented capabilities
+    and whether YOU verified it as available, shows the current vs proposed
+    model/effort/context per subagent route with rates, reasons and
+    evidence, and applies local overrides only after you type \`yes\`
+    (default No). Optional, each skipped with Enter: \`v\` records the
+    models/reasoning levels you verified in the Copilot CLI /model picker
+    (saved only after its own \`yes\`), and numbered optional alternatives
+    (possibly more expensive, with a documented differentiator) that are
+    never pre-selected. Shipped defaults are never edited; your own
+    /subagents values are never overwritten. Undo with:
     copilot-model-refresh.py reset --yes
   - Prompts to keep/rename/delete a session when \`copilot\` exits
   - For sessions created by copilot-s from now on: shows the context fill
@@ -2299,6 +2411,7 @@ ${BOLD}Environment:${RESET}
   COPILOT_SESSION_CLEANUP_HELPER Override the path to copilot-session-cleanup.py
   COPILOT_REPORT_CLEANUP_HELPER  Override the path to copilot-report-cleanup.py
   COPILOT_MODEL_REFRESH_HELPER   Override the path to copilot-model-refresh.py
+  COPILOT_MODEL_REFRESH_DOCS_FETCH  Set to 0 to stop menu p fetching the capability docs (cached copy only)
   COPILOT_SESSION_REPORT_HELPER  Override the path to copilot-session-report.py
   COPILOT_SESSION_REPORTS_DIR    Override where per-launch run records are kept
   COPILOT_S_RTK_PLUGIN_DIR       Override the RTK hook plugin directory (absolute)

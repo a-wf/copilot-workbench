@@ -88,11 +88,14 @@ sessions may need a reload or restart.
   delete Copilot CLI sessions across every directory, not just the one
   you're in, plus a recoverable cleanup of empty, never-used sessions.
 - **Subagent model refresh** (`copilot-s` menu `p`) — compares each
-  subagent route against the current official GitHub Copilot prices and a
-  dated, sourced catalog of official model categories, shows the
-  current/proposed table with reasons, and applies local overrides only
-  after you type `yes`; shipped defaults and your own `/subagents` values
-  are never overwritten.
+  subagent route against the current official GitHub Copilot prices and the
+  current official model capability pages (with a dated, sourced catalog
+  as fallback), lists every model in view with its documented facts and
+  whether you verified it, shows the current/proposed table with reasons
+  plus optional (possibly more expensive) alternatives that have a
+  documented differentiator, and applies local overrides only after you
+  type `yes`; shipped defaults and your own `/subagents` values are never
+  overwritten.
 - **Automatic per-task usage reports** — every session exit appends
   token counts, model-call time, reasoning-effort intent, and an estimated
   USD cost to a cumulative Markdown report for the task associated with
@@ -517,46 +520,115 @@ and `p` returns to that menu instead of launching anything) runs
    the 24h TTL and the 1h failure backoff; a snapshot fetched under 5 min ago
    is reused). On failure (offline, parse error) the last valid snapshot is
    shown, but nothing is proposed unless it is under 24h old.
-2. **Table.** For each of the ten routes — the seven custom agents,
+2. **Current capabilities.** In the same run it fetches the official
+   [supported models](https://docs.github.com/en/copilot/reference/ai-models/supported-models)
+   page (model list, 1M-context / configurable-reasoning table, per-client
+   table incl. Copilot CLI) and the
+   [model comparison](https://docs.github.com/en/copilot/reference/ai-models/model-comparison)
+   ("Recommended models by task": task area, "Excels at"). Only those two
+   fixed docs.github.com URLs are requested (HTTPS, certificate checks on,
+   redirects refused, size/time bounded, no cookies or credentials; a
+   verified system-curl fallback only after a Python certificate error).
+   A strict, versioned parser turns them into a dated evidence snapshot
+   (`~/.copilot/model-refresh/capability-evidence.json`, with URL, fetch
+   time, content digest and parser version), reused for 5 min and usable
+   for 3 days (supported models) / 7 days (comparison). A changed page
+   layout, a missing column, conflicting rows or an unknown cell value
+   becomes **unknown** with a warning — never a guess — and a failed fetch
+   shows the last valid copy with its age; stale or unknown evidence never
+   authorizes a change. Per model and field, fresh official evidence is
+   used first and the dated catalog is the fallback. Disable the fetch with
+   `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` (or `--offline`).
+3. **Table.** For each of the ten routes — the seven custom agents,
    `coder (small/casual)`, `reviewer (stronger override)`, and the built-in
    `task` route — it shows the current model · effort · context and its
    source (shipped default / managed override / your pin), the proposal,
    official input / cached / cache-write / output rates per 1M tokens
    (plus long-context tier rates), the snapshot id and cache age, and the
-   reason and evidence for every keep/change decision. Priced models that
-   the catalog has not assessed are listed but never assigned; models new
-   since your last refresh are flagged.
-3. **Confirm.** Changes are applied only after you type exactly `yes`
+   reason and evidence for every keep/change decision. **All models in
+   view** — the union of the official pricing, the official capability
+   pages, the catalog, your verified records and the current routes,
+   including unpriced or undocumented ones as *unknown* — are listed with
+   price, task area, 1M context, configurable reasoning, Copilot CLI
+   support, where each fact comes from, and your availability (verified /
+   not verified / not in your complete `/model` list). This is not your
+   account's model list: Copilot CLI documents no programmatic per-account
+   listing, so availability is only what you verified. A model missing from
+   the static catalog (for example GPT-6.2 Sol when the official pages list
+   it) is assessed from the current official pages when they document its
+   task area, Category, capabilities and CLI support; otherwise it is
+   listed as unassessed and never assigned. Models new since your last
+   refresh are flagged.
+4. **Optional: record what you verified (`v`).** When replacements are
+   blocked only by availability or reasoning levels you have not verified,
+   `copilot-s` offers `v` (Enter skips). You type the model IDs you can
+   select in Copilot CLI's `/model` picker, whether that is the complete
+   list, and — only for models your routes need — the reasoning levels the
+   picker shows for each. Nothing is saved unless you type `yes`; it goes to
+   `~/.copilot/model-refresh/verified-models.json` (dated, valid 30 days;
+   `user-config.json` is never written), and the proposal is re-evaluated
+   once. Levels you do not re-enter keep their original date (never
+   silently renewed).
+5. **Optional alternatives.** Besides the cost-saving proposals (rule
+   unchanged: at least 10% cheaper), a route can list numbered optional
+   alternatives: models that pass every gate below, are in the route's
+   official task area, are *not* at least 10% cheaper (they may cost the
+   same or more), and have a concrete documented differentiator versus the
+   current model — e.g. listed as included for Copilot CLI in the official
+   per-client table when the current model is not listed there. A higher
+   Category, a newer version or a higher price is never a differentiator;
+   such models are shown as "considered" with the reason. Each alternative
+   shows the blended price change in $ and % (and above the long-context
+   threshold), the differentiator and its source, the official "Excels at"
+   text labelled as the vendor's description, and its limits — no measured,
+   equal or better quality claim. None is pre-selected: you may type their
+   numbers (Enter = none); a selected alternative replaces that route's
+   cost-saving change and still needs the final `yes`. Pinned routes and
+   routes with an unknown current price get none.
+6. **Confirm.** Changes are applied only after you type exactly `yes`
    (anything else, Enter, or EOF cancels). The proposal is frozen with
-   digests of everything it read; `apply` refuses and changes nothing if
-   `settings.json`, the refresh state, your user config, the routing
-   defaults, the catalog, or the generated files changed in between, or if
-   the proposal is older than 15 min. Every outcome — applied, cancelled,
+   digests of everything it read plus an evidence digest; `apply` (and
+   `select`) re-derive every decision from the cached evidence and refuse,
+   changing nothing, if `settings.json`, the refresh state, your user
+   config or verified record, the routing defaults, the catalog, the
+   capability evidence (or its freshness), the pricing snapshot or the
+   generated files changed in between (the digests cover the parsed prices
+   and capability values themselves), if the proposal is older than
+   15 min (measured from its real creation; a future-dated or extended
+   proposal is refused), was altered (proposals are sealed with a private
+   key in `~/.copilot/model-refresh/.proposal-key`), was made by an older
+   version, or was already applied. Every outcome — applied, cancelled,
    no changes, failed — prints the final effective routing (after a failure
    via `status`; if even that cannot read its inputs, an explicit
    "unavailable" message instead of a guessed table) and waits for Enter
    before returning to the menu.
 
 **How a replacement is chosen (categorical fit, not a quality score).**
-`config/model-role-catalog.json` is a small, dated registry (reviewed
-2026-11-16, expires 2027-02-14) transcribed from GitHub's official docs: the
-pricing page's *Category* (Lightweight / Versatile / Powerful), the model
-comparison's *Task area*, the supported-models page's 1M-context and
-configurable-reasoning support, and its per-client Copilot CLI column. The
-shipped routes stay the baseline. A route is changed only when it is not
-pinned and a candidate:
+The facts are the official pricing page's *Category* (Lightweight /
+Versatile / Powerful), the model comparison's *Task area*, the
+supported-models page's 1M-context and configurable-reasoning support, and
+its per-client Copilot CLI column — read live as above, with
+`config/model-role-catalog.json` (a small, dated registry transcribed from
+the same pages; reviewed 2026-11-16, expires 2027-02-14) as the fallback
+when a page is unavailable or stale. A live value that differs from the
+shipped catalog is shown as a change; one that contradicts your local
+overlay blocks that model until you re-vet it. The shipped routes stay the
+baseline. A route is changed only when it is not pinned and a candidate:
 
 - has the same official task area as the route's shipped baseline model and
   a Category at least as high, configurable reasoning, 1M-context support if
   the route uses `long_context`, and is listed as included for Copilot CLI;
-- still shows the catalogued Category in the live pricing (otherwise it
-  needs re-review) and the catalog entry has not expired;
-- is in **your verified availability list** — Copilot CLI documents no
-  programmatic model catalog, so availability under your plan and
-  organization policy is never assumed from the pricing page;
+- when any of its facts come from the catalog: still shows the catalogued
+  Category in the live pricing (otherwise it needs re-review) and the
+  catalog entry has not expired;
+- is in **your verified availability list** (`user-config.json` and/or
+  the list recorded with `v`) — Copilot CLI documents no programmatic model
+  catalog, so availability under your plan and organization policy is
+  never assumed from the pricing or supported-models pages;
 - has the route's **specific reasoning level** (e.g. `high`, `xhigh`)
   verified for that model — either a source-backed `reasoning_levels` entry
-  in the catalog or your own dated `verified_capabilities` record. The
+  in the catalog or your own dated record (`verified_capabilities` or
+  levels recorded with `v`). The
   official docs only say reasoning is "configurable" and that levels vary
   per model (Copilot CLI shows them only in the interactive `/model`
   picker), so the shipped catalog lists no levels and an unknown level
@@ -678,6 +750,22 @@ wrote (your pins stay). An interrupted apply is rolled back on the next run
 only when its journal is fully valid (known targets, backups inside the
 tool's own backups folder that still match); otherwise nothing is restored
 or deleted and the output explains how to recover by hand.
+
+**Evidence limits, privacy.** The official pages say *whether* a model has
+configurable reasoning, not which levels; which models and levels YOU can
+use is visible only in Copilot CLI's interactive `/model` picker (no
+documented programmatic listing), so availability and levels are never
+claimed automatically — only from what you record. Fit is categorical: no
+output claims measured, equal or better quality, and the blended price
+impact is an assumption, not your bill. The capability fetch sends only a
+plain GET for the two fixed public URLs (no credentials, cookies, model
+usage or local data); remote text is sanitized, shown only in the
+terminal, and never written into the generated instruction or settings.
+Scripted use: `copilot-model-refresh.py propose` prints machine lines
+`PROPOSAL<TAB>id`, `ALTERNATIVE<TAB>n<TAB>route<TAB>model` and
+`VERIFY<TAB>needed`; `select --proposal-id ID --choose 1,2` adds chosen
+alternatives (new id); `record-verified` is interactive and refuses to run
+without a terminal.
 
 ### Context metrics (new copilot-s sessions only)
 
@@ -1562,7 +1650,7 @@ Verify the pipeline is loaded:
 | Legacy company fixed per-request policy (inactive) | `~/.copilot/task-reports/request-pricing.json` | copied from `config/request-pricing.json` on first install (only if absent); unused |
 | Executables install prefix | `scripts/install.sh --prefix DIR` | `~/.local/bin` |
 | Install method | `scripts/install.sh --copy` | symlink |
-| Subagent model refresh (menu `p`) | `copilot-model-refresh.py`; state, backups and your `user-config.json` in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated catalog `~/.copilot/model-role-catalog.json` | no overrides; replacements need your verified `available_models` list |
+| Subagent model refresh (menu `p`) | `copilot-model-refresh.py`; state, backups, capability evidence cache, your `user-config.json` and `verified-models.json` (recorded with `v`) in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated fallback catalog `~/.copilot/model-role-catalog.json`; `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` stops the capability-page fetch | no overrides; replacements need your verified availability list |
 | Model refresh helper path | `COPILOT_MODEL_REFRESH_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-model-refresh.py` |
 | Per-launch session reports | `COPILOT_SESSION_REPORTS_DIR` env var | `~/.copilot/session-reports` (never pruned automatically) |
 | Session report helper path | `COPILOT_SESSION_REPORT_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-session-report.py` |

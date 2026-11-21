@@ -6,6 +6,75 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Added — live official model capabilities, full model list and optional alternatives in menu `p` (model-live-refresh-c1)
+
+- `copilot-model-refresh.py` now fetches, in the same run as the price
+  refresh, the official `supported-models` (model list, 1M-context /
+  configurable-reasoning table, per-client table) and `model-comparison`
+  ("Recommended models by task") pages from two fixed docs.github.com
+  article-body URLs: stdlib HTTPS GET with certificate verification,
+  every redirect refused, 10 s / 20 s / 2 MB bounds, and a verified
+  system-curl fallback only after a Python certificate-verification error.
+  A strict, versioned table parser (octicon `aria-label`s, footnote and
+  markup stripping, character allowlist) produces a dated evidence snapshot
+  in `model-refresh/capability-evidence.json` (URL, fetch time, content
+  SHA-256, parser version; reused 5 min, usable 3 days / 7 days). Layout
+  changes, missing columns, conflicting rows or unknown values become
+  unknown with a warning; failed fetches keep the last valid copy; stale
+  or unknown evidence never authorizes a change. Disable with
+  `COPILOT_MODEL_REFRESH_DOCS_FETCH=0`, `COPILOT_TASK_REPORT_PRICING_FETCH=0`
+  or `--offline`; an injected pricing test transport without a capability
+  transport never causes live traffic (`CAPABILITY_FETCHER` hook).
+- Per model and field, fresh official evidence is used first and the dated
+  catalog (`config/model-role-catalog.json`, now documented as fallback,
+  not allowlist) second. A live value differing from the shipped catalog is
+  shown as a note; one contradicting the local overlay fails closed. Models
+  absent from the static catalog (e.g. GPT-6.2 Sol) are assessed from the
+  live pages when they document every needed fact. An expired shipped
+  catalog no longer blocks all routes when every live section is fresh.
+- New "All models in view" section: union of pricing, live pages, catalog,
+  your verified records and current routes, including unpriced or
+  undocumented models as unknown, with price, task area, 1M context,
+  reasoning, Copilot CLI support, evidence basis, NEW/not-in-catalog tags
+  and your availability (verified / not verified / not in your complete
+  list). It states explicitly that it is not your account's model list.
+- Optional alternatives per route: eligible, same official task area, not
+  ≥ 10% cheaper, and only with a concrete documented differentiator versus
+  the current model (Copilot CLI listing, route task area, 1M context on
+  long_context routes, configurable reasoning — never Category, newness or
+  price). Shown with $ and % blended price change (both tiers on
+  long_context routes), source, the official "Excels at" text labelled as
+  the vendor's description, and limits. Same-task-area models that are not
+  offered are listed with the reason. The cost-led 10% rule is unchanged.
+- New subcommands: `select --proposal-id ID --choose N[,N]` (re-derives
+  everything cache-only and writes a new frozen proposal including the
+  chosen alternatives; one per route, replacing that route's cost-led
+  change) and `record-verified` (interactive, terminal only: model IDs,
+  complete/partial, and reasoning levels you saw in `/model`; saved to
+  `model-refresh/verified-models.json` only after an exact `yes`; levels
+  not re-entered keep their original date; `user-config.json` is never
+  written). Availability = any fresh list (user-config or recorded);
+  same-date level disagreements are unknown.
+- `propose` machine lines: `ALTERNATIVE<TAB>n<TAB>route<TAB>model` and
+  `VERIFY<TAB>needed`; with alternatives but no default change it exits 3
+  and still prints a `PROPOSAL` id for an explicit selection. Proposals are
+  format 2 with digests of the verified record, capability evidence and
+  pricing snapshot plus an evidence digest; `select`/`apply` refuse on any
+  change, an older-format proposal, overrides that differ from the
+  re-derivation (tampering) or an already-applied id (replay). The capability
+  and pricing digests bind the parsed evidence itself (every section, model
+  and rate), not only source ids. Proposals are sealed with an HMAC keyed
+  by a private random `model-refresh/.proposal-key` (0600); any edit,
+  a future creation time or an expiry other than creation + 15 min is
+  refused. Models seen only in a stale cached page stay listed as unknown
+  (facts never used).
+- `copilot-s` menu `p`: optional `v` (record `/model` facts, then one
+  re-evaluation) and an optional numbered alternative selection (Enter =
+  none, never pre-selected) before the unchanged exact-`yes` confirmation;
+  a no-op proposal with nothing selected is discarded. `--help` updated.
+- Docs: README menu `p` section (steps, evidence limits, privacy, machine
+  lines), docs/architecture.md section 4.
+
 ### Added — permanent purge of one quarantine batch (menus `x` and `r` → `4`, quarantine-purge-c1)
 
 - New shared stdlib engine `bin/copilot_quarantine_purge.py` (a library,

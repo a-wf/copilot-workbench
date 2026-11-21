@@ -752,7 +752,7 @@ class TestContextMetricsSessionManager(BaseHomeTestCase):
                     output.extend(chunk)
                     if (
                         not empty_menu_acknowledged
-                        and b"Start a new session? [Enter/n = new, p, q]:" in output
+                        and b"Start a new session? [Enter/n = new, p, r, q]:" in output
                     ):
                         os.write(master, b"\n")
                         empty_menu_acknowledged = True
@@ -2053,7 +2053,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
     _env = TestContextMetricsSessionManager._env
     _session = TestContextMetricsSessionManager._session
 
-    EMPTY_PROMPT = "Start a new session? [Enter/n = new, p, q]:"
+    EMPTY_PROMPT = "Start a new session? [Enter/n = new, p, r, q]:"
     SELECT_PROMPT = "Select session to resume"
     CONFIRM = "anything else cancels):"
     PAUSE = "Press Enter to return to the menu..."
@@ -2074,10 +2074,23 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 " if os.environ.get('REAL_PROPOSE')=='1': real_helper()\n"
                 " print('Routes current -> proposed; 15/75/5/5 assumption; categorical fit NOT measured quality')\n"
                 " rc=int(os.environ.get('REFRESH_RC','0'))\n"
-                " if rc==0: print('PROPOSAL\\t'+os.environ.get('REFRESH_ID','0123456789abcdef'))\n"
+                " alts=os.environ.get('REFRESH_ALTS')=='1'\n"
+                " if alts:\n"
+                "  print('ALTERNATIVE\\t1\\ttester\\tgpt-6.2-sol')\n"
+                "  print('ALTERNATIVE\\t2\\tcoder\\tfixture-premium')\n"
+                " if os.environ.get('REFRESH_VERIFY')=='1' and not os.path.exists(os.path.join(os.environ['HOME'],'.copilot/model-refresh/verified-models.json')): print('VERIFY\\tneeded')\n"
+                " if rc==0 or (rc==3 and alts): print('PROPOSAL\\t'+os.environ.get('REFRESH_ID','0123456789abcdef'))\n"
                 " elif rc==3: print('Final effective routing (kept): ten routes')\n"
                 " else: print('fixture propose failed before a final table')\n"
                 " sys.exit(rc)\n"
+                "if args[0]=='select':\n"
+                " rc=int(os.environ.get('SELECT_RC','0'))\n"
+                " print('You selected OPTIONAL alternatives; blended $/1M 10.00 -> 12.00 (+$2.00/1M, +20%)')\n"
+                " if rc==0: print('PROPOSAL\\t'+os.environ.get('SELECT_ID','fedcba9876543210'))\n"
+                " sys.exit(rc)\n"
+                "if args[0]=='record-verified':\n"
+                " if os.environ.get('REAL_RECORD')=='1': real_helper()\n"
+                " sys.exit(int(os.environ.get('RECORD_RC','3')))\n"
                 "if args[0]=='apply':\n"
                 " rc=int(os.environ.get('APPLY_RC','0'))\n"
                 " print('Final effective routing: ten routes' if rc==0 else 'fixture apply refused before write')\n"
@@ -2327,6 +2340,109 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         self.assertIn("Refresh subagent models", result.stdout)
         self.assertEqual(self._calls(), [])
         self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_numbered_premium_requires_selection_and_final_exact_yes(self):
+        selected_id = "fedcba9876543210"
+        for confirm, command in (("yes\n", "apply"), ("YES\n", "discard"), ("\n", "discard")):
+            with self.subTest(confirm=confirm):
+                env = self._refresh_env({"REFRESH_ALTS": "1"})
+                if os.path.exists(self.refresh_log):
+                    os.unlink(self.refresh_log)
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), ("or Enter for none:", "1\n"),
+                    (self.CONFIRM, confirm), (self.PAUSE, self._assert_no_launch_at_pause),
+                    (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [
+                    ["propose"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
+                    [command, "--proposal-id", selected_id]])
+                self.assertIn("+$2.00/1M, +20%", out)
+                self.assertNotIn("PROPOSAL\t", out)
+                self.assertNotIn("ALTERNATIVE\t", out)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_optional_only_decline_eof_or_invalid_number_discards_noop_without_confirmation(self):
+        for selection in ("\n", "\x04", "999\n"):
+            with self.subTest(selection=repr(selection)):
+                env = self._refresh_env({"REFRESH_ALTS": "1", "REFRESH_RC": "3"})
+                if os.path.exists(self.refresh_log):
+                    os.unlink(self.refresh_log)
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), ("or Enter for none:", selection),
+                    (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [["propose"], ["discard", "--proposal-id", self.PROPOSAL_ID]])
+                self.assertNotIn("Type 'yes' to apply", out)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_select_failure_or_bad_new_id_never_applies_and_shows_current_routing(self):
+        for additions in ({"SELECT_RC": "4"}, {"SELECT_ID": "invalid"}):
+            with self.subTest(additions=additions):
+                env = self._refresh_env(dict(additions, REFRESH_ALTS="1"))
+                if os.path.exists(self.refresh_log):
+                    os.unlink(self.refresh_log)
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), ("or Enter for none:", "1,2\n"),
+                    (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [
+                    ["propose"], ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1,2"],
+                    ["discard", "--proposal-id", self.PROPOSAL_ID], ["status"]])
+                self.assertNotIn("Type 'yes' to apply", out)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_verification_skip_or_failed_record_never_reproposes_or_applies_without_yes(self):
+        for answer, record in (("\n", False), ("v\n", True)):
+            with self.subTest(answer=repr(answer)):
+                env = self._refresh_env({"REFRESH_VERIFY": "1", "RECORD_RC": "3"})
+                if os.path.exists(self.refresh_log):
+                    os.unlink(self.refresh_log)
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), ("(Enter skips):", answer),
+                    (self.CONFIRM, "no\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+                    (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls(), [["propose"]] + ([["record-verified"]] if record else []) +
+                                 [["discard", "--proposal-id", self.PROPOSAL_ID]])
+                self.assertNotIn("VERIFY\t", out)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_real_verification_save_and_apply_have_independent_confirmations_without_settings_mutations(self):
+        self._native_status_settings()
+        settings_path = os.path.join(self.home, ".copilot/settings.json")
+        with open(settings_path, "rb") as handle:
+            before = handle.read()
+        verified_path = os.path.join(self.home, ".copilot/model-refresh/verified-models.json")
+        for save, saved in (("YES\n", False), ("yes\n", True)):
+            with self.subTest(save=repr(save)):
+                env = self._refresh_env({"REFRESH_VERIFY": "1", "REAL_RECORD": "1"})
+                if os.path.exists(self.refresh_log):
+                    os.unlink(self.refresh_log)
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), ("(Enter skips):", "v\n"),
+                    ("Enter = cancel):", "gpt-6.1-terra\n"), ("[y/N]:", "no\n"),
+                    ("Reasoning levels /model shows for gpt-6.1-terra", "low high\n"),
+                    (self.CONFIRM, save), ("Type 'yes' to apply", "no\n"),
+                    (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(os.path.exists(verified_path), saved)
+                with open(settings_path, "rb") as handle:
+                    self.assertEqual(handle.read(), before)
+                calls = [["propose"], ["record-verified"]]
+                if saved:
+                    calls += [["discard", "--proposal-id", self.PROPOSAL_ID], ["propose"]]
+                    with open(verified_path, encoding="utf-8") as handle:
+                        doc = json.load(handle)
+                    self.assertEqual(doc["models"]["gpt-6.1-terra"]["reasoning_levels"], ["low", "high"])
+                    self.assertNotIn("VERIFY\t", out)
+                    os.unlink(verified_path)
+                self.assertEqual(self._calls(), calls + [["discard", "--proposal-id", self.PROPOSAL_ID]])
+                self.assertFalse(os.path.exists(self.copilot_log))
 
 
 class TestRegistryLockSafety(BaseHomeTestCase):

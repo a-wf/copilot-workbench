@@ -634,7 +634,7 @@ session manager, or both.
 ## 4. `copilot-model-refresh.py` — subagent model refresh (menu `p`)
 
 An optional, user-triggered helper that reviews the pipeline's routes
-against current official prices. It never edits the shipped defaults
+against current official prices and official model capability docs. It never edits the shipped defaults
 (`config/agent-routing.yaml`, `agents/*.agent.md`, the instructions); it
 layers confirmed local overrides on top of them.
 
@@ -646,7 +646,11 @@ layers confirmed local overrides on top of them.
   1M-context / configurable-reasoning support and Copilot CLI client
   listing per model, with source URLs, `reviewed_on`, and `expires_on`. The
   user's `model-refresh/user-config.json` (availability list with
-  `verified_on`, pins, optional dated local catalog overlay). Native
+  `verified_on`, pins, optional dated local catalog overlay; never written
+  by the tool) and `model-refresh/verified-models.json` (written only by
+  the interactive `record-verified` after an exact `yes`: the model IDs and
+  per-model reasoning levels the user saw in `/model`, whether the list is
+  complete, dated; a level carried over keeps its original date). Native
   `settings.json` `subagents.agents.<agent>` values. Official pricing comes
   from `copilot-task-report.py`, loaded via `importlib`:
   `refresh_official_pricing_now()` reuses the fixed-URL fetcher, parser,
@@ -655,11 +659,49 @@ layers confirmed local overrides on top of them.
   The parser additionally records each model's official `category` and
   `release_status` labels when present and consistent (optional, validated
   snapshot fields; never used for pricing).
+- **Live capability evidence.** In the same run (not for `status`, `select`
+  or `apply`, which are cache-only) the helper fetches two fixed
+  docs.github.com article-body URLs — `supported-models` (sections
+  "Supported AI models in Copilot", "Models with extended capabilities",
+  "Supported AI models per client") and `model-comparison` ("Recommended
+  models by task") — with its own bounded stdlib HTTPS GET (certificate
+  verification on, every redirect refused, 10 s per operation / 20 s total,
+  2 MB cap; after a Python certificate-verification failure only, the
+  system curl with `-q`, `--proto =https`, no `-L`, verification on). A
+  strict, versioned Markdown table parser maps the octicon `aria-label`s
+  (Supported / Not supported / Included / Not included) and text cells to
+  fields, derives model IDs with the pricing parser's own mechanical name
+  rule, and makes a whole section UNKNOWN on a missing/duplicated heading,
+  missing column or malformed row; duplicate rows that disagree make that
+  model's field unknown. Text is sanitized to a small character allowlist
+  and never reaches generated instructions. The snapshot
+  (`model-refresh/capability-evidence.json`: URL, fetch time, content
+  SHA-256, parser version, parsed sections) is reused for 5 min, is usable
+  for 3 days (supported-models) / 7 days (model-comparison), and a failed
+  fetch keeps the last valid copy (shown with its age; stale copies
+  authorize nothing). Fetching is skipped with
+  `COPILOT_MODEL_REFRESH_DOCS_FETCH=0`, `COPILOT_TASK_REPORT_PRICING_FETCH=0`
+  or `--offline`, and whenever a test injects a pricing transport without a
+  capability transport.
+- **Model facts.** Per model and field: fresh live evidence, else the dated
+  catalog (shipped or local overlay) as a documented fallback, else
+  unknown. A live value that differs from the shipped catalog is shown as a
+  note; one that contradicts the local overlay fails closed. Absence from
+  the per-client or capability table is evidence ("not listed" / "not
+  documented"); absence from the comparison table is not (the catalog value
+  still applies). When every gate field is live, the Category comes from
+  the live pricing; when any comes from the catalog, the catalogued
+  Category must still match the live pricing. The visible model universe is
+  the union of pricing, live pages, catalog, the user's verified records
+  and the current routes; unpriced or undocumented models stay listed as
+  unknown, and availability is never claimed beyond the user's records.
 - **Resolution.** shipped defaults → managed overrides (`state.json`) →
   `/subagents` values the tool did not write (agent default routes) →
   user-config pins (any route). Pinned routes are never re-proposed.
 - **Decision.** Proposals require a pricing snapshot under 24h old and an
-  unexpired catalog. A candidate must match the route baseline's official
+  unexpired catalog (or, when it has expired, fresh live evidence for every
+  parsed section; per model, catalog-based facts still fail closed). A
+  candidate must match the route baseline's official
   task area with an equal-or-higher Category (or a dated route override),
   support configurable reasoning and, for `long_context` routes, the 1M
   window, be listed as included for Copilot CLI, still show its catalogued
@@ -681,13 +723,48 @@ layers confirmed local overrides on top of them.
   the review, or `expires_on` not after `reviewed_on` authorize nothing.
   Otherwise the route is
   kept with the reason; user-fixable blocks (availability, reasoning level)
-  end the output with an ACTION REQUIRED block and a config example. The
+  end the output with an ACTION REQUIRED block and a config example (and
+  `propose` prints `VERIFY<TAB>needed` so `copilot-s` can offer `v`). The
   table states that fit is categorical, not measured or equal quality.
-- **Two-phase apply.** `propose` writes `pending-proposal.json` (15 min TTL)
-  with digests of settings, state, user config, routing defaults, catalog
-  and generated files plus the expected output digests; `copilot-s` asks
-  for an exact `yes`, then `apply --proposal-id` re-reads everything and
-  refuses on any mismatch. The commit writes a journal and per-file backups,
+- **Optional alternatives.** Per unpinned route with a known current
+  price, an eligible model (every gate above) in the route's accepted task
+  area that is NOT ≥ 10% cheaper is offered only when it has a concrete
+  documented differentiator versus the current model: official Copilot CLI
+  "included" where the current model is not, the route's task area where
+  the current model's differs, or documented 1M context (long_context
+  routes) / configurable reasoning the current model lacks. Category,
+  newness or price are never differentiators; without one the model is
+  listed as considered with that reason. Alternatives are numbered,
+  shown with the blended Default (and long-context) price delta in $ and
+  %, the differentiator with its source, the official "Excels at" text
+  labelled as the vendor's description, and limits; `propose` prints
+  `ALTERNATIVE<TAB>n<TAB>route<TAB>model`. None is ever pre-selected: when
+  nothing else changes, `propose` still exits 3 but freezes a no-op
+  proposal so an explicit selection is possible.
+- **Two-phase apply.** `propose` writes `pending-proposal.json` (format 2,
+  15 min TTL) with digests of settings, state, user config, verified
+  record, routing defaults, catalog, capability evidence, pricing snapshot
+  and generated files, the expected output digests, an evidence digest
+  (pricing snapshot and status, capability digest incl. freshness, catalog,
+  availability records, local date, each route's decision and
+  alternatives) and the numbered alternatives. `select --proposal-id
+  --choose N[,N]` re-derives everything cache-only, refuses on any
+  difference, and writes a NEW proposal (same expiry) whose overrides add
+  the chosen alternatives (one per route; it replaces that route's
+  cost-led change). `copilot-s` asks for an exact `yes`, then `apply
+  --proposal-id` re-reads everything, re-derives the decisions, refuses on
+  any mismatch, on an older-format proposal, on overrides that are not
+  exactly the re-derived ones (tampering), and on a proposal id already in
+  the state history (replay). The capability digest hashes each parsed
+  record (sections, models, values, provenance) with its freshness, and the
+  pricing digest hashes the parsed rates/labels, so a changed cached value
+  is detected even when ids are unchanged. Each proposal carries an
+  HMAC-SHA256 seal keyed by a private random `model-refresh/.proposal-key`
+  (0600; created on first `propose`); `select`/`apply` refuse a broken
+  seal, a creation time in the future, or an expiry other than exactly
+  creation + 15 min (`select` keeps the original creation/expiry and
+  re-seals). Models listed only in a stale/future-dated cached page stay in
+  the model list as unknown with a note; their facts are never used. The commit writes a journal and per-file backups,
   re-checks each file's digest immediately before replacing it, defers
   SIGINT/SIGTERM/SIGHUP, and rolls back on failure; an interrupted commit is
   rolled back on the next run unless the file was changed by someone else

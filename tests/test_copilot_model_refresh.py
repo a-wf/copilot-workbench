@@ -8,6 +8,8 @@ The real shared pricing parser runs, but its transport is always injected.
 
 import contextlib
 import copy
+import hashlib
+import hmac
 import importlib.util
 import io
 import json
@@ -31,6 +33,9 @@ NOW = datetime(2026, 11, 16, 12, tzinfo=timezone.utc).timestamp()
 DAY = 86400
 CHEAP = "fixture-cheap"
 UNKNOWN = "fixture-unassessed"
+NEW = "gpt-6.2-sol"
+DOC_ONLY = "fixture-docs-only"
+USER_ONLY = "fixture-user-only"
 
 
 def load_module(name, path):
@@ -270,7 +275,8 @@ class TestRefreshLifecycle(RefreshCase):
         self.assertEqual(doc["expires_epoch"] - doc["created_epoch"], 900)
         self.assertEqual(len(doc["route_changes"]), 10)
         self.assertEqual(set(doc["digests"]), {
-            "settings", "state", "user_config", "routing", "catalog", "instructions", "effective"})
+            "settings", "state", "user_config", "routing", "catalog", "instructions", "effective",
+            "verified", "capabilities", "pricing"})
         self.assertEqual(self.routing_bytes(), before)
         rc, out, err = self.cli("discard", "--proposal-id", proposal_id)
         self.assertEqual(rc, 0, err)
@@ -967,12 +973,24 @@ class TestApplyPinsAndRouting(RefreshCase):
         self.assertIn("cannot be read safely", out + err)
         self.assertEqual(before, self.routing_bytes())
 
-    def test_apply_uses_frozen_proposal_not_network_or_reselection(self):
+    def test_apply_rederives_frozen_proposal_from_cache_without_network(self):
         proposal_id = self.proposal()
+        proposal = self.read_json(self.paths.proposal)
         self.mod.PRICING_FETCHER = mock.Mock(side_effect=AssertionError("apply fetched"))
-        with mock.patch.object(self.mod, "evaluate", side_effect=AssertionError("reselected")):
+        with mock.patch.object(self.mod, "_fetch_capability_bytes", side_effect=AssertionError("apply fetched")), \
+                mock.patch.object(self.mod, "evaluate", wraps=self.mod.evaluate) as evaluate:
             rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
         self.assertEqual(rc, 0, out + err)
+        evaluate.assert_called_once()
+        state = self.read_json(self.paths.state)
+        applied = state["overrides"]
+        self.assertEqual({key: {field: rec[field] for field in self.mod.FIELDS}
+                          for key, rec in applied.items()},
+                         {key: dict(value, model=CHEAP) for key, value in self.defaults.items()})
+        for rec in applied.values():
+            self.assertEqual(rec["snapshot_id"], proposal["snapshot_id"])
+            self.assertEqual(rec["applied_at"], self.mod.now_iso(NOW))
+        self.assertEqual(state["history"][-1]["proposal_id"], proposal_id)
 
 
 class TestLiveInstructions(RefreshCase):
@@ -1174,6 +1192,7 @@ class TestJournalTransaction(RefreshCase):
             "import importlib.util,os,sys\n"
             "s=importlib.util.spec_from_file_location('r',sys.argv[1]);"
             "m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\n"
+            "m.load_pricing_module().SUPPORT_DIR=sys.argv[4]\n"
             "original=m.atomic_write_bytes\n"
             "def crash(path,data,mode=0o600):\n"
             " original(path,data,mode)\n"
@@ -1182,7 +1201,8 @@ class TestJournalTransaction(RefreshCase):
             "sys.exit(m.main(['apply','--proposal-id',sys.argv[2]],now=float(sys.argv[3])))\n"
         )
         result = subprocess.run(
-            [sys.executable, "-B", "-c", child, str(HELPER), proposal_id, str(NOW)],
+            [sys.executable, "-B", "-c", child, str(HELPER), proposal_id, str(NOW),
+             self.pricing.SUPPORT_DIR],
             env=dict(os.environ, COPILOT_TASK_REPORT_PRICING_FETCH="0"),
             capture_output=True, text=True, timeout=15,
         )
@@ -1239,6 +1259,1173 @@ class TestJournalTransaction(RefreshCase):
                 self.assertEqual(rc, 2, out + err)
                 self.assertEqual(before, self.routing_bytes())
                 self.assertFalse(Path(self.paths.journal).exists())
+
+
+class TestProposalSealing(RefreshCase):
+    def assert_independent_seal(self, doc, key):
+        body = {field: value for field, value in doc.items() if field != "seal"}
+        raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        self.assertEqual(doc["seal"], hmac.new(key, raw, hashlib.sha256).hexdigest())
+
+    def test_key_is_created_only_for_a_frozen_proposal_private_reused_and_not_a_routing_write(self):
+        before = self.routing_bytes()
+        for command in ("status", "preview"):
+            rc, out, err = self.cli(command)
+            self.assertEqual(rc, 0, out + err)
+            self.assertFalse(Path(self.paths.proposal_key).exists())
+            self.assertEqual(self.routing_bytes(), before)
+        first_id = self.proposal()
+        key_path = Path(self.paths.proposal_key)
+        raw_key = key_path.read_bytes()
+        self.assertRegex(raw_key, rb"^[0-9a-f]{64}\n$")
+        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+        self.assert_independent_seal(self.read_json(self.paths.proposal), raw_key.strip())
+        self.assertEqual(self.routing_bytes(), before)
+        rc, out, err = self.cli("discard", "--proposal-id", first_id)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(key_path.read_bytes(), raw_key)
+        self.proposal()
+        self.assertEqual(key_path.read_bytes(), raw_key)
+        self.assert_independent_seal(self.read_json(self.paths.proposal), raw_key.strip())
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_no_changes_does_not_create_a_key_or_pending_proposal(self):
+        self.markdown = self.make_markdown(cheap=9.01)
+        before = self.routing_bytes()
+        rc, out, err = self.cli("propose")
+        self.assertEqual(rc, 3, out + err)
+        self.assertFalse(Path(self.paths.proposal_key).exists())
+        self.assertFalse(Path(self.paths.proposal).exists())
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_key_creation_failure_never_produces_an_applyable_proposal_or_routing_write(self):
+        original_write = self.mod.atomic_write_bytes
+
+        def deny_key(path, data, mode=0o600):
+            if path == self.paths.proposal_key:
+                raise PermissionError("fixture proposal key creation denied")
+            return original_write(path, data, mode)
+
+        before = self.routing_bytes()
+        with mock.patch.object(self.mod, "atomic_write_bytes", side_effect=deny_key):
+            rc, out, err = self.cli("propose")
+        self.assertEqual(rc, 2, err)
+        self.assertIn("key creation denied", err)
+        self.assertNotIn("PROPOSAL\t", out)
+        self.assertFalse(Path(self.paths.proposal_key).exists())
+        self.assertFalse(Path(self.paths.proposal).exists())
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_missing_corrupt_changed_or_nonregular_key_refuses_apply_without_recreating_it(self):
+        key_path = Path(self.paths.proposal_key)
+        for corruption in ("missing", "malformed", "oversized", "changed", "directory"):
+            with self.subTest(corruption=corruption):
+                proposal_id = self.proposal()
+                before = self.routing_bytes()
+                key_path.unlink()
+                if corruption == "directory":
+                    key_path.mkdir()
+                    key_before = None
+                elif corruption == "missing":
+                    key_before = None
+                else:
+                    raw = {"malformed": b"not-a-key\n", "oversized": b"a" * 257,
+                           "changed": b"f" * 64 + b"\n"}[corruption]
+                    self.write(key_path, raw)
+                    key_before = raw
+                rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+                self.assertEqual(rc, 4, err)
+                self.assertIn("seal", err)
+                self.assertEqual(self.routing_bytes(), before)
+                if corruption == "missing":
+                    self.assertFalse(key_path.exists())
+                elif corruption == "directory":
+                    self.assertTrue(key_path.is_dir())
+                    key_path.rmdir()
+                else:
+                    self.assertEqual(key_path.read_bytes(), key_before)
+                    key_path.unlink()
+
+    def test_symlink_key_refuses_propose_and_apply_and_preserves_the_external_target(self):
+        key_path = Path(self.paths.proposal_key)
+        target = self.home / "external-fixture.key"
+        target_bytes = b"a" * 64 + b"\n"
+        self.write(target, target_bytes)
+        before = self.routing_bytes()
+        key_path.symlink_to(target)
+        rc, out, err = self.cli("propose")
+        self.assertEqual(rc, 4, err)
+        self.assertIn("symlink", err)
+        self.assertNotIn("PROPOSAL\t", out)
+        self.assertFalse(Path(self.paths.proposal).exists())
+        self.assertEqual(target.read_bytes(), target_bytes)
+        self.assertEqual(self.routing_bytes(), before)
+        key_path.unlink()
+        proposal_id = self.proposal()
+        key_path.unlink()
+        key_path.symlink_to(target)
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, err)
+        self.assertIn("symlink", err)
+        self.assertEqual(target.read_bytes(), target_bytes)
+        self.assertTrue(key_path.is_symlink())
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_existing_key_must_be_private_before_it_can_authorize_apply(self):
+        proposal_id = self.proposal()
+        key_path = Path(self.paths.proposal_key)
+        os.chmod(key_path, 0o644)
+        before = self.routing_bytes()
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        if rc == 0:
+            # Repairing permissions is safe too; accepting an exposed key is not.
+            self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600,
+                             "apply accepted a group/world-readable proposal key without repairing its mode")
+        else:
+            self.assertIn(rc, (2, 4), err)
+            self.assertEqual(self.routing_bytes(), before)
+
+    def test_seal_binds_overrides_selection_outputs_digests_and_metadata(self):
+        for field in ("overrides", "selected", "expected", "digests", "route_changes", "snapshot_id", "seal"):
+            with self.subTest(field=field):
+                proposal_id = self.proposal()
+                doc = self.read_json(self.paths.proposal)
+                if field == "overrides":
+                    doc[field]["coder"] = dict(self.defaults["coder"])
+                elif field == "selected":
+                    doc[field] = [1]
+                elif field in ("expected", "digests"):
+                    doc[field]["settings"] = "0" * 64
+                elif field == "route_changes":
+                    doc[field] = []
+                elif field == "snapshot_id":
+                    doc[field] = "sha256:" + "0" * 16
+                else:
+                    doc[field] = "0" * 64
+                self.write_json(self.paths.proposal, doc)
+                before = self.routing_bytes()
+                rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+                self.assertEqual(rc, 4, err)
+                self.assertIn("altered", err)
+                self.assertEqual(self.routing_bytes(), before)
+
+    def test_json_reformatting_preserves_valid_seal_and_accepts_exact_ttl_boundary(self):
+        proposal_id = self.proposal()
+        doc = self.read_json(self.paths.proposal)
+        key = Path(self.paths.proposal_key).read_bytes().strip()
+        self.assert_independent_seal(doc, key)
+        self.write(self.paths.proposal, json.dumps(doc, indent=4, sort_keys=True))
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id, now=NOW + 900)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(Path(self.paths.proposal_key).read_bytes().strip(), key)
+        self.assertFalse(Path(self.paths.proposal).exists())
+
+    def test_new_propose_rotates_unsafe_key_and_invalidates_old_seal_without_routing_writes(self):
+        key_path = Path(self.paths.proposal_key)
+        before = self.routing_bytes()
+        for corruption in ("writable", "malformed"):
+            with self.subTest(corruption=corruption):
+                old_id = self.proposal()
+                old_doc = Path(self.paths.proposal).read_bytes()
+                old_key = key_path.read_bytes()
+                if corruption == "writable":
+                    os.chmod(key_path, 0o622)
+                else:
+                    self.write(key_path, b"invalid fixture key\n")
+                new_id = self.proposal()
+                new_doc = Path(self.paths.proposal).read_bytes()
+                new_key = key_path.read_bytes()
+                self.assertNotEqual(new_key, old_key)
+                self.assertRegex(new_key, rb"^[0-9a-f]{64}\n$")
+                self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+                self.assert_independent_seal(json.loads(new_doc), new_key.strip())
+                self.assertEqual(self.routing_bytes(), before)
+                self.write(self.paths.proposal, old_doc)
+                rc, out, err = self.cli("apply", "--proposal-id", old_id)
+                self.assertEqual(rc, 4, err)
+                self.assertIn("seal", err)
+                self.assertEqual(self.routing_bytes(), before)
+                self.assertEqual(key_path.read_bytes(), new_key)
+                self.write(self.paths.proposal, new_doc)
+        rc, out, err = self.cli("apply", "--proposal-id", new_id)
+        self.assertEqual(rc, 0, out + err)
+
+    def test_foreign_owner_on_open_descriptor_is_rejected_before_key_content_is_read(self):
+        proposal_id = self.proposal()
+        key_path = Path(self.paths.proposal_key)
+        key_before = key_path.read_bytes()
+        inode = key_path.stat().st_ino
+        original_fstat = os.fstat
+
+        def foreign_owner(fd):
+            st = original_fstat(fd)
+            if st.st_ino == inode:
+                fields = list(st)
+                fields[4] = st.st_uid + 1
+                return os.stat_result(fields)
+            return st
+
+        before = self.routing_bytes()
+        with mock.patch.object(self.mod.os, "fstat", side_effect=foreign_owner), \
+                mock.patch.object(self.mod.os, "read", wraps=os.read) as read:
+            rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, err)
+        self.assertIn("not owned by you", err)
+        read.assert_not_called()
+        self.assertEqual(key_path.read_bytes(), key_before)
+        self.assertEqual(self.routing_bytes(), before)
+
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "requires POSIX no-follow open")
+    def test_symlink_inserted_at_open_is_not_followed_or_read(self):
+        proposal_id = self.proposal()
+        key_path = Path(self.paths.proposal_key)
+        key_before = key_path.read_bytes()
+        target = self.home / "late-linked-fixture.key"
+        self.write(target, key_before)
+        os.chmod(target, 0o600)
+        original_open = os.open
+        raced = []
+
+        def insert_symlink(path, flags, *args, **kwargs):
+            if os.fspath(path) == self.paths.proposal_key:
+                self.assertTrue(flags & os.O_NOFOLLOW, "key open must refuse late symlinks")
+                key_path.unlink()
+                key_path.symlink_to(target)
+                raced.append(True)
+            return original_open(path, flags, *args, **kwargs)
+
+        before = self.routing_bytes()
+        with mock.patch.object(self.mod.os, "open", side_effect=insert_symlink), \
+                mock.patch.object(self.mod.os, "read", wraps=os.read) as read:
+            rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, err)
+        self.assertEqual(raced, [True])
+        read.assert_not_called()
+        self.assertTrue(key_path.is_symlink())
+        self.assertEqual(target.read_bytes(), key_before)
+        self.assertEqual(self.routing_bytes(), before)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and hasattr(os, "O_NONBLOCK"), "requires POSIX FIFO")
+    def test_fifo_key_is_refused_without_blocking_read_or_routing_writes(self):
+        proposal_id = self.proposal()
+        key_path = Path(self.paths.proposal_key)
+        key_path.unlink()
+        os.mkfifo(key_path, 0o600)
+        original_open = os.open
+
+        def nonblocking_open(path, flags, *args, **kwargs):
+            if os.fspath(path) == self.paths.proposal_key:
+                self.assertTrue(flags & os.O_NONBLOCK, "key open must not block on a nonregular file")
+            return original_open(path, flags, *args, **kwargs)
+
+        before = self.routing_bytes()
+        with mock.patch.object(self.mod.os, "open", side_effect=nonblocking_open), \
+                mock.patch.object(self.mod.os, "read", wraps=os.read) as read:
+            rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, err)
+        self.assertIn("not a regular file", err)
+        read.assert_not_called()
+        self.assertTrue(stat.S_ISFIFO(key_path.stat().st_mode))
+        self.assertEqual(self.routing_bytes(), before)
+
+
+class TerminalInput(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class LiveRefreshCase(RefreshCase):
+    """Synthetic values, with the official article-body layout observed
+    2026-11-21: HTML wrappers, blank rows, SVG aria labels, footnotes, links,
+    extra client columns, and the comparison's Further reading column.
+    All transport is injected; no test contacts a public or private service.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.ids.append(NEW)
+        self.doc_facts = {mid: {
+            "provider": "OpenAI", "release_status": "GA", "task_area": "Fixture coding",
+            "excels_at": "Synthetic fixture tasks", "one_million_context": "Supported",
+            "configurable_reasoning": "Supported", "copilot_cli_client": "Included",
+        } for mid in self.ids + [DOC_ONLY]}
+        self.config["available_models"]["models"] = list(self.ids)
+        self.config["verified_capabilities"]["models"][NEW] = {
+            "reasoning_levels": ["low", "medium", "high", "xhigh"]}
+        self.save_config()
+        self.markdown = self.live_prices()
+        self.docs_fetches = []
+        self.events = []
+        self.mod.CAPABILITY_FETCHER = self.fetch_docs
+
+    def fetch(self, url, timeout, max_bytes):
+        self.events.append(url)
+        return super().fetch(url, timeout, max_bytes)
+
+    def live_prices(self, new=5, cheap=15, new_long=None):
+        lines = self.make_markdown(cheap=cheap).decode().splitlines()
+        for i, line in enumerate(list(lines)):
+            if line.startswith("| %s |" % NEW):
+                default = line.replace("$10", "$%s" % new)
+                if new_long is not None:
+                    default = default.replace("Not applicable", "≤ 272K")
+                    lines.append(line.replace("Default | Not applicable", "Long context | > 272K")
+                                 .replace("$10", "$%s" % new_long))
+                lines[i] = default
+        return "\n".join(lines).encode()
+
+    @staticmethod
+    def icon(label):
+        return '<svg viewBox="0 0 16 16" aria-label="%s"><path d="M1 1"/></svg>' % label
+
+    def pages(self):
+        def table(headers, cells):
+            lines = ["<div class=\"ghd-tool rowheaders\">", "",
+                     "| " + " | ".join(headers) + " |",
+                     "| " + " | ".join("---" for _ in headers) + " |"]
+            for row in cells:
+                lines += ["| " + " | ".join("" for _ in headers) + " |",
+                          "| " + " | ".join(row) + " |"]
+            return "\n".join(lines + ["", "</div>", ""])
+
+        models = sorted(self.doc_facts)
+        name = lambda mid: "GPT-6.2 Sol[^fixture]" if mid == NEW else mid
+        supported = "## Supported AI models in Copilot\n\n" + table(
+            ["Model name", "Provider", "Release status"],
+            [[name(mid), self.doc_facts[mid]["provider"], self.doc_facts[mid]["release_status"]]
+             for mid in models])
+        supported += "\n## Models with extended capabilities\n\n" + table(
+            ["Model", "1 million token context window", "Configurable reasoning"],
+            [[name(mid), self.icon(self.doc_facts[mid]["one_million_context"]),
+              self.icon(self.doc_facts[mid]["configurable_reasoning"])] for mid in models])
+        supported += "\n## Supported AI models per client\n\n" + table(
+            ["Model", "GitHub.com", "Copilot CLI", "Visual Studio Code"],
+            [[name(mid), self.icon("Included"), self.icon(self.doc_facts[mid]["copilot_cli_client"]),
+              self.icon("Included")] for mid in models])
+        comparison = "## Recommended models by task\n\n" + table(
+            ["Model", "Task area", "Excels at (primary use case)", "Further reading"],
+            [[name(mid), self.doc_facts[mid]["task_area"], self.doc_facts[mid]["excels_at"],
+              "[Fixture model card](https://docs.github.com/fixture)"] for mid in models])
+        return {"supported_models": supported.encode(), "model_comparison": comparison.encode()}
+
+    def fetch_docs(self, url, timeout, max_bytes):
+        self.docs_fetches.append((url, timeout, max_bytes))
+        self.events.append(url)
+        for src in self.mod.CAPABILITY_SOURCES:
+            if url == self.mod.capability_url(src):
+                return self.pages()[src["key"]]
+        raise AssertionError("unexpected source: " + url)
+
+    def seed_docs(self, ages=None):
+        cache = self.mod._blank_capability_cache()
+        pages = self.pages()
+        for src in self.mod.CAPABILITY_SOURCES:
+            epoch = NOW - (ages or {}).get(src["key"], 0)
+            raw = pages[src["key"]]
+            cache["sources"][src["key"]] = {
+                "url": self.mod.capability_url(src), "public_url": self.mod.capability_public_url(src),
+                "fetched_at": self.mod.now_iso(epoch), "fetched_epoch": epoch,
+                "content_sha256": self.mod.sha256_bytes(raw),
+                "parser_version": self.mod.CAPABILITY_PARSER_VERSION,
+                "sections": self.mod.parse_capability_markdown(
+                    raw.decode(), src, self.pricing.normalize_official_model_name),
+            }
+        self.write_json(self.paths.capabilities, cache)
+        return cache
+
+    def context(self, ages=None):
+        self.seed_cache()
+        self.seed_docs(ages)
+        return self.mod.build_context(self.paths, NOW)
+
+    def rows(self, ctx):
+        return {r["key"]: r for r in self.mod.evaluate(ctx)}
+
+    def verified_doc(self, models=None, date="2026-11-16", complete=True):
+        return {
+            "schema_version": 1, "kind": self.mod.VERIFIED_KIND, "verified_on": date,
+            "recorded_at": self.mod.now_iso(NOW),
+            "source": "fixture: user attested in /model", "complete_list": complete,
+            "models": models if models is not None else {NEW: {}},
+        }
+
+    def record(self, *answers):
+        with mock.patch.object(self.mod.sys, "stdin", TerminalInput("\n".join(answers) + "\n")):
+            return self.cli("record-verified")
+
+    def premium(self, cheap=5):
+        self.markdown = self.live_prices(new=12, cheap=cheap, new_long=18)
+        for mid in {v["model"] for v in self.defaults.values()}:
+            self.doc_facts[mid]["copilot_cli_client"] = "Not included"
+        self.seed_cache()
+        self.seed_docs()
+
+    def numbered(self, proposal_id, route, model=NEW):
+        doc = self.read_json(self.paths.proposal)
+        self.assertEqual(doc["proposal_id"], proposal_id)
+        return next(a["n"] for a in doc["alternatives"]
+                    if a["route"] == route and a["values"]["model"] == model)
+
+
+class TestLiveCapabilityRefresh(LiveRefreshCase):
+    def test_one_p_refreshes_prices_and_both_pages_with_provenance_and_shared_five_min_reuse(self):
+        self.seed_cache(age=600)
+        self.seed_docs({key: 600 for key in self.pages()})
+        before = self.routing_bytes()
+        config_before = Path(self.paths.user_config).read_bytes()
+        catalog_before = self.catalog_path.read_bytes()
+        rc, out, err = self.cli("propose")
+        self.assertEqual(rc, 0, out + err)
+        urls = [self.pricing.OFFICIAL_PRICING_API_URL] + [
+            self.mod.capability_url(src) for src in self.mod.CAPABILITY_SOURCES]
+        self.assertEqual(self.events, urls)
+        for url, timeout, max_bytes in self.docs_fetches:
+            self.assertIn(url, urls[1:])
+            self.assertEqual((timeout, max_bytes), (10, 2_000_000))
+        cache = self.read_json(self.paths.capabilities)
+        for src in self.mod.CAPABILITY_SOURCES:
+            rec = cache["sources"][src["key"]]
+            self.assertEqual(rec["fetched_epoch"], NOW)
+            self.assertEqual(rec["content_sha256"], self.mod.sha256_bytes(self.pages()[src["key"]]))
+            self.assertEqual(rec["url"], self.mod.capability_url(src))
+            self.assertTrue(all(s["status"] == "ok" for s in rec["sections"].values()))
+        self.assertEqual(self.routing_bytes(), before)
+        self.assertEqual(Path(self.paths.user_config).read_bytes(), config_before)
+        self.assertEqual(self.catalog_path.read_bytes(), catalog_before)
+        self.assertIn(NEW, out)
+        self.assertEqual(self.cli("propose", now=NOW + 299)[0], 0)
+        self.assertEqual(self.events, urls)
+        self.assertEqual(self.cli("propose", now=NOW + 300)[0], 0)
+        self.assertEqual(self.events, urls + urls)
+
+    def test_offline_and_kill_switches_control_only_the_documented_transports(self):
+        for args, env, price_calls in (
+            (("preview", "--offline"), {}, 0),
+            (("preview",), {"COPILOT_TASK_REPORT_PRICING_FETCH": "0"}, 0),
+            (("preview",), {"COPILOT_MODEL_REFRESH_DOCS_FETCH": "0"}, 1),
+        ):
+            with self.subTest(args=args, env=env):
+                self.seed_cache(age=600)
+                self.seed_docs({key: 600 for key in self.pages()})
+                self.fetches.clear()
+                self.docs_fetches.clear()
+                with mock.patch.dict(os.environ, env):
+                    rc, out, err = self.cli(*args)
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(len(self.fetches), price_calls)
+                self.assertEqual(self.docs_fetches, [])
+
+    def test_new_documented_model_absent_static_catalog_can_replace_even_expired_catalog(self):
+        self.catalog["expires_on"] = "2026-11-15"
+        self.save_catalog()
+        before = self.catalog_path.read_bytes()
+        ctx = self.context()
+        self.assertNotIn(NEW, ctx["catalog"]["models"])
+        self.assertTrue(ctx["facts"][NEW]["all_live"])
+        for key, row in self.rows(ctx).items():
+            self.assertEqual(row["proposed"], dict(self.defaults[key], model=NEW))
+            self.assertIn("current official docs", " ".join(row["evidence"]))
+        self.assertEqual(self.catalog_path.read_bytes(), before)
+
+    def test_every_source_of_known_models_is_visible_with_honest_unknown_price_and_availability(self):
+        catalog_only = "fixture-catalog-only"
+        self.catalog["models"][catalog_only] = copy.deepcopy(self.catalog["models"][CHEAP])
+        self.save_catalog()
+        self.config["available_models"]["models"].append(USER_ONLY)
+        self.save_config()
+        settings = copy.deepcopy(self.initial_settings)
+        settings["subagents"]["agents"]["coder"] = {"model": "fixture-current-only"}
+        self.write_json(self.paths.settings, settings)
+        ctx = self.context()
+        expected = set(self.ids) | {DOC_ONLY, USER_ONLY, UNKNOWN, catalog_only, "fixture-current-only"}
+        self.assertEqual(set(ctx["universe"]), expected)
+        rc, out, err = self.cli("preview", "--offline")
+        self.assertEqual(rc, 0, out + err)
+        section = out.split("All models in view", 1)[1].split("Optional alternatives", 1)[0]
+        for mid in expected:
+            self.assertIn("  " + mid, section)
+        self.assertIn("price unknown (not in the official pricing)", section)
+        self.assertIn("NOT your account's model list", out)
+        self.assertFalse(ctx["facts"][UNKNOWN]["assessed"])
+        self.assertFalse(ctx["facts"][USER_ONLY]["assessed"])
+        self.assertEqual(self.rows(ctx)["coder"]["reason"].split(":")[0], "kept")
+
+    def test_unverified_live_model_is_listed_and_actionable_but_never_assigned(self):
+        self.config["available_models"]["models"].remove(NEW)
+        self.config["verified_capabilities"]["models"].pop(NEW)
+        self.save_config()
+        ctx = self.context()
+        self.assert_no_changes(self.rows(ctx))
+        rc, out, err = self.cli("propose", "--offline")
+        self.assertEqual(rc, 3, out + err)
+        self.assertIn(NEW, out)
+        self.assertIn("VERIFY\tneeded", out)
+        self.assertIn("not verified", self.mod._availability_text(NEW, ctx))
+
+    def test_exact_levels_are_per_model_not_inferred_from_generic_live_flag(self):
+        self.config["verified_capabilities"]["models"][NEW]["reasoning_levels"] = ["low"]
+        self.save_config()
+        ctx = self.context()
+        for key, row in self.rows(ctx).items():
+            if self.defaults[key]["reasoning_effort"] == "low":
+                self.assertEqual(row["proposed"], dict(self.defaults[key], model=NEW))
+            else:
+                self.assertIsNone(row["proposed"], row)
+                self.assertIn("not offered", repr(row["blocked"]))
+        self.config["verified_capabilities"]["models"].pop(NEW)
+        self.save_config()
+        ctx = self.mod.build_context(self.paths, NOW)
+        self.assertTrue(ctx["facts"][NEW]["configurable_reasoning"])
+        self.assert_no_changes(self.rows(ctx), "generic configurable-reasoning")
+
+    def test_per_client_svg_values_use_cli_column_not_another_clients_inclusion(self):
+        for label, value, eligible in (
+            ("Included", "included", True), ("Not included", "not_included", False),
+            ("Yes", None, False), ("", None, False),
+        ):
+            with self.subTest(label=label):
+                self.doc_facts[NEW]["copilot_cli_client"] = label
+                ctx = self.context()
+                self.assertEqual(ctx["facts"][NEW]["copilot_cli_client"], value)
+                self.assertEqual(self.rows(ctx)["tester"]["proposed"] is not None, eligible)
+        cache = self.seed_docs()
+        del cache["sources"]["supported_models"]["sections"]["clients"]["models"][NEW]
+        self.write_json(self.paths.capabilities, cache)
+        ctx = self.mod.build_context(self.paths, NOW)
+        self.assertEqual(ctx["facts"][NEW]["copilot_cli_client"], "not_listed")
+        self.assert_no_changes(self.rows(ctx), "Copilot CLI")
+
+    def test_conflicting_rows_and_changed_layout_never_guess_or_assign(self):
+        src = self.mod.CAPABILITY_SOURCE_BY_KEY["model_comparison"]
+        raw = self.pages()["model_comparison"].decode()
+        variants = (
+            raw,
+            raw.replace("## Recommended models by task", "## Renamed table"),
+            raw + "\n## Recommended models by task\n\n" + raw.split("\n", 1)[1],
+            raw.replace("| Model | Task area |", "| Model | Undocumented heading |"),
+            raw.replace("| GPT-6.2 Sol[^fixture] | Fixture coding | Synthetic fixture tasks |",
+                        "| GPT-6.2 Sol[^fixture] | Fixture coding |"),
+            raw.replace("\n\n</div>", "\n| GPT-6.2 Sol | Different tasks | Other fixture | none |\n\n</div>"),
+        )
+        for index, text in enumerate(variants):
+            with self.subTest(variant=index):
+                sections = self.mod.parse_capability_markdown(text, src)
+                cache = self.seed_docs()
+                cache["sources"]["model_comparison"]["sections"] = sections
+                self.write_json(self.paths.capabilities, cache)
+                self.seed_cache()
+                ctx = self.mod.build_context(self.paths, NOW)
+                self.assertEqual(self.rows(ctx)["tester"]["proposed"] is not None, index == 0)
+                if index == 5:
+                    self.assertIn(NEW, sections["tasks"]["conflicts"])
+
+    def test_live_change_supersedes_shipped_facts_but_contradictory_local_overlay_fails_closed(self):
+        self.catalog["models"][NEW] = dict(self.catalog["models"][CHEAP], copilot_cli_client="not_included")
+        self.save_catalog()
+        ctx = self.context()
+        self.assertIsNotNone(self.rows(ctx)["tester"]["proposed"])
+        self.assertIn("catalog said", repr(ctx["facts"][NEW]["notes"]))
+        self.config["catalog"] = {
+            "reviewed_on": "2026-11-15", "expires_on": "2026-12-15",
+            "sources": copy.deepcopy(self.catalog["sources"]),
+            "models": {NEW: copy.deepcopy(self.catalog["models"][NEW])},
+        }
+        self.save_config()
+        ctx = self.mod.build_context(self.paths, NOW)
+        self.assert_no_changes(self.rows(ctx), "local overlay contradicts")
+
+    def test_source_specific_ttl_inclusive_boundary_and_future_evidence_fail_closed(self):
+        for src in self.mod.CAPABILITY_SOURCES:
+            for age, usable in ((src["ttl_seconds"], True), (src["ttl_seconds"] + 1, False), (-1, False)):
+                with self.subTest(source=src["key"], age=age):
+                    ctx = self.context({src["key"]: age})
+                    self.assertEqual(ctx["capabilities"]["sources"][src["key"]]["status"] == "fresh", usable)
+                    self.assertEqual(self.rows(ctx)["tester"]["proposed"] is not None, usable)
+                    if not usable:
+                        self.assertEqual(self.rows(ctx)["tester"]["current"], self.defaults["tester"])
+
+    def test_stale_page_only_models_remain_visible_as_unknown_not_silently_dropped(self):
+        ctx = self.context({s["key"]: s["ttl_seconds"] + 1 for s in self.mod.CAPABILITY_SOURCES})
+        self.assert_no_changes(self.rows(ctx))
+        self.assertIn(DOC_ONLY, ctx["universe"], "previously discovered unpriced model must remain visible")
+        self.assertFalse(ctx["facts"][DOC_ONLY]["all_live"])
+
+    def test_failed_refresh_keeps_old_copy_and_age_without_renewing_expired_evidence(self):
+        old = self.seed_docs({s["key"]: s["ttl_seconds"] + 1 for s in self.mod.CAPABILITY_SOURCES})
+        self.seed_cache()
+        self.mod.CAPABILITY_FETCHER = mock.Mock(side_effect=OSError("fixture offline"))
+        rc, out, err = self.cli("propose")
+        self.assertEqual(rc, 3, out + err)
+        self.assertIn("REFRESH FAILED", out)
+        self.assertIn("stale", out.lower())
+        self.assertEqual(self.read_json(self.paths.capabilities)["sources"], old["sources"])
+        self.assertFalse(Path(self.paths.state).exists())
+
+    def test_corrupt_unknown_source_parser_version_and_wrong_source_identity_verify_nothing(self):
+        base = self.seed_docs()
+        variants = [b'{"broken":', b'{"schema_version": 1, "schema_version": 1}']
+        for field, value in (
+            ("url", "https://docs.github.com/api/article/body?pathname=/en/unrelated"),
+            ("public_url", "https://example.invalid/"),
+            ("parser_version", 999), ("content_sha256", "not-a-digest"), ("fetched_epoch", True),
+        ):
+            doc = copy.deepcopy(base)
+            doc["sources"]["supported_models"][field] = value
+            variants.append(json.dumps(doc).encode())
+        doc = copy.deepcopy(base)
+        doc["sources"]["other-source"] = doc["sources"]["supported_models"]
+        variants.append(json.dumps(doc).encode())
+        self.seed_cache()
+        for raw in variants:
+            with self.subTest(raw=raw[:140]):
+                self.write(self.paths.capabilities, raw)
+                ctx = self.mod.build_context(self.paths, NOW)
+                self.assertTrue(ctx["capabilities"]["warning"])
+                self.assert_no_changes(self.rows(ctx))
+                self.assertFalse(ctx["facts"][NEW]["all_live"])
+
+    def test_fixed_url_allowlist_rejects_unauthorized_sources_before_transport(self):
+        fetch = mock.Mock(side_effect=AssertionError("unauthorized fetch"))
+        with mock.patch.object(self.mod, "CAPABILITY_FETCHER", fetch):
+            for url in ("http://docs.github.com/api/article/body", "https://example.invalid/",
+                        self.mod.capability_url(self.mod.CAPABILITY_SOURCES[0]) + "&extra=1"):
+                with self.subTest(url=url), self.assertRaises(self.mod.CapabilityError):
+                    self.mod._fetch_capability_bytes(url)
+        fetch.assert_not_called()
+
+    def test_https_response_identity_size_and_request_headers_are_checked_offline(self):
+        import urllib.request
+
+        url = self.mod.capability_url(self.mod.CAPABILITY_SOURCES[0])
+        for status, final, body, headers, succeeds in (
+            (200, url, b"abc", {}, True),
+            (302, url, b"abc", {}, False),
+            (200, "https://example.invalid/", b"abc", {}, False),
+            (200, url, b"abcd", {}, False),
+            (200, url, b"abc", {"Content-Length": "4"}, False),
+        ):
+            with self.subTest(status=status, final=final, headers=headers, size=len(body)):
+                response = io.BytesIO(body)
+                response.status = status
+                response.headers = headers
+                response.geturl = lambda: final
+                opener = mock.Mock()
+                opener.open.return_value = response
+                with mock.patch.object(urllib.request, "build_opener", return_value=opener):
+                    if succeeds:
+                        self.assertEqual(self.mod._default_docs_fetch(url, 10, 3), b"abc")
+                    else:
+                        with self.assertRaises(self.mod.CapabilityError):
+                            self.mod._default_docs_fetch(url, 10, 3)
+                request = opener.open.call_args.args[0]
+                self.assertEqual(request.full_url, url)
+                self.assertEqual(request.get_method(), "GET")
+                self.assertIsNone(request.data)
+                self.assertNotIn("authorization", {k.lower() for k, v in request.header_items()})
+                self.assertNotIn("cookie", {k.lower() for k, v in request.header_items()})
+                self.assertEqual(opener.open.call_args.kwargs["timeout"], 10)
+
+    def test_only_certificate_verification_failure_uses_verified_curl_fallback(self):
+        import ssl
+        import urllib.error
+        import urllib.request
+
+        url = self.mod.capability_url(self.mod.CAPABILITY_SOURCES[0])
+        failures = (
+            (urllib.error.URLError(ssl.SSLCertVerificationError(1, "fixture certificate")), True),
+            (TimeoutError("fixture timeout"), False),
+            (urllib.error.URLError("fixture disconnected"), False),
+            (urllib.error.HTTPError(url, 302, "fixture redirect", {}, None), False),
+        )
+        for error, fallback in failures:
+            with self.subTest(error=type(error).__name__, fallback=fallback):
+                opener = mock.Mock()
+                opener.open.side_effect = error
+                with mock.patch.object(urllib.request, "build_opener", return_value=opener), \
+                        mock.patch.object(self.mod, "_curl_docs_fetch", return_value=b"fixture") as curl, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    if fallback:
+                        self.assertEqual(self.mod._default_docs_fetch(url, 10, 20), b"fixture")
+                        curl.assert_called_once()
+                    else:
+                        with self.assertRaises(self.mod.CapabilityError):
+                            self.mod._default_docs_fetch(url, 10, 20)
+                        curl.assert_not_called()
+
+    def test_curl_fallback_disables_user_curlrc_auth_and_redirect_options(self):
+        url = self.mod.capability_url(self.mod.CAPABILITY_SOURCES[0])
+        trailer = (self.mod._DOCS_CURL_STATUS_MARKER + "200 " + url).encode()
+        proc = mock.Mock(stdout=io.BytesIO(b"fixture" + trailer))
+        proc.wait.return_value = 0
+        proc.poll.return_value = 0
+        with mock.patch.object(subprocess, "Popen", return_value=proc) as popen:
+            self.assertEqual(self.mod._curl_docs_fetch(url, 10, 20, "fixture certificate"), b"fixture")
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[1], "-q")
+        for dangerous in ("-k", "--insecure", "-L", "--location", "-u", "--user", "-b", "--cookie"):
+            self.assertNotIn(dangerous, argv)
+        self.assertEqual(argv[argv.index("--proto") + 1], "=https")
+        self.assertEqual(argv[argv.index("--max-filesize") + 1], "20")
+        self.assertEqual(argv[argv.index("--url") + 1], url)
+        self.assertFalse(popen.call_args.kwargs["shell"])
+
+
+class TestCompleteAvailabilityAuthority(LiveRefreshCase):
+    def lists(self, config_date, recorded_date, complete=True, recorded_models=None):
+        self.config["available_models"] = {"verified_on": config_date, "models": list(self.ids)}
+        self.save_config()
+        included = set(self.ids) - {NEW} if recorded_models is None else set(recorded_models)
+        self.write_json(self.paths.verified, self.verified_doc(
+            {mid: {} for mid in sorted(included)}, date=recorded_date, complete=complete))
+        return self.context()
+
+    def test_complete_list_excludes_older_same_day_config_and_inclusive_thirty_day_boundary(self):
+        for config_date, recorded_date in (
+            ("2026-11-15", "2026-11-16"),
+            ("2026-11-16", "2026-11-16"),
+            ("2026-10-17", "2026-10-17"),
+        ):
+            with self.subTest(config_date=config_date, recorded_date=recorded_date):
+                ctx = self.lists(config_date, recorded_date)
+                models, description, usable = ctx["availability"]
+                self.assertTrue(usable)
+                self.assertEqual(models, set(self.ids) - {NEW})
+                self.assertIn("treated as unavailable", description)
+                self.assertIn("NOT in your complete", self.mod._availability_text(NEW, ctx))
+                self.assertIn(NEW, ctx["universe"], "excluded models remain visible, not authorized")
+                self.assert_no_changes(self.rows(ctx))
+                policy, why = self.mod.route_policy(
+                    "tester", self.defaults, ctx["catalog"], ctx["today"], ctx["facts"])
+                self.assertIsNone(why)
+                reasons = self.mod.check_candidate(NEW, "tester", self.defaults["tester"], policy, ctx)
+                self.assertEqual({code for code, text in reasons}, {self.mod.REASON_AVAILABILITY})
+
+    def test_newer_config_partial_stale_and_future_record_keep_independent_fresh_config_models(self):
+        for config_date, recorded_date, complete in (
+            ("2026-11-16", "2026-11-15", True),
+            ("2026-11-15", "2026-11-16", False),
+            ("2026-11-15", "2026-10-16", True),
+            ("2026-11-15", "2026-11-17", True),
+        ):
+            with self.subTest(config_date=config_date, recorded_date=recorded_date, complete=complete):
+                ctx = self.lists(config_date, recorded_date, complete=complete)
+                self.assertTrue(ctx["availability"][2])
+                self.assertEqual(ctx["availability"][0], set(self.ids))
+                self.assertIn("verified available to you", self.mod._availability_text(NEW, ctx))
+                for key, row in self.rows(ctx).items():
+                    self.assertEqual(row["proposed"], dict(self.defaults[key], model=NEW))
+
+    def test_empty_fresh_complete_list_cannot_authorize_a_model_from_older_config(self):
+        ctx = self.lists("2026-11-15", "2026-11-16", recorded_models=[])
+        self.assertEqual(ctx["availability"][0], set())
+        self.assert_no_changes(self.rows(ctx))
+        before = self.routing_bytes()
+        rc, out, err = self.cli("propose", "--offline")
+        self.assertEqual(rc, 3, out + err)
+        self.assertNotIn("PROPOSAL\t", out)
+        self.assertFalse(Path(self.paths.proposal).exists())
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_complete_list_change_refuses_frozen_apply_and_fresh_proposal_excludes_the_model(self):
+        self.lists("2026-11-15", "2026-11-16", complete=False)
+        before = self.routing_bytes()
+        rc, out, err = self.cli("propose", "--offline")
+        self.assertEqual(rc, 0, out + err)
+        doc = self.read_json(self.paths.proposal)
+        self.assertTrue(all(values["model"] == NEW for values in doc["overrides"].values()))
+        record = self.read_json(self.paths.verified)
+        record["complete_list"] = True
+        self.write_json(self.paths.verified, record)
+        rc, out, err = self.cli("apply", "--proposal-id", doc["proposal_id"])
+        self.assertEqual(rc, 4, err)
+        self.assertIn("verified", err)
+        self.assertEqual(self.routing_bytes(), before)
+        rc, out, err = self.cli("propose", "--offline")
+        self.assertEqual(rc, 3, out + err)
+        self.assertNotIn("PROPOSAL\t", out)
+        self.assertIn("treated as unavailable", out)
+        self.assertEqual(self.routing_bytes(), before)
+        self.assertEqual(self.fetches, [])
+        self.assertEqual(self.docs_fetches, [])
+
+    def test_strictly_newer_config_can_propose_and_apply_a_model_absent_from_complete_record(self):
+        self.lists("2026-11-16", "2026-11-15")
+        before = self.routing_bytes()
+        config_before = Path(self.paths.user_config).read_bytes()
+        record_before = Path(self.paths.verified).read_bytes()
+        rc, out, err = self.cli("propose", "--offline")
+        self.assertEqual(rc, 0, out + err)
+        doc = self.read_json(self.paths.proposal)
+        self.assertEqual(self.routing_bytes(), before)
+        self.assertEqual(set(doc["overrides"]), set(self.defaults))
+        self.assertTrue(all(values["model"] == NEW for values in doc["overrides"].values()))
+        rc, out, err = self.cli("apply", "--proposal-id", doc["proposal_id"])
+        self.assertEqual(rc, 0, out + err)
+        applied = self.read_json(self.paths.state)["overrides"]
+        self.assertEqual({key: {field: values[field] for field in self.mod.FIELDS}
+                          for key, values in applied.items()},
+                         {key: dict(values, model=NEW) for key, values in self.defaults.items()})
+        self.assertEqual(Path(self.paths.user_config).read_bytes(), config_before)
+        self.assertEqual(Path(self.paths.verified).read_bytes(), record_before)
+        self.assertEqual(self.fetches, [])
+        self.assertEqual(self.docs_fetches, [])
+
+
+class TestVerifiedImport(LiveRefreshCase):
+    def setUp(self):
+        super().setUp()
+        self.config = {}
+        self.save_config()
+        self.context()
+
+    def test_pipe_is_refused_and_every_nonexact_confirmation_is_effect_free(self):
+        before = self.routing_bytes()
+        config = Path(self.paths.user_config).read_bytes()
+        with mock.patch.object(self.mod.sys, "stdin", io.StringIO(NEW + "\ny\nlow\n yes\n")):
+            rc, out, err = self.cli("record-verified")
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("terminal", err)
+        for confirm in ("", "y", "YES", " yes", "yes ", "no"):
+            with self.subTest(confirm=confirm):
+                rc, out, err = self.record(NEW, "yes", "low high", confirm)
+                self.assertEqual(rc, 3, out + err)
+                self.assertFalse(Path(self.paths.verified).exists())
+                self.assertEqual(self.routing_bytes(), before)
+                self.assertEqual(Path(self.paths.user_config).read_bytes(), config)
+
+    def test_exact_yes_records_unknown_models_and_only_entered_levels_without_routing_writes(self):
+        before = self.routing_bytes()
+        config = Path(self.paths.user_config).read_bytes()
+        rc, out, err = self.record(NEW + ", " + USER_ONLY, "yes", "low high", "yes")
+        self.assertEqual(rc, 0, out + err)
+        doc = self.read_json(self.paths.verified)
+        self.assertEqual(doc["models"], {
+            NEW: {"reasoning_levels": ["low", "high"], "levels_verified_on": "2026-11-16"},
+            USER_ONLY: {},
+        })
+        self.assertTrue(doc["complete_list"])
+        self.assertEqual(self.routing_bytes(), before)
+        self.assertEqual(Path(self.paths.user_config).read_bytes(), config)
+        self.assertEqual(self.docs_fetches, [])
+        self.assertEqual(self.fetches, [])
+        ctx = self.mod.build_context(self.paths, NOW)
+        self.assertIn(USER_ONLY, ctx["universe"])
+        self.assertIn("NOT in your complete", self.mod._availability_text(CHEAP, ctx))
+        self.assertFalse(ctx["facts"][USER_ONLY]["assessed"])
+        for key, row in self.rows(ctx).items():
+            self.assertEqual(row["proposed"] is not None, self.defaults[key]["reasoning_effort"] in ("low", "high"))
+
+    def test_carried_levels_keep_original_date_and_expired_levels_are_not_silently_renewed(self):
+        settings = copy.deepcopy(self.initial_settings)
+        settings["subagents"]["agents"]["coder"] = {"model": NEW}
+        self.write_json(self.paths.settings, settings)
+        for old_date, expected in (
+            ("2026-10-17", {"reasoning_levels": ["low"], "levels_verified_on": "2026-10-17"}),
+            ("2026-10-16", {}),
+        ):
+            with self.subTest(old_date=old_date):
+                self.write_json(self.paths.verified, self.verified_doc({
+                    NEW: {"reasoning_levels": ["low"], "levels_verified_on": old_date}}))
+                rc, out, err = self.record(NEW, "no", "", "yes")
+                self.assertEqual(rc, 0, out + err)
+                doc = self.read_json(self.paths.verified)
+                self.assertEqual(doc["verified_on"], "2026-11-16")
+                self.assertEqual(doc["models"][NEW], expected)
+
+    def test_same_date_reasoning_conflict_is_unknown_and_newer_verified_record_wins(self):
+        self.config["verified_capabilities"] = {
+            "verified_on": "2026-11-16", "models": {NEW: {"reasoning_levels": ["high"]}}}
+        self.save_config()
+        for date, expected in (("2026-11-16", None), ("2026-11-15", ["high"])):
+            with self.subTest(date=date):
+                self.write_json(self.paths.verified, self.verified_doc({
+                    NEW: {"reasoning_levels": ["low"], "levels_verified_on": date}}))
+                ctx = self.mod.build_context(self.paths, NOW)
+                levels, provenance = self.mod.verified_reasoning_levels(NEW, ctx)
+                self.assertEqual(levels, expected)
+                if expected is None:
+                    self.assertIn("disagree", provenance)
+
+    def test_invalid_stale_and_future_records_never_authorize_live_replacements(self):
+        for doc in (
+            {"kind": "wrong"},
+            self.verified_doc(date="2026-10-16"),
+            self.verified_doc(date="2026-11-17"),
+            self.verified_doc({NEW: {"reasoning_levels": ["xhigh"]}}),
+        ):
+            with self.subTest(doc=doc):
+                self.write_json(self.paths.verified, doc)
+                ctx = self.mod.build_context(self.paths, NOW)
+                self.assert_no_changes(self.rows(ctx))
+                self.assertFalse(ctx["availability"][2])
+
+    def test_concurrent_edit_or_symlink_at_save_is_refused_without_clobbering(self):
+        original_ask = self.mod._ask
+        human = self.verified_doc({USER_ONLY: {}})
+
+        def concurrent(prompt):
+            if prompt.startswith("Type 'yes'"):
+                self.write_json(self.paths.verified, human)
+            return original_ask(prompt)
+
+        with mock.patch.object(self.mod, "_ask", side_effect=concurrent):
+            rc, out, err = self.record(NEW, "no", "high", "yes")
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("changed while", err)
+        self.assertEqual(self.read_json(self.paths.verified), human)
+        Path(self.paths.verified).unlink()
+        target = self.home / "human-record.json"
+        self.write_json(target, human)
+        Path(self.paths.verified).symlink_to(target)
+        rc, out, err = self.record(NEW, "no", "high", "yes")
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("symlink", err)
+        self.assertEqual(self.read_json(target), human)
+
+
+class TestOptionalSelectionAndEvidence(LiveRefreshCase):
+    def test_premium_is_explicit_only_with_documented_relevance_and_both_price_differences(self):
+        self.premium()
+        before = self.routing_bytes()
+        proposal_id = self.proposal()
+        doc = self.read_json(self.paths.proposal)
+        self.assertEqual(doc["selected"], [])
+        self.assertTrue(all(v["model"] == CHEAP for v in doc["overrides"].values()))
+        n = self.numbered(proposal_id, "reviewer.stronger")
+        ctx = self.mod.build_context(self.paths, NOW)
+        rows = self.mod.evaluate(ctx)
+        self.mod.number_alternatives(rows)
+        rendered = "\n".join(self.mod.render_alternatives(ctx, rows))
+        self.assertIn("documented differentiator", rendered)
+        self.assertIn("official per-client table", rendered)
+        self.assertIn("+$2.00/1M, +20%", rendered)
+        self.assertIn("+$8.00/1M, +80%", rendered)
+        self.assertIn("vendor's description, not a measurement", rendered)
+        with mock.patch.object(self.mod, "_fetch_capability_bytes", side_effect=AssertionError("select fetched")), \
+                mock.patch.object(self.mod, "refresh_pricing", side_effect=AssertionError("select fetched")):
+            rc, out, err = self.cli("select", "--proposal-id", proposal_id, "--choose", str(n), now=NOW + 1)
+        self.assertEqual(rc, 0, out + err)
+        selected = self.read_json(self.paths.proposal)
+        self.assertNotEqual(selected["proposal_id"], proposal_id)
+        self.assertNotEqual(selected["seal"], doc["seal"])
+        self.assertEqual(selected["created_epoch"], doc["created_epoch"])
+        self.assertEqual(selected["expires_epoch"], doc["expires_epoch"])
+        self.assertEqual(selected["selected"], [n])
+        self.assertEqual(selected["overrides"]["reviewer.stronger"],
+                         dict(self.defaults["reviewer.stronger"], model=NEW))
+        self.assertIn("costs MORE", out)
+        self.assertEqual(self.routing_bytes(), before)
+        rc, out, err = self.cli("apply", "--proposal-id", selected["proposal_id"], now=NOW + 1)
+        self.assertEqual(rc, 0, out + err)
+        state = self.read_json(self.paths.state)
+        applied = state["overrides"]
+        self.assertEqual({key: {field: rec[field] for field in self.mod.FIELDS}
+                          for key, rec in applied.items()}, selected["overrides"])
+        for rec in applied.values():
+            self.assertEqual(rec["snapshot_id"], selected["snapshot_id"])
+            self.assertEqual(rec["applied_at"], self.mod.now_iso(NOW + 1))
+        self.assertEqual(state["history"][-1]["proposal_id"], selected["proposal_id"])
+        instruction = Path(self.paths.instructions).read_text()
+        self.assertNotIn("Synthetic fixture tasks", instruction)
+        self.assertNotIn("docs.github.com", instruction)
+        self.assertNotIn("12.00", instruction)
+
+    def test_tampered_frozen_alternative_is_refused_by_select_without_routing_or_key_changes(self):
+        self.premium()
+        proposal_id = self.proposal()
+        n = self.numbered(proposal_id, "tester")
+        doc = self.read_json(self.paths.proposal)
+        next(a for a in doc["alternatives"] if a["n"] == n)["values"]["model"] = "fixture-forged-premium"
+        self.write_json(self.paths.proposal, doc)
+        before = self.routing_bytes()
+        key_before = Path(self.paths.proposal_key).read_bytes()
+        rc, out, err = self.cli("select", "--proposal-id", proposal_id, "--choose", str(n))
+        self.assertEqual(rc, 4, err)
+        self.assertIn("altered", err)
+        self.assertEqual(self.routing_bytes(), before)
+        self.assertEqual(Path(self.paths.proposal_key).read_bytes(), key_before)
+
+    def test_select_refuses_unsafe_key_without_repairing_it_or_writing_routing(self):
+        self.premium()
+        proposal_id = self.proposal()
+        n = self.numbered(proposal_id, "tester")
+        key_path = Path(self.paths.proposal_key)
+        key_before = key_path.read_bytes()
+        os.chmod(key_path, 0o644)
+        before = self.routing_bytes()
+        rc, out, err = self.cli("select", "--proposal-id", proposal_id, "--choose", str(n))
+        self.assertEqual(rc, 4, err)
+        self.assertIn("not trusted", err)
+        self.assertEqual(key_path.read_bytes(), key_before)
+        self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o644)
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_newness_category_price_and_excels_at_alone_do_not_offer_an_alternative(self):
+        self.markdown = self.live_prices(new=12, cheap=11)
+        ctx = self.context()
+        rows = self.rows(ctx)
+        self.assert_no_changes(rows)
+        self.assertTrue(all(not r["alternatives"] for r in rows.values()))
+        self.assertIn("no documented differentiator", repr(rows["tester"]["considered"]))
+
+    def test_optional_only_noop_proposal_decline_never_changes_baseline(self):
+        self.premium(cheap=11)
+        before = self.routing_bytes()
+        rc, out, err = self.cli("propose", "--offline")
+        self.assertEqual(rc, 3, out + err)
+        doc = self.read_json(self.paths.proposal)
+        self.assertTrue(doc["alternatives"])
+        self.assertEqual(doc["overrides"], {})
+        self.assertEqual(doc["route_changes"], [])
+        self.assertIn("nothing changes unless you select one", out)
+        rc, out, err = self.cli("discard", "--proposal-id", doc["proposal_id"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_invalid_duplicate_zero_missing_and_two_choices_for_one_route_never_write_routing(self):
+        self.premium(cheap=11)
+        rc, out, err = self.cli("propose", "--offline")
+        self.assertEqual(rc, 3, out + err)
+        doc = self.read_json(self.paths.proposal)
+        same_route = [a["n"] for a in doc["alternatives"] if a["route"] == "tester"]
+        self.assertEqual(len(same_route), 2)
+        before = self.routing_bytes()
+        frozen = Path(self.paths.proposal).read_bytes()
+        for choice in ("", "0", "999", "1,1", "-1", "yes", "1; echo nope",
+                       ",".join(map(str, same_route))):
+            with self.subTest(choice=choice):
+                rc, out, err = self.cli("select", "--proposal-id", doc["proposal_id"], "--choose", choice)
+                self.assertEqual(rc, 4, out + err)
+                self.assertEqual(self.routing_bytes(), before)
+                self.assertEqual(Path(self.paths.proposal).read_bytes(), frozen)
+
+    def test_pins_unknown_current_price_and_unknown_candidate_price_offer_no_alternatives(self):
+        self.premium()
+        self.config["pins"] = {"tester": {"model": self.defaults["tester"]["model"]}}
+        self.save_config()
+        ctx = self.mod.build_context(self.paths, NOW)
+        self.assertEqual(self.rows(ctx)["tester"]["alternatives"], [])
+        self.markdown = b"\n".join(line for line in self.markdown.splitlines()
+                                  if not line.startswith(("| %s |" % NEW).encode()))
+        self.seed_cache()
+        ctx = self.mod.build_context(self.paths, NOW)
+        self.assertTrue(all(a["model"] != NEW for r in self.rows(ctx).values() for a in r["alternatives"]))
+        baseline = self.defaults["coder"]["model"]
+        self.markdown = b"\n".join(line for line in self.markdown.splitlines()
+                                  if not line.startswith(("| %s |" % baseline).encode()))
+        self.seed_cache()
+        row = self.rows(self.mod.build_context(self.paths, NOW))["coder"]
+        self.assertIsNone(row["current_cost"])
+        self.assertIsNone(row["proposed"])
+        self.assertEqual(row["alternatives"], [])
+
+    def test_changed_verified_record_and_cache_content_identity_refuse_select_and_apply(self):
+        for command, changed in (("select", "verified"), ("apply", "capability-content"), ("apply", "pricing")):
+            with self.subTest(command=command, changed=changed):
+                # These are independent input mutations: do not carry the
+                # first case's complete-list exclusion into later proposals.
+                Path(self.paths.verified).unlink(missing_ok=True)
+                self.premium()
+                proposal_id = self.proposal()
+                before = self.routing_bytes()
+                n = self.numbered(proposal_id, "tester")
+                if changed == "verified":
+                    self.write_json(self.paths.verified, self.verified_doc())
+                elif changed == "capability-content":
+                    doc = self.read_json(self.paths.capabilities)
+                    doc["sources"]["model_comparison"]["content_sha256"] = "f" * 64
+                    self.write_json(self.paths.capabilities, doc)
+                else:
+                    self.seed_cache(markdown=self.live_prices(new=13, cheap=5))
+                args = ("--choose", str(n)) if command == "select" else ()
+                rc, out, err = self.cli(command, "--proposal-id", proposal_id, *args)
+                self.assertEqual(rc, 4, out + err)
+                self.assertIn("changed", err)
+                self.assertEqual(self.routing_bytes(), before)
+
+    def test_tampered_parsed_capability_evidence_refuses_apply_even_when_route_choices_are_unchanged(self):
+        self.context()
+        proposal_id = self.proposal()
+        before = self.routing_bytes()
+        doc = self.read_json(self.paths.capabilities)
+        doc["sources"]["model_comparison"]["sections"]["tasks"]["models"][NEW]["excels_at"] = "Altered evidence"
+        self.write_json(self.paths.capabilities, doc)
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, "changed parsed capability evidence accepted: rc=%s %s %s" %
+                         (rc, out[:140], err))
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_tampered_parsed_prices_refuse_apply_even_when_cheapest_model_is_unchanged(self):
+        self.context()
+        proposal_id = self.proposal()
+        before = self.routing_bytes()
+        path = self.pricing.official_pricing_cache_path()
+        doc = self.read_json(path)
+        rates = doc["models"][NEW]["tiers"]["default"]
+        for field in ("input", "cached_input", "cache_write", "output"):
+            rates[field] = 6
+        self.write_json(path, doc)
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, "changed parsed price evidence accepted: rc=%s %s %s" %
+                         (rc, out[:140], err))
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_expiring_evidence_inside_proposal_ttl_refuses_without_network(self):
+        for evidence in ("supported_models", "pricing"):
+            with self.subTest(evidence=evidence):
+                self.seed_cache(age=DAY - 100 if evidence == "pricing" else 0)
+                self.seed_docs({"supported_models": 3 * DAY - 100} if evidence == "supported_models" else {})
+                rc, out, err = self.cli("propose", "--offline")
+                self.assertEqual(rc, 0, out + err)
+                proposal_id = self.read_json(self.paths.proposal)["proposal_id"]
+                before = self.routing_bytes()
+                rc, out, err = self.cli("apply", "--proposal-id", proposal_id, now=NOW + 101)
+                self.assertEqual(rc, 4, out + err)
+                self.assertEqual(self.routing_bytes(), before)
+                self.assertEqual(self.events, [])
+
+    def test_future_dated_proposal_is_refused(self):
+        self.context()
+        proposal_id = self.proposal()
+        before = self.routing_bytes()
+        doc = self.read_json(self.paths.proposal)
+        doc["created_epoch"] = NOW + 60
+        doc["created_at"] = self.mod.now_iso(NOW + 60)
+        self.write_json(self.paths.proposal, doc)
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, "future-dated proposal accepted: rc=%s %s %s" % (rc, out[:140], err))
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_altered_expiry_cannot_extend_frozen_fifteen_minute_ttl(self):
+        self.context()
+        proposal_id = self.proposal()
+        before = self.routing_bytes()
+        doc = self.read_json(self.paths.proposal)
+        doc["expires_epoch"] = NOW + 3600
+        self.write_json(self.paths.proposal, doc)
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id, now=NOW + 901)
+        self.assertEqual(rc, 4, "proposal TTL extension accepted: rc=%s %s %s" % (rc, out[:140], err))
+        self.assertEqual(self.routing_bytes(), before)
+
+    def test_applied_proposal_replay_and_old_format_are_refused(self):
+        self.context()
+        proposal_id = self.proposal()
+        frozen = Path(self.paths.proposal).read_bytes()
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 0, out + err)
+        self.write(self.paths.proposal, frozen)
+        before = self.routing_bytes()
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("replay", err)
+        self.assertEqual(self.routing_bytes(), before)
+        doc = json.loads(frozen)
+        doc["format"] = 1
+        self.write_json(self.paths.proposal, doc)
+        rc, out, err = self.cli("apply", "--proposal-id", proposal_id)
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("older version", err)
+        self.assertEqual(self.routing_bytes(), before)
 
 
 if __name__ == "__main__":
