@@ -6,6 +6,51 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/
 
 ## [Unreleased]
 
+### Changed — menu `p`: balanced options (nothing preselected), automatic third-party comparisons, compact colour overview (model-live-refresh-c3)
+
+- **Balanced policy (new default).** `copilot-model-refresh.py propose` /
+  `preview` (and menu `p`) no longer propose any change automatically.
+  Per unpinned route they offer numbered options among models passing every
+  official gate: every eligible model at least 10% cheaper (not only the
+  cheapest), and not-cheaper models with a documented official
+  differentiator or a fresh reviewed third-party comparison of that exact
+  pair reporting a higher score on at least one comparable metric — only
+  when the page states both models' effort and it equals the route's
+  levels (otherwise the scores are context only). A route whose
+  effort/context drifted from its shipped baseline is flagged and, when
+  possible, gets a same-model alignment option. Nothing
+  is preselected; you choose by number (at most one per route), confirm what
+  is unverified about your choice, then type `yes`. The legacy behaviour is
+  `--cost-led` (menu `p`: `COPILOT_MODEL_REFRESH_POLICY=cost-led`).
+- **Third-party comparisons (automatic, reference only).** New library
+  `bin/copilot_model_benchmarks.py` (installed next to the helper) GETs a
+  fixed, reviewed list of public comparison pages (initially BenchLeader
+  and BenchLM pages for claude-sonnet-5.5 vs gpt-6.1-terra and gpt-6.1-sol
+  vs gpt-6.2-sol) on every propose/preview: fixed hosts, public-IP-only
+  DNS check with a pinned connection, TLS verified, redirects refused,
+  timeouts, shared deadline, 1 MB cap, no cookies/auth/query/user data.
+  Strict versioned parsers verify page identity, date and allowlisted
+  metrics (unknown stays unknown); effort is recorded only where stated.
+  Cached in `model-refresh/benchmark-evidence.json` (reused 5 min, fresh
+  24 h, older = reference only). Shown per option with source, date,
+  effort/harness, metrics as reported, disagreement disclosures and
+  cautions; never a gate, never averaged, third-party prices never read.
+  Switch off with `--offline` or `COPILOT_MODEL_REFRESH_BENCHMARKS_FETCH=0`.
+- **Compact output.** A change-first overview (sources, every route,
+  options with official rates, third-party evidence, coverage, next step)
+  replaces the ~300-line report, which is now the details view:
+  `--details`, new read-only `details [--proposal-id ID]` (cached copies
+  only), or `d` at the menu `p` prompt. Semantic colour only on a terminal
+  (`NO_COLOR`/`TERM=dumb` disable it; machine lines never coloured);
+  `copilot-s` decides colour/width from its own terminal and forwards
+  `COPILOT_MODEL_REFRESH_COLOR` and `COLUMNS`. Text wraps without breaking
+  model IDs, prices or warnings.
+- **Safety.** Proposal format 4 seals the policy and binds the third-party
+  cache/registry digest; `select`/`review`/`apply` stay cache-only and refuse
+  on any change; older proposals are refused. `select` replaces the earlier
+  selection. Menu `p` re-offers the renumbered options (max 3 rounds) when a
+  `/model` answer drops a selection. Machine-line formats are unchanged.
+
 ### Changed — menu `p` asks about the proposed models instead of a full `/model` inventory (model-live-refresh-c2)
 
 - `copilot-model-refresh.py propose --review` (used by `copilot-s` menu `p`)

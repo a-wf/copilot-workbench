@@ -8,6 +8,7 @@ The real shared pricing parser runs, but its transport is always injected.
 
 import contextlib
 import copy
+import functools
 import hashlib
 import hmac
 import importlib.util
@@ -46,6 +47,11 @@ def load_module(name, path):
 
 
 class RefreshCase(unittest.TestCase):
+    # Preserve the existing cost-led contracts as EXPLICIT legacy-policy
+    # coverage. New balanced/compact tests below use the unadapted defaults.
+    TEST_POLICY = "cost-led"
+    TEST_DETAILS = True
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="model-refresh-test-")
         self.addCleanup(self.tmp.cleanup)
@@ -65,6 +71,14 @@ class RefreshCase(unittest.TestCase):
             time.tzset()
         self.addCleanup(self.restore_environment)
         self.mod = load_module("model_refresh_under_test", HELPER)
+        if self.TEST_POLICY:
+            self.mod.build_context = functools.partial(
+                self.mod.build_context, policy=self.TEST_POLICY)
+        for target in ("socket.getaddrinfo", "socket.create_connection",
+                       "socket.socket.connect", "socket.socket.connect_ex"):
+            guard = mock.patch(target, side_effect=AssertionError("live network forbidden"))
+            guard.start()
+            self.addCleanup(guard.stop)
         self.pricing = load_module("refresh_pricing_under_test", REPORT)
         self.paths = self.mod.Paths()
         self.pricing.SUPPORT_DIR = str(self.home / "isolated-pricing")
@@ -169,6 +183,12 @@ class RefreshCase(unittest.TestCase):
         return snapshot
 
     def cli(self, *args, now=NOW):
+        args = list(args)
+        if args and args[0] in ("preview", "propose"):
+            if self.TEST_POLICY == "cost-led" and "--cost-led" not in args:
+                args.append("--cost-led")
+            if self.TEST_DETAILS and "--details" not in args:
+                args.append("--details")
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = self.mod.main(list(args), now=now)
@@ -276,7 +296,8 @@ class TestRefreshLifecycle(RefreshCase):
         self.assertEqual(len(doc["route_changes"]), 10)
         self.assertEqual(set(doc["digests"]), {
             "settings", "state", "user_config", "routing", "catalog", "instructions", "effective",
-            "verified", "capabilities", "pricing"})
+            "verified", "capabilities", "pricing", "benchmarks", "economics"})
+        self.assertEqual(doc["digests"]["economics"], self.mod.economics_digest())
         self.assertEqual(self.routing_bytes(), before)
         rc, out, err = self.cli("discard", "--proposal-id", proposal_id)
         self.assertEqual(rc, 0, err)
@@ -2196,11 +2217,12 @@ class TestOptionalSelectionAndEvidence(LiveRefreshCase):
         rows = self.mod.evaluate(ctx)
         self.mod.number_alternatives(rows)
         rendered = "\n".join(self.mod.render_alternatives(ctx, rows))
-        self.assertIn("documented differentiator", rendered)
+        self.assertIn("official differentiator", rendered)
         self.assertIn("official per-client table", rendered)
         self.assertIn("+$2.00/1M, +20%", rendered)
         self.assertIn("+$8.00/1M, +80%", rendered)
-        self.assertIn("vendor's description, not a measurement", rendered)
+        self.assertIn("NOT a measured, equal or better quality claim", rendered)
+        self.assertNotIn("Synthetic fixture tasks", rendered)
         with mock.patch.object(self.mod, "_fetch_capability_bytes", side_effect=AssertionError("select fetched")), \
                 mock.patch.object(self.mod, "refresh_pricing", side_effect=AssertionError("select fetched")):
             rc, out, err = self.cli("select", "--proposal-id", proposal_id, "--choose", str(n), now=NOW + 1)
@@ -2266,7 +2288,7 @@ class TestOptionalSelectionAndEvidence(LiveRefreshCase):
         rows = self.rows(ctx)
         self.assert_no_changes(rows)
         self.assertTrue(all(not r["alternatives"] for r in rows.values()))
-        self.assertIn("no documented differentiator", repr(rows["tester"]["considered"]))
+        self.assertIn("no documented official differentiator", repr(rows["tester"]["considered"]))
 
     def test_optional_only_noop_proposal_decline_never_changes_baseline(self):
         self.premium(cheap=11)
@@ -2277,7 +2299,8 @@ class TestOptionalSelectionAndEvidence(LiveRefreshCase):
         self.assertTrue(doc["alternatives"])
         self.assertEqual(doc["overrides"], {})
         self.assertEqual(doc["route_changes"], [])
-        self.assertIn("nothing changes unless you select one", out)
+        self.assertIn("NONE is preselected", out)
+        self.assertIn("nothing changes until you confirm with an exact yes", out)
         rc, out, err = self.cli("discard", "--proposal-id", doc["proposal_id"])
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self.routing_bytes(), before)
@@ -2697,7 +2720,7 @@ class TestProposalScopedReview(LiveRefreshCase):
         self.assertEqual(kept[0]["values"], dict(self.defaults["tester"], model=NEW))
         self.assertNotEqual(kept[0]["n"], keep_n, "the renumbered table must not reuse stale selections")
         self.assertTrue(all(a["values"]["model"] != CHEAP for a in checked["alternatives"]))
-        self.assertIn("dropped", out)
+        self.assertIn("Dropped:", out)
         self.assertEqual(self.machine(out, "SELECTED"), [["1"]])
         self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
         for field in ("snapshot_id", "digests", "created_epoch", "expires_epoch"):
@@ -2807,6 +2830,1391 @@ class TestProposalScopedReview(LiveRefreshCase):
         self.assertEqual(routes["coder"]["model"], "OMIT")
         self.assertEqual(routes["task"], self.defaults["task"])
         self.assertEqual(routes["reviewer.stronger"]["reasoning_effort"], "max")
+
+
+BENCHMARK_HELPER = ROOT / "bin" / "copilot_model_benchmarks.py"
+
+
+def comparison_fixture(pair, values=None, efforts=("max", "max"), updated=True,
+                       reverse=False):
+    """Entirely synthetic provider layouts; not copied public/source data."""
+    names = [n for _mid, n in pair["models"]]
+    if pair["provider"] == "benchleader":
+        metrics = values or (
+            ("Terminal-Bench", "Terminal-Bench", "70%", "80%"),
+            ("Coding score", "BenchLeader", "72", "82"),
+            ("Agents & tools score", "BenchLeader", "90", "60"),
+        )
+        columns = ["%s%s" % (n, " (%s)" % e if e else "")
+                   for n, e in zip(names, efforts)]
+        if reverse:
+            columns.reverse()
+        lines = ["---", "url: " + pair["page"], "---",
+                 "# %s vs %s" % tuple(names)]
+        if updated:
+            lines.append("Updated 16 November 2026")
+        lines += ["## Every benchmark", "| Metric | Publisher | %s | %s |" % tuple(columns),
+                  "|---|---|---|---|"]
+        for label, publisher, a, b in metrics:
+            if reverse:
+                a, b = b, a
+            lines.append("| %s | %s | %s | %s |" % (label, publisher, a, b))
+    else:
+        metrics = values or (("Terminal-Bench 4.0", "86%", "70%"),)
+        columns = list(reversed(names)) if reverse else names
+        lines = ["# %s vs %s" % tuple(names), "- Canonical page: " + pair["page"]]
+        if updated:
+            lines.append("- Last updated: November 16, 2026")
+        lines += ["## Category Breakdown", "### Coding",
+                  "- %s public-lane score: 90 (Supported: synthetic fixture)" % names[0],
+                  "- %s public-lane score: 60 (Supported: synthetic fixture)" % names[1],
+                  "| Benchmark | %s | %s | Winner |" % tuple(columns),
+                  "|---|---|---|---|"]
+        for label, a, b in metrics:
+            if reverse:
+                a, b = b, a
+            lines.append("| %s | %s | %s | irrelevant remote winner |" % (label, a, b))
+    return ("\n".join(lines) + "\n").encode()
+
+
+class TestPublicBenchmarkEvidence(unittest.TestCase):
+    """Offline parsing, cache, comparison and bounded transport contracts."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="benchmark-fixture-")
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = Path(self.tmp.name) / "state" / "benchmark-evidence.json"
+        self.b = load_module("benchmark_fixture_test", BENCHMARK_HELPER)
+        self.clock = mock.patch.object(self.b.time, "monotonic", return_value=100.0)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        for target in ("socket.getaddrinfo", "socket.create_connection",
+                       "socket.socket.connect", "socket.socket.connect_ex"):
+            patch = mock.patch(target, side_effect=AssertionError("live network forbidden"))
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.calls = []
+
+    def fetch(self, url, timeout, max_bytes, deadline):
+        self.calls.append((url, timeout, max_bytes, deadline))
+        pair = next(p for p in self.b.PAIRS if p["url"] == url)
+        return comparison_fixture(pair)
+
+    def refreshed(self, now=NOW, fetcher=None):
+        return self.b.refresh(str(self.cache), now, True, fetcher=fetcher or self.fetch)
+
+    def compared(self, ctx):
+        return self.b.comparison(ctx, "gpt-6.1-sol", NEW, "max", "max")
+
+    def test_fixed_registry_and_exact_public_urls_only(self):
+        self.assertEqual(len(self.b.PAIRS), 4)
+        self.assertEqual({p["provider"] for p in self.b.PAIRS}, {"benchleader", "benchlm"})
+        self.assertEqual({frozenset(m for m, _ in p["models"]) for p in self.b.PAIRS},
+                         {frozenset(("claude-sonnet-5.5", "gpt-6.1-terra")),
+                          frozenset(("gpt-6.1-sol", NEW))})
+        self.assertEqual(self.b.ALLOWED_URLS, frozenset(p["url"] for p in self.b.PAIRS))
+        for p in self.b.PAIRS:
+            self.assertTrue(p["url"].startswith("https://"))
+            self.assertNotRegex(p["url"], r"[@?#]")
+
+    def test_fetch_all_fresh_attributable_values_no_average_or_winner(self):
+        ctx = self.refreshed()
+        self.assertEqual(self.calls, [(p["url"], 8, 1_000_000, 120.0) for p in self.b.PAIRS])
+        self.assertTrue(all(s["status"] == "fresh" for s in ctx["pairs"].values()))
+        comp = self.compared(ctx)
+        self.assertTrue(comp["supports"])
+        self.assertTrue(comp["mixed"])
+        self.assertTrue(comp["providers_disagree"])
+        self.assertEqual({e["provider"] for e in comp["fresh"]}, {"BenchLeader", "BenchLM"})
+        entry = next(e for e in comp["fresh"] if e["provider"] == "BenchLeader")
+        metric = next(m for m in entry["metrics"] if m["key"] == "terminal_bench")
+        self.assertEqual((metric["current"], metric["candidate"], metric["publisher"], metric["unit"]),
+                         (70.0, 80.0, "Terminal-Bench", "%"))
+        self.assertEqual(entry["updated_on"], "2026-11-16")
+        self.assertEqual(entry["fetched_at"], self.b._now_iso(NOW))
+        self.assertEqual(entry["efforts"], {"gpt-6.1-sol": "max", NEW: "max"})
+        other = next(e for e in comp["fresh"] if e["provider"] == "BenchLM")
+        self.assertEqual(other["efforts"], {"gpt-6.1-sol": None, NEW: None})
+        self.assertFalse({"average", "overall_winner", "recommendation"} & comp.keys())
+        self.assertEqual(stat.S_IMODE(self.cache.stat().st_mode), 0o600)
+        self.assertNotIn("irrelevant remote winner", self.cache.read_text())
+        self.assertNotIn("synthetic fixture", self.cache.read_text())
+        self.assertEqual(self.b.comparison(ctx, CHEAP, NEW)["fresh"], [])
+
+    def test_reverse_columns_preserve_exact_model_identity(self):
+        for pair in self.b.PAIRS:
+            with self.subTest(provider=pair["provider"], pair=pair["id"]):
+                normal = self.b.parse_page(pair, comparison_fixture(pair))
+                reverse = self.b.parse_page(pair, comparison_fixture(pair, reverse=True))
+                self.assertEqual(normal, reverse)
+
+    def test_cache_reuse_five_minutes_freshness_and_future_are_exact(self):
+        self.refreshed()
+        self.calls.clear()
+        self.refreshed(now=NOW + 299)
+        self.assertEqual(self.calls, [])
+        self.refreshed(now=NOW + 300)
+        self.assertEqual(len(self.calls), 4)
+        cache, warning = self.b.read_cache(str(self.cache))
+        self.assertIsNone(warning)
+        for age, state in ((0, "fresh"), (86400, "fresh"),
+                           (86401, "stale"), (-1, "future")):
+            with self.subTest(age=age):
+                ctx = self.b.context(cache, NOW + 300 + age)
+                self.assertEqual({s["status"] for s in ctx["pairs"].values()}, {state})
+                self.assertEqual(self.compared(ctx)["supports"], state == "fresh")
+
+    def test_partial_error_retains_copy_and_sanitizes_error_without_poisoning_other_sources(self):
+        old = self.refreshed()
+        pid = self.b.PAIRS[0]["id"]
+
+        def partial(url, *args):
+            if url == self.b.PAIRS[0]["url"]:
+                raise OSError("\x1b]8;;https://evil.invalid\x07bad\x1b[31m\n\u202eerror")
+            return self.fetch(url, *args)
+
+        ctx = self.refreshed(now=NOW + 300, fetcher=partial)
+        self.assertEqual(ctx["pairs"][pid]["record"], old["pairs"][pid]["record"])
+        self.assertIn("REFRESH FAILED", ctx["pairs"][pid]["note"])
+        self.assertNotRegex(ctx["pairs"][pid]["note"], r"[\x00-\x1f\u202a-\u202e]")
+        self.assertTrue(all(s["status"] == "fresh" for s in ctx["pairs"].values()))
+        stale = self.refreshed(now=NOW + DAY + 1,
+                               fetcher=lambda *a: (_ for _ in ()).throw(OSError("unavailable")))
+        self.assertEqual(stale["pairs"][pid]["status"], "stale")
+        self.assertIsNotNone(stale["pairs"][pid]["record"])
+
+    def test_missing_and_malformed_bodies_are_nonfatal_unknown(self):
+        for raw in (b"not a comparison", b"\xff", None, "not bytes", b"x" * 1_000_001):
+            with self.subTest(raw_type=type(raw).__name__):
+                self.cache.unlink(missing_ok=True)
+                ctx = self.refreshed(fetcher=lambda *args: raw)
+                self.assertEqual({s["status"] for s in ctx["pairs"].values()}, {"missing"})
+                self.assertFalse(self.compared(ctx)["supports"])
+                self.assertTrue(all(s["last_error"] for s in ctx["pairs"].values()))
+
+    def test_shared_budget_skips_remaining_requests_after_deadline(self):
+        with mock.patch.object(self.b.time, "monotonic", side_effect=(100, 100, 121, 121, 121)):
+            ctx = self.refreshed()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(sum(s["status"] == "missing" for s in ctx["pairs"].values()), 3)
+        self.assertTrue(all("deadline" in s["last_error"] for s in list(ctx["pairs"].values())[1:]))
+
+    def test_cache_only_and_kill_switches_do_not_fetch_or_write(self):
+        self.refreshed()
+        before = self.cache.read_bytes(), self.cache.stat().st_mtime_ns
+        ctx = self.b.refresh(str(self.cache), NOW + DAY + 1, False, "offline",
+                             fetcher=mock.Mock(side_effect=AssertionError("offline fetch")))
+        self.assertEqual(before, (self.cache.read_bytes(), self.cache.stat().st_mtime_ns))
+        self.assertFalse(self.compared(ctx)["supports"])
+        self.assertIn("offline", self.b.fetch_disabled_reason(offline=True))
+        for value in ("0", "off", "false", "no"):
+            with mock.patch.dict(os.environ, {self.b.FETCH_ENV: value}):
+                self.assertIn("disabled", self.b.fetch_disabled_reason())
+        with mock.patch.dict(os.environ, {self.b.FETCH_ENV: "1"}):
+            self.assertIsNone(self.b.fetch_disabled_reason())
+            self.assertEqual(self.b.fetch_disabled_reason(extra_disabled="fixture"), "fixture")
+
+    def test_all_sources_unavailable_does_not_claim_quality_or_support(self):
+        ctx = self.refreshed(fetcher=lambda *a: (_ for _ in ()).throw(TimeoutError("timeout")))
+        self.assertFalse(self.compared(ctx)["supports"])
+        self.assertEqual(self.compared(self.b.unavailable_context("missing module"))["fresh"], [])
+        self.assertEqual({s["status"] for s in ctx["pairs"].values()}, {"missing"})
+
+    def test_title_canonical_headers_and_layout_mismatch_refuse(self):
+        for pair in self.b.PAIRS:
+            good = comparison_fixture(pair)
+            mutations = (good.replace(pair["page"].encode(), b"https://wrong.invalid/pair"),
+                         good.replace(pair["models"][0][1].encode(), b"Another model", 1),
+                         good.replace(b"Every benchmark", b"Another section")
+                         if pair["provider"] == "benchleader" else
+                         good.replace(b"Category Breakdown", b"Another section"),
+                         good.replace(b"Metric | Publisher", b"Metric | Not publisher")
+                         if pair["provider"] == "benchleader" else
+                         good.replace(b"| Winner |", b"| Not winner |"))
+            for i, raw in enumerate(mutations):
+                with self.subTest(pair=pair["id"], mutation=i):
+                    with self.assertRaises(self.b.BenchmarkError):
+                        self.b.parse_page(pair, raw)
+
+    def test_unknown_zero_invalid_units_ranges_and_missing_are_not_invented(self):
+        pair = self.b.PAIRS[1]
+        for raw, expected in (("0%", 0.0), ("100%", 100.0), ("n/a", None), ("—", None),
+                              ("coming soon", None), ("101%", None), ("-1%", None),
+                              ("80", None), ("NaN%", None), ("inf%", None),
+                              ("80% estimated", None), ("1e2%", None)):
+            with self.subTest(value=raw):
+                parsed = self.b.parse_page(pair, comparison_fixture(pair, values=(
+                    ("Terminal-Bench", "Terminal-Bench", raw, "80%"),)))
+                metric = parsed["metrics"]["terminal_bench"]
+                self.assertEqual(metric["values"]["gpt-6.1-sol"]["value"], expected)
+        parsed = self.b.parse_page(pair, comparison_fixture(pair, updated=False))
+        self.assertIsNone(parsed["updated_on"])
+
+    def test_duplicate_conflicting_and_other_effort_rows_never_support(self):
+        pair = self.b.PAIRS[1]
+        for values in (
+                (("Terminal-Bench", "Terminal-Bench", "70%", "80%"),
+                 ("Terminal-Bench", "Terminal-Bench", "70%", "80%"),
+                 ("Coding score", "BenchLeader", "50", "40")),
+                (("Terminal-Bench", "Terminal-Bench", "70%", "80%"),
+                 ("Terminal-Bench", "Terminal-Bench", "90%", "99%"),
+                 ("Coding score", "BenchLeader", "50", "40")),
+                (("Terminal-Bench", "Terminal-Bench", "70%", "80%†"),)):
+            with self.subTest(values=values):
+                self.cache.unlink(missing_ok=True)
+                ctx = self.refreshed(fetcher=lambda url, *a: comparison_fixture(pair, values=values)
+                                     if url == pair["url"] else b"unsupported layout")
+                comp = self.compared(ctx)
+                self.assertFalse(comp["supports"])
+                if len(values) > 1:
+                    m = ctx["pairs"][pair["id"]]["record"]["metrics"]["terminal_bench"]
+                    self.assertTrue(m["conflict"])
+                    self.assertTrue(all(v["value"] is None for v in m["values"].values()))
+                else:
+                    self.assertEqual(comp["fresh"][0]["metrics"][0]["why_not"],
+                                     "measured at another effort setting")
+
+    def test_benchlm_estimated_composite_is_reference_not_support(self):
+        pair = self.b.PAIRS[3]
+        raw = comparison_fixture(pair, values=(("Terminal-Bench 4.0", "90%", "80%"),))
+        raw = raw.replace(b"90 (Supported", b"30 (Estimated")
+        ctx = self.refreshed(fetcher=lambda url, *a: raw if url == pair["url"] else b"unsupported")
+        comp = self.compared(ctx)
+        self.assertFalse(comp["supports"])
+        metric = next(m for m in comp["fresh"][0]["metrics"] if m["kind"] == "composite")
+        self.assertFalse(metric["comparable"])
+        self.assertIn("estimated", metric["why_not"])
+
+    def test_cache_schema_registry_duplicates_nonfinite_and_model_identity_refuse(self):
+        self.refreshed()
+        good = self.cache.read_bytes()
+        doc = json.loads(good)
+        pid = self.b.PAIRS[1]["id"]
+        mutations = []
+        for edit in (
+                lambda d: d.update(schema_version=99),
+                lambda d: d.update(registry="0" * 64),
+                lambda d: d["records"][pid].update(url="https://private.invalid"),
+                lambda d: d["records"][pid]["efforts"].update({NEW: "invented"}),
+                lambda d: d["records"][pid]["metrics"]["terminal_bench"]["values"][NEW].update(value=True),
+                lambda d: d["records"][pid]["metrics"]["terminal_bench"]["values"][NEW].update(value=101),
+                lambda d: d["records"][pid]["metrics"]["terminal_bench"].update(label="Injected label"),
+                lambda d: d["records"][pid].update(fetched_epoch=float("nan"))):
+            changed = copy.deepcopy(doc)
+            edit(changed)
+            mutations.append(json.dumps(changed).encode())
+        mutations += [b'{"schema_version":1,"schema_version":1}',
+                      b"x" * (self.b.MAX_CACHE_BYTES + 1)]
+        for raw in mutations:
+            with self.subTest(prefix=raw[:50]):
+                self.cache.write_bytes(raw)
+                got, warning = self.b.read_cache(str(self.cache))
+                self.assertEqual(got["records"], {})
+                self.assertIsNotNone(warning)
+        self.cache.write_bytes(good)
+        self.assertIsNone(self.b.read_cache(str(self.cache))[1])
+
+    def test_cache_symlinks_refuse_and_do_not_mutate_targets(self):
+        self.refreshed()
+        real = self.cache.with_name("real.json")
+        self.cache.rename(real)
+        self.cache.symlink_to(real)
+        before = real.read_bytes()
+        cache, warning = self.b.read_cache(str(self.cache))
+        self.assertEqual(cache["records"], {})
+        self.assertIsNotNone(warning)
+        with self.assertRaises(OSError):
+            self.b._write_cache(str(self.cache), self.b.blank_cache())
+        self.assertEqual(real.read_bytes(), before)
+
+    def test_impossible_or_forged_cached_provenance_dates_are_refused(self):
+        self.refreshed()
+        good = json.loads(self.cache.read_bytes())
+        for field, value in (("updated_on", "2026-99-99"),
+                             ("fetched_at", "not a timestamp"),
+                             ("fetched_at", "2000-01-01T00:00:00Z"),
+                             ("fetched_epoch", True),
+                             ("fetched_epoch", 0),
+                             ("fetched_epoch", -1),
+                             ("fetched_epoch", 32503680000),
+                             ("fetched_epoch", "not an epoch"),
+                             ("notes", ["unsafe \x1b[31mnote"]),
+                             ("notes", ["unsafe \u202enote"])):
+            with self.subTest(field=field, value=value):
+                changed = copy.deepcopy(good)
+                changed["records"][self.b.PAIRS[1]["id"]][field] = value
+                self.cache.write_text(json.dumps(changed))
+                doc, warning = self.b.read_cache(str(self.cache))
+                self.assertEqual(doc["records"], {})
+                self.assertIsNotNone(warning)
+
+    def test_safe_text_strips_terminal_controls_bidi_and_bounds_exceptions(self):
+        unsafe = "\x1b[31mred\x1b[0m\x1b]8;;https://evil.invalid\x07link\x1b]8;;\x07" \
+                 "\r\n\x00\u202e\u2066\u200b" + "x" * 500
+        clean = self.b.safe_text(unsafe)
+        self.assertLessEqual(len(clean), 200)
+        self.assertNotRegex(clean, r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
+        self.assertNotIn("evil.invalid", clean)
+
+    def test_nonallowlisted_url_variants_are_rejected_before_dns(self):
+        url = self.b.PAIRS[0]["url"]
+        for variant in ("http:" + url[6:], url + "?auth=secret", url + "#fragment",
+                        url + "/", url.replace("www.", "user@www."),
+                        "https://127.0.0.1/path", "https://evil.invalid/path"):
+            with self.subTest(url=variant):
+                with mock.patch.object(self.b, "_public_address") as dns:
+                    with self.assertRaises(self.b.BenchmarkError):
+                        self.b.default_fetch(variant, 8, 1_000_000, 120)
+                    dns.assert_not_called()
+
+    def test_dns_every_resolved_address_must_be_global_unicast(self):
+        import socket
+
+        def info(ip):
+            family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+            return family, socket.SOCK_STREAM, 6, "", (ip, 443)
+
+        for ip in ("127.0.0.1", "10.0.0.1", "169.254.1.2", "0.0.0.0",
+                   "192.0.2.1", "224.0.0.1", "::1", "fc00::1", "fe80::1",
+                   "::ffff:127.0.0.1", "not-an-ip"):
+            with self.subTest(ip=ip), mock.patch.object(
+                    socket, "getaddrinfo", return_value=[info("8.8.8.8"), info(ip)]):
+                with self.assertRaises(self.b.BenchmarkError):
+                    self.b._public_address("fixture.invalid")
+        with mock.patch.object(socket, "getaddrinfo", return_value=[info("8.8.8.8")]):
+            self.assertEqual(self.b._public_address("fixture.invalid"), (socket.AF_INET, "8.8.8.8"))
+        with mock.patch.object(socket, "getaddrinfo", return_value=[]):
+            with self.assertRaises(self.b.BenchmarkError):
+                self.b._public_address("fixture.invalid")
+
+    def test_headers_refuse_redirect_nontext_status_and_declared_oversize(self):
+        self.b._check_headers(200, "text/markdown; charset=utf-8", "10", 10)
+        for status, ctype, size in ((301, "text/plain", "0"), (302, "text/plain", "0"),
+                                     (404, "text/plain", "0"), (200, "text/html", "0"),
+                                     (200, "", "0"), (200, "text/plain", "11")):
+            with self.subTest(status=status, ctype=ctype, size=size):
+                with self.assertRaises(self.b.BenchmarkError):
+                    self.b._check_headers(status, ctype, size, 10)
+
+    def test_python_transport_pins_ip_keeps_tls_hostname_no_auth_and_bounds_bytes(self):
+        import http.client
+        import socket
+        import ssl
+
+        pair = self.b.PAIRS[0]
+        response = mock.Mock(status=200)
+        response.getheader.side_effect = lambda name: (
+            "text/markdown" if name == "Content-Type" else None)
+        response.read.side_effect = [b"fixture", b""]
+        sock, tls = mock.Mock(), mock.Mock()
+        with mock.patch.object(socket, "create_connection", return_value=sock) as create, \
+                mock.patch.object(ssl.SSLContext, "wrap_socket", return_value=tls) as wrap, \
+                mock.patch.object(http.client.HTTPSConnection, "request", autospec=True,
+                                  side_effect=lambda conn, *a, **k: conn.connect()) as request, \
+                mock.patch.object(http.client.HTTPSConnection, "getresponse", return_value=response):
+            raw = self.b._python_fetch(pair["url"], "www.benchleader.com", "/fixed",
+                                       (socket.AF_INET, "8.8.8.8"), 8, 100, 120)
+        self.assertEqual(raw, b"fixture")
+        create.assert_called_once_with(("8.8.8.8", 443), 8)
+        wrap.assert_called_once_with(sock, server_hostname="www.benchleader.com")
+        headers = request.call_args.kwargs["headers"]
+        self.assertEqual(set(headers), {"User-Agent", "Accept", "Accept-Encoding", "Connection"})
+        self.assertEqual(headers["Accept-Encoding"], "identity")
+        self.assertEqual(request.call_args.args[1:3], ("GET", "/fixed"))
+        self.assertEqual(response.read.call_args_list, [mock.call(65536), mock.call(65536)])
+        tls.close.assert_called_once()
+
+    def test_python_body_cap_and_end_of_read_total_deadline_are_enforced(self):
+        import http.client
+
+        response = mock.Mock(status=200)
+        response.getheader.side_effect = lambda name: "text/plain" if name == "Content-Type" else None
+        with mock.patch.object(http.client.HTTPSConnection, "request"), \
+                mock.patch.object(http.client.HTTPSConnection, "getresponse", return_value=response):
+            response.read.side_effect = [b"x" * 11]
+            with self.assertRaisesRegex(self.b.BenchmarkError, "large"):
+                self.b._python_fetch("", "fixture.invalid", "/", (2, "8.8.8.8"), 8, 10, 120)
+            # Simulate a slow final read: the request must not be accepted
+            # when it completes AFTER the shared total deadline.
+            def slow_eof(_size):
+                self.b.time.monotonic.return_value = 121
+                return b""
+            response.read.side_effect = slow_eof
+            with self.assertRaisesRegex(self.b.BenchmarkError, "deadline"):
+                self.b._python_fetch("", "fixture.invalid", "/", (2, "8.8.8.8"), 8, 10, 120)
+
+    def test_python_tls_verification_failure_only_uses_verified_fallback_same_pin(self):
+        import ssl
+
+        pair = self.b.PAIRS[0]
+        for error, fallback in ((ssl.SSLCertVerificationError("untrusted certificate"), True),
+                                (TimeoutError("timeout"), False),
+                                (self.b.BenchmarkError("redirect refused"), False)):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(self.b, "_public_address", return_value=(2, "8.8.8.8")), \
+                    mock.patch.object(self.b, "_python_fetch", side_effect=error), \
+                    mock.patch.object(self.b, "_curl_fetch", return_value=b"fixture") as curl:
+                if fallback:
+                    self.assertEqual(self.b.default_fetch(pair["url"], 8, 100, 120), b"fixture")
+                    self.assertEqual(curl.call_args.args,
+                                     (pair["url"], "www.benchleader.com", (2, "8.8.8.8"), 8, 100, 120))
+                else:
+                    with self.assertRaises(self.b.BenchmarkError):
+                        self.b.default_fetch(pair["url"], 8, 100, 120)
+                    curl.assert_not_called()
+
+    def test_default_fetch_rechecks_shared_deadline_after_dns_before_connecting(self):
+        pair = self.b.PAIRS[0]
+
+        def slow_dns(_host):
+            self.b.time.monotonic.return_value = 121
+            return 2, "8.8.8.8"
+
+        with mock.patch.object(self.b, "_public_address", side_effect=slow_dns), \
+                mock.patch.object(self.b, "_python_fetch", return_value=b"fixture") as fetch:
+            with self.assertRaisesRegex(self.b.BenchmarkError, "deadline"):
+                self.b.default_fetch(pair["url"], 8, 100, 120)
+            fetch.assert_not_called()
+
+    def test_expired_budget_never_starts_dns_and_late_download_is_refused(self):
+        pair = self.b.PAIRS[0]
+        with mock.patch.object(self.b, "_public_address") as dns:
+            self.b.time.monotonic.return_value = 121
+            with self.assertRaisesRegex(self.b.BenchmarkError, "before DNS"):
+                self.b.default_fetch(pair["url"], 8, 100, 120)
+            dns.assert_not_called()
+
+        self.b.time.monotonic.return_value = 100
+
+        def late_download(*args):
+            self.b.time.monotonic.return_value = 121
+            return b"complete synthetic body"
+
+        with mock.patch.object(self.b, "_public_address", return_value=(2, "8.8.8.8")), \
+                mock.patch.object(self.b, "_python_fetch", side_effect=late_download):
+            with self.assertRaisesRegex(self.b.BenchmarkError, "after download"):
+                self.b.default_fetch(pair["url"], 8, 100, 120)
+
+    def test_bounded_dns_uses_daemon_and_abandons_timeout_result(self):
+        # A fake worker models the timeout deterministically: no actual DNS,
+        # sleeping or test-owned background thread is needed.
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        with mock.patch.object(self.b.threading, "Thread", return_value=worker) as thread, \
+                mock.patch.object(self.b.socket, "getaddrinfo") as dns:
+            with self.assertRaisesRegex(self.b.BenchmarkError, "DNS lookup exceeded"):
+                self.b._getaddrinfo_bounded("fixture.invalid", 8)
+            dns.assert_not_called()
+        self.assertTrue(thread.call_args.kwargs["daemon"])
+        worker.start.assert_called_once_with()
+        worker.join.assert_called_once_with(8)
+
+    def test_curl_late_successful_response_is_refused(self):
+        pair = self.b.PAIRS[0]
+        proc = mock.Mock()
+        proc.stdout.read1.side_effect = [
+            b"fixture" + self.b._CURL_MARKER.encode() + b"200 0 text/markdown", b""]
+        proc.poll.return_value = 0
+
+        def late_wait(*args, **kwargs):
+            self.b.time.monotonic.return_value = 121
+            return 0
+
+        proc.wait.side_effect = late_wait
+        with mock.patch.object(subprocess, "Popen", return_value=proc):
+            with self.assertRaisesRegex(self.b.BenchmarkError, "deadline"):
+                self.b._curl_fetch(pair["url"], "www.benchleader.com", (2, "8.8.8.8"), 8, 100, 120)
+
+    def test_curl_fallback_no_auth_config_redirects_insecure_tls_or_proxy_and_exact_limits(self):
+        pair = self.b.PAIRS[0]
+        proc = mock.Mock()
+        proc.stdout.read1.side_effect = [b"fixture" + self.b._CURL_MARKER.encode()
+                                       + b"200 0 text/markdown", b""]
+        proc.wait.return_value = proc.poll.return_value = 0
+        with mock.patch.object(subprocess, "Popen", return_value=proc) as popen:
+            raw = self.b._curl_fetch(pair["url"], "www.benchleader.com", (2, "8.8.8.8"), 8, 100, 120)
+        self.assertEqual(raw, b"fixture")
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[1], "-q")
+        for opt, value in (("--proto", "=https"), ("--max-redirs", "0"),
+                           ("--resolve", "www.benchleader.com:443:8.8.8.8"),
+                           ("--connect-timeout", "8"), ("--max-time", "20"),
+                           ("--max-filesize", "100")):
+            self.assertEqual(argv[argv.index(opt) + 1], value)
+        self.assertFalse(set(argv) & {"-k", "--insecure", "-L", "--location", "--cookie", "--user"})
+        self.assertEqual(popen.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin"})
+        self.assertFalse(popen.call_args.kwargs["shell"])
+        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_curl_response_trailer_redirect_and_oversize_fail_closed(self):
+        pair = self.b.PAIRS[0]
+        for output in (b"no trailer", b"x" + self.b._CURL_MARKER.encode() + b"302 0 text/plain",
+                       b"x" + self.b._CURL_MARKER.encode() + b"200 1 text/plain",
+                       b"x" * 101 + self.b._CURL_MARKER.encode() + b"200 0 text/plain"):
+            with self.subTest(output=output[:60]):
+                proc = mock.Mock()
+                proc.stdout.read1.side_effect = [output, b""]
+                proc.wait.return_value = proc.poll.return_value = 0
+                with mock.patch.object(subprocess, "Popen", return_value=proc):
+                    with self.assertRaises(self.b.BenchmarkError):
+                        self.b._curl_fetch(pair["url"], "www.benchleader.com", (2, "8.8.8.8"), 8, 100, 120)
+
+    def test_support_requires_both_explicit_model_efforts_to_match_the_route(self):
+        ctx = self.refreshed()
+        for current, candidate, expected in (
+                ("max", "max", True), ("max", "low", False), ("low", "max", False),
+                ("low", "low", False), (None, "max", False), ("max", None, False), (None, None, False)):
+            with self.subTest(current=current, candidate=candidate):
+                comp = self.b.comparison(ctx, "gpt-6.1-sol", NEW, current, candidate)
+                self.assertEqual(comp["supports"], expected)
+                self.assertEqual(len(comp["fresh"]), 2, "mismatches remain visible as context")
+                leader = next(e for e in comp["fresh"] if e["provider"] == "BenchLeader")
+                self.assertEqual(leader["setup_matches"], expected)
+                self.assertEqual(leader["efforts"], {"gpt-6.1-sol": "max", NEW: "max"})
+                self.assertFalse(next(e for e in comp["fresh"] if e["provider"] == "BenchLM")["setup_matches"])
+
+        # Matching means each model's own level, not an invented requirement
+        # that the two models must have identical levels.
+        self.cache.unlink()
+        pair = self.b.PAIRS[1]
+        ctx = self.refreshed(fetcher=lambda url, *a: comparison_fixture(
+            pair, efforts=("max", "low")) if url == pair["url"] else b"unrecognized")
+        self.assertTrue(self.b.comparison(ctx, "gpt-6.1-sol", NEW, "max", "low")["supports"])
+        self.assertFalse(self.b.comparison(ctx, "gpt-6.1-sol", NEW, "max", "high")["supports"])
+        for efforts in ((None, "max"), ("max", None)):
+            with self.subTest(source_efforts=efforts):
+                self.cache.unlink()
+                ctx = self.refreshed(fetcher=lambda url, *a: comparison_fixture(
+                    pair, efforts=efforts) if url == pair["url"] else b"unrecognized")
+                self.assertFalse(self.b.comparison(ctx, "gpt-6.1-sol", NEW, "max", "max")["supports"])
+
+    def test_unknown_source_effort_with_higher_score_is_context_only(self):
+        pair = self.b.PAIRS[3]
+        raw = comparison_fixture(pair, values=(("Terminal-Bench 4.0", "70%", "80%"),))
+        ctx = self.refreshed(fetcher=lambda url, *a: raw if url == pair["url"] else b"unrecognized")
+        comp = self.b.comparison(ctx, "gpt-6.1-sol", NEW, "xhigh", "xhigh")
+        self.assertFalse(comp["supports"])
+        self.assertEqual(len(comp["fresh"]), 1)
+        self.assertFalse(comp["fresh"][0]["setup_matches"])
+        metric = next(m for m in comp["fresh"][0]["metrics"] if m["key"] == "terminal_bench_40")
+        self.assertEqual((metric["current"], metric["candidate"]), (70, 80))
+        self.assertTrue(metric["comparable"], "numeric context is not erased or turned into a support claim")
+
+    def test_long_malicious_heading_is_skipped_valid_pages_remain_safe(self):
+        self.assertEqual(self.b.MAX_LINE_CHARS, 20_000)
+        noise = "## " + " " * (self.b.MAX_LINE_CHARS + 100) + "\x1b[31m\u202euntrusted"
+        self.assertIsNone(self.b._heading(noise))
+        self.assertEqual(self.b._heading("####\tExpected heading"), (4, "Expected heading"))
+        self.assertIsNone(self.b._heading("####### Too many levels"))
+        self.assertIsNone(self.b._heading("##No separator"))
+        for pair in self.b.PAIRS:
+            with self.subTest(pair=pair["id"]):
+                raw = comparison_fixture(pair)
+                title = "# %s vs %s\n" % tuple(n for _mid, n in pair["models"])
+                attack = raw.replace(title.encode(), (title + noise + "\n").encode(), 1)
+                self.assertEqual(self.b.parse_page(pair, attack), self.b.parse_page(pair, raw))
+                self.assertNotIn("untrusted", repr(self.b.parse_page(pair, attack)))
+        self.assertEqual(self.b._lines("x" * 20_000 + "\n" + "y" * 20_001),
+                         ["x" * 20_000, ""])
+
+    def test_oversized_cells_and_scores_are_unknown_not_invented(self):
+        pair = self.b.PAIRS[1]
+        raw = comparison_fixture(pair, values=(
+            ("Terminal-Bench", "Terminal-Bench", "9" * 1500 + "%", "80%"),
+            ("Coding score", "BenchLeader", "72", "82")))
+        parsed = self.b.parse_page(pair, raw)
+        values = parsed["metrics"]["terminal_bench"]["values"]
+        self.assertIsNone(values["gpt-6.1-sol"]["value"])
+        self.assertEqual(values[NEW]["value"], 80)
+        bounded = self.b._cell("[label](https://unused.invalid/" + "x" * 25_000 + ")\x1b[31m\u202e")
+        self.assertLessEqual(len(bounded), 300)
+        self.assertNotRegex(bounded, r"[\x1b\u202a-\u202e]")
+
+
+class TestBalancedBenchmarkRefresh(LiveRefreshCase):
+    """The unadapted new default: actual CLI, offline official and comparison
+    adapters, temporary settings only. No production-function replacements."""
+
+    TEST_POLICY = None
+    TEST_DETAILS = False
+    machine = TestProposalScopedReview.machine
+    frozen = TestProposalScopedReview.frozen
+    protected_bytes = TestProposalScopedReview.protected_bytes
+
+    def setUp(self):
+        super().setUp()
+        self.b, error = self.mod.load_benchmark_module()
+        self.assertIsNone(error)
+        self.benchmark_fetches = []
+        self.benchmark_efforts = {"gpt-6.1-sol": "xhigh", NEW: "xhigh",
+                                  "claude-sonnet-5.5": "high", "gpt-6.1-terra": "high"}
+        self.benchmark_pages = {}
+        self.mod.BENCHMARK_FETCHER = self.fetch_benchmarks
+        # No savings or official differentiators: the compared options
+        # below must come from actual, attributable synthetic benchmark rows.
+        self.markdown = self.live_prices(new=12, cheap=15, new_long=18)
+
+    def fetch_benchmarks(self, url, timeout, max_bytes):
+        self.benchmark_fetches.append((url, timeout, max_bytes))
+        pair = next(p for p in self.b.PAIRS if p["url"] == url)
+        return self.benchmark_pages.get(url) or comparison_fixture(
+            pair, efforts=tuple(self.benchmark_efforts[mid] for mid, _ in pair["models"]))
+
+    def context(self, ages=None, benchmark_age=0):
+        self.seed_cache()
+        self.seed_docs(ages)
+        self.b.refresh(self.paths.benchmarks, NOW - benchmark_age, True,
+                       fetcher=lambda url, timeout, cap, deadline:
+                       self.fetch_benchmarks(url, timeout, cap))
+        return self.mod.build_context(self.paths, NOW)
+
+    def offered(self, *args):
+        rc, out, err = self.cli("propose", "--review", *args)
+        self.assertEqual(rc, 3, out + err)
+        doc = self.frozen(out)
+        self.assertEqual(doc["policy"], "balanced")
+        return doc, out
+
+    def select_option(self, doc, route, model=NEW, now=NOW + 1):
+        n = next(a["n"] for a in doc["alternatives"]
+                 if a["route"] == route and a["values"]["model"] == model)
+        rc, out, err = self.cli("select", "--proposal-id", doc["proposal_id"],
+                                "--choose", str(n), now=now)
+        self.assertEqual(rc, 0, out + err)
+        return self.frozen(out), out
+
+    def whole_home(self):
+        return {str(p.relative_to(self.home)): (p.read_bytes(), p.stat().st_mtime_ns)
+                for p in self.home.rglob("*") if p.is_file()}
+
+    def benchmark_alt(self, ctx, current, candidate, current_effort, candidate_effort, n=1):
+        return {"n": n, "current_model": current, "model": candidate,
+                "values": {"model": candidate, "reasoning_effort": candidate_effort, "context_tier": "default"},
+                "benchmark": self.mod.benchmark_comparison(
+                    ctx, current, candidate, current_effort, candidate_effort)}
+
+    def install_managed_drift(self, key="planner", model=None):
+        """Test-owned, synchronized prior-apply fixture; no production writes
+        or user files are used to manufacture the starting managed state."""
+        model = model or self.defaults[key]["model"]
+        values = dict(self.defaults[key], model=model, reasoning_effort="low", context_tier="default")
+        state = self.mod.blank_state()
+        state["overrides"] = {key: values}
+        native = {"model": model, "effortLevel": "low", "contextTier": "default"}
+        state["managed_settings"] = {key: native}
+        settings = copy.deepcopy(self.initial_settings)
+        settings["subagents"]["agents"][key] = native
+        self.write_json(self.paths.settings, settings)
+        self.write_json(self.paths.state, state)
+        ctx = self.context()
+        plan = self.mod.plan_outputs(ctx, state["overrides"])
+        self.write(self.paths.instructions, plan["instructions"])
+        self.write(self.paths.effective, plan["effective_doc"])
+        self.write_json(self.paths.settings, plan["settings_data"])
+        state["managed_settings"] = plan["managed_settings"]
+        state["instructions_sha256"] = self.mod.sha256_bytes(plan["instructions"])
+        self.write_json(self.paths.state, state)
+        self.assertFalse(self.mod._sync_needed(self.mod.build_context(self.paths, NOW), plan))
+        return values
+
+    def test_default_preview_and_propose_have_no_preselection_even_with_savings(self):
+        self.markdown = self.live_prices(new=5, cheap=6)
+        before = self.protected_bytes()
+        rc, preview, err = self.cli("preview")
+        self.assertEqual(rc, 3, preview + err)
+        self.assertFalse(Path(self.paths.proposal).exists())
+        self.assertIn("balanced mode", preview)
+        self.assertIn("NONE is preselected", preview)
+        self.assertNotIn("CHANGE proposed", preview)
+        doc, out = self.offered()
+        self.assertEqual(doc["selected"], [])
+        self.assertEqual(doc["route_changes"], [])
+        self.assertEqual(doc["overrides"], {})
+        self.assertEqual(self.protected_bytes(), before)
+        self.assertEqual(self.mod.DEFAULT_POLICY, "balanced")
+        self.assertEqual(self.machine(out, "CHECK"), [])
+        self.assertEqual(self.machine(out, "LEVEL"), [])
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        self.assertEqual(self.machine(out, "SELECTED"), [["0"]])
+        self.assertEqual(len(self.fetches), 1)
+        self.assertEqual(len(self.docs_fetches), 2)
+        self.assertEqual(len(self.benchmark_fetches), 4)
+
+    def test_explicit_cost_led_retains_legacy_automatic_saving_proposals(self):
+        self.markdown = self.live_prices(new=5, cheap=6)
+        before = self.protected_bytes()
+        rc, out, err = self.cli("propose", "--review", "--cost-led")
+        self.assertEqual(rc, 0, out + err)
+        doc = self.frozen(out)
+        self.assertEqual(doc["policy"], "cost-led")
+        self.assertEqual(set(doc["overrides"]), set(self.defaults))
+        self.assertTrue(all(v["model"] == NEW for v in doc["overrides"].values()))
+        self.assertIn("CHANGE proposed", out)
+        self.assertEqual(self.protected_bytes(), before)
+
+    def test_real_comparisons_offer_sol_and_terra_only_for_exact_pairs(self):
+        for effort in ("medium", "xhigh"):
+            with self.subTest(source_effort=effort):
+                self.benchmark_efforts.update({"gpt-6.1-sol": effort, NEW: effort})
+                Path(self.paths.benchmarks).unlink(missing_ok=True)
+                rows = self.rows(self.context())
+                self.assertTrue(all(r["proposed"] is None for r in rows.values()))
+                for key in ("planner", "coder", "tester"):
+                    options = [a for a in rows[key]["alternatives"] if a["model"] == NEW]
+                    if self.defaults[key]["reasoning_effort"] != effort:
+                        self.assertEqual(options, [])
+                        continue
+                    self.assertEqual(len(options), 1)
+                    alt = options[0]
+                    self.assertEqual(alt["bases"], ["benchmark"])
+                    self.assertEqual(alt["values"], dict(self.defaults[key], model=NEW))
+                    self.assertTrue(alt["benchmark"]["supports"])
+                for key in ("reviewer", "test-reviewer"):
+                    alt = next(a for a in rows[key]["alternatives"] if a["model"] == "gpt-6.1-terra")
+                    self.assertEqual(alt["bases"], ["benchmark"])
+                    self.assertEqual(alt["values"], dict(self.defaults[key], model="gpt-6.1-terra"))
+                self.assertFalse(rows["reviewer.stronger"]["alternatives"])
+                self.assertFalse(rows["discovery"]["alternatives"])
+                self.assertFalse(rows["task"]["alternatives"])
+
+    def test_compact_first_has_scores_sources_setup_caveats_and_no_full_report(self):
+        doc, out = self.offered()
+        self.assertNotIn("===== Details (full report) =====", out)
+        self.assertNotIn("Reasons and evidence:", out)
+        self.assertNotIn("Official rates (Default tier", out)
+        self.assertLess(out.index("Current routes"), out.index("Options —"))
+        for text in ("BenchLeader", "BenchLM", "70%", "80%", "86%", "page updated 2026-11-16",
+                     "compared at gpt-6.1-sol 'xhigh'", "reasoning effort and harness not stated",
+                     "same levels as this route", "not independent confirmation", "no average, overall winner",
+                     "not proof of", "different directions", "composite scores disagree",
+                     "NOT comprehensive", "official $/1M", "not your bill"):
+            self.assertIn(text, out)
+        for pair in self.b.PAIRS:
+            self.assertIn(pair["page"], out)
+        for route in self.mod.ROUTES:
+            self.assertIn(route["label"], out)
+        self.assertNotIn("irrelevant remote winner", out)
+        self.assertNotIn("Synthetic fixture tasks", out)
+        self.assertEqual(doc["format"], 4)
+        self.assertIn("benchmarks", doc["digests"])
+
+    def test_details_are_full_cached_read_only_and_match_numbering(self):
+        doc, compact = self.offered()
+        before, calls = self.whole_home(), list(self.benchmark_fetches)
+        with mock.patch.object(self.mod, "refresh_pricing", side_effect=AssertionError("details fetched")), \
+                mock.patch.object(self.mod, "_fetch_capability_bytes", side_effect=AssertionError("details fetched")), \
+                mock.patch.object(self.b, "default_fetch", side_effect=AssertionError("details fetched")), \
+                mock.patch.object(self.b, "_write_cache", side_effect=AssertionError("details wrote")):
+            rc, out, err = self.cli("details", "--proposal-id", doc["proposal_id"])
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("numbers below match it", out)
+        self.assertIn("===== Details (full report) =====", out)
+        self.assertIn("Reasons and evidence:", out)
+        self.assertIn("sha256", out)
+        self.assertIn("===== Recap", out)
+        self.assertGreater(len(out), len(compact))
+        self.assertEqual(self.machine(out, "PROPOSAL"), [])
+        self.assertEqual(self.machine(out, "ALTERNATIVE"), [])
+        self.assertEqual(self.whole_home(), before)
+        self.assertEqual(self.benchmark_fetches, calls)
+        rc, out, err = self.cli("propose", "--review", "--details")
+        self.assertEqual(rc, 3, out + err)
+        self.assertLess(out.index("Current routes"), out.index("===== Details (full report) ====="))
+
+    def test_details_on_expired_or_tampered_proposal_never_deletes_or_repairs_it(self):
+        for failure in ("expired", "tampered"):
+            with self.subTest(failure=failure):
+                doc, _ = self.offered()
+                if failure == "tampered":
+                    doc["policy"] = "cost-led"
+                    self.write_json(self.paths.proposal, doc)
+                before = self.whole_home()
+                rc, out, err = self.cli("details", "--proposal-id", doc["proposal_id"],
+                                        now=NOW + 901 if failure == "expired" else NOW)
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn("not used", out)
+                self.assertEqual(self.whole_home(), before)
+
+    def test_missing_optional_module_and_transport_error_leave_official_behavior_intact(self):
+        before = self.protected_bytes()
+        for failure in ("module", "transport"):
+            with self.subTest(failure=failure):
+                if failure == "module":
+                    patch = mock.patch.object(self.mod, "load_benchmark_module",
+                                              return_value=(None, "fixture module unavailable"))
+                else:
+                    Path(self.paths.benchmarks).unlink(missing_ok=True)
+                    patch = mock.patch.object(self.mod, "BENCHMARK_FETCHER",
+                                              side_effect=TimeoutError("fixture unavailable"))
+                with patch:
+                    rc, out, err = self.cli("propose", "--review")
+                self.assertEqual(rc, 3, out + err)
+                self.assertNotIn("PROPOSAL\t", out)
+                self.assertIn("unavailable" if failure == "module" else "refresh(es) failed", out)
+                self.assertEqual(self.protected_bytes(), before)
+
+    def test_injected_pricing_without_benchmark_adapter_cannot_make_real_traffic(self):
+        self.mod.BENCHMARK_FETCHER = None
+        with mock.patch.object(self.b, "default_fetch") as transport:
+            rc, out, err = self.cli("propose", "--review")
+        self.assertEqual(rc, 3, out + err)
+        transport.assert_not_called()
+        self.assertIn("injected pricing transport has no comparison transport", out)
+        self.assertFalse(Path(self.paths.benchmarks).exists())
+
+    def test_offline_and_both_fetch_switches_prevent_benchmark_requests(self):
+        self.context()
+        self.benchmark_fetches.clear()
+        for environment, flags in (({}, ("--offline",)),
+                                   ({self.b.FETCH_ENV: "0"}, ()),
+                                   ({"COPILOT_TASK_REPORT_PRICING_FETCH": "0"}, ())):
+            with self.subTest(environment=environment, flags=flags):
+                with mock.patch.dict(os.environ, environment):
+                    before = Path(self.paths.benchmarks).read_bytes()
+                    rc, out, err = self.cli("propose", "--review", *flags, now=NOW + 301)
+                self.assertEqual(rc, 3, out + err)
+                self.assertEqual(self.benchmark_fetches, [])
+                self.assertEqual(Path(self.paths.benchmarks).read_bytes(), before)
+                self.assertIn("4 of 4 reviewed comparison pages fresh", out)
+
+    def test_stale_future_and_malformed_comparisons_cannot_offer_premium_options(self):
+        for age in (DAY + 1, -1):
+            with self.subTest(age=age):
+                Path(self.paths.benchmarks).unlink(missing_ok=True)
+                ctx = self.context(benchmark_age=age)
+                self.assertTrue(all(not r["alternatives"] for r in self.rows(ctx).values()))
+                rc, out, err = self.cli("propose", "--review", "--offline")
+                self.assertEqual(rc, 3, out + err)
+                self.assertNotIn("PROPOSAL\t", out)
+                self.assertIn("stale/future-dated", out)
+        Path(self.paths.benchmarks).write_text('{"schema_version":1,"schema_version":1}')
+        rc, out, err = self.cli("propose", "--review", "--offline")
+        self.assertEqual(rc, 3, out + err)
+        self.assertNotIn("PROPOSAL\t", out)
+        self.assertIn("cache is invalid", out)
+
+    def test_benchmark_cannot_override_category_context_pins_price_or_exact_effort_gates(self):
+        self.benchmark_efforts.update({"gpt-6.1-sol": "medium", NEW: "medium"})
+        for change in ("category", "context", "effort", "price", "pin", "stale-docs"):
+            with self.subTest(change=change):
+                # Restore fixture inputs only; do not repair implementation state.
+                self.config["verified_capabilities"]["models"][NEW] = {
+                    "reasoning_levels": ["low", "medium", "high", "xhigh"]}
+                self.config.pop("pins", None)
+                self.doc_facts[NEW]["one_million_context"] = "Supported"
+                self.markdown = self.live_prices(new=12, cheap=15, new_long=18)
+                self.catalog["expires_on"] = "2026-12-15"
+                if change == "category":
+                    self.markdown = self.markdown.replace(
+                        ("| %s | GA | Powerful" % NEW).encode(),
+                        ("| %s | GA | Lightweight" % NEW).encode())
+                elif change == "context":
+                    self.doc_facts[NEW]["one_million_context"] = "Not supported"
+                elif change == "effort":
+                    self.config["verified_capabilities"]["models"][NEW]["reasoning_levels"] = ["low"]
+                elif change == "price":
+                    self.markdown = b"\n".join(line for line in self.markdown.splitlines()
+                                              if not line.startswith(("| %s |" % NEW).encode()))
+                elif change == "pin":
+                    self.config["pins"] = {"planner": {"model": self.defaults["planner"]["model"]}}
+                else:
+                    self.catalog["expires_on"] = "2026-11-15"
+                self.save_config()
+                self.save_catalog()
+                ctx = self.context({"supported_models": 4 * DAY, "model_comparison": 4 * DAY}
+                                   if change == "stale-docs" else None)
+                row = self.rows(ctx)["planner"]
+                self.assertFalse(any(a["model"] == NEW for a in row["alternatives"]), row)
+                self.assertIsNone(row["proposed"])
+
+    def test_long_context_saving_requires_both_tiers_even_with_benchmark_support(self):
+        self.benchmark_efforts.update({"gpt-6.1-sol": "medium", NEW: "medium"})
+        self.markdown = self.live_prices(new=5, cheap=15, new_long=18)
+        rows = self.rows(self.context())
+        planner = next(a for a in rows["planner"]["alternatives"] if a["model"] == NEW)
+        coder = next(a for a in rows["coder"]["alternatives"] if a["model"] == NEW)
+        self.assertNotIn("saving", planner["bases"])
+        self.assertIn("benchmark", planner["bases"])
+        self.assertIn("saving", coder["bases"])
+        self.assertEqual((planner["cost"], planner["long_cost"]), (5, 18))
+        self.mod.number_alternatives(list(rows.values()))
+        rendered = "\n".join(self.mod.render_options(self.mod.build_context(self.paths, NOW),
+                                                    list(rows.values())))
+        self.assertIn("above the long-context threshold $10.00 -> $18.00", rendered)
+        self.assertIn("+$8.00/1M, +80%", rendered)
+
+    def test_only_explicit_selection_changes_one_route_then_apply_and_replay_refuses(self):
+        before = self.protected_bytes()
+        doc, _ = self.offered()
+        selected, out = self.select_option(doc, "tester")
+        self.assertEqual(selected["route_changes"], ["tester"])
+        self.assertEqual(selected["overrides"], {"tester": dict(self.defaults["tester"], model=NEW)})
+        self.assertEqual(selected["created_epoch"], doc["created_epoch"])
+        self.assertEqual(selected["expires_epoch"], doc["expires_epoch"])
+        self.assertNotEqual(selected["seal"], doc["seal"])
+        self.assertEqual(self.protected_bytes(), before)
+        self.assertIn("costs MORE", out)
+        fetched = (len(self.fetches), len(self.docs_fetches), len(self.benchmark_fetches))
+        rc, out, err = self.cli("apply", "--proposal-id", selected["proposal_id"], now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        state = self.read_json(self.paths.state)
+        self.assertEqual(set(state["overrides"]), {"tester"})
+        self.assertEqual(state["overrides"]["tester"]["model"], NEW)
+        self.assertEqual(self.read_json(self.paths.user_config), self.config)
+        self.assertEqual((len(self.fetches), len(self.docs_fetches), len(self.benchmark_fetches)), fetched)
+        after = self.routing_bytes()
+        rc, out, err = self.cli("apply", "--proposal-id", selected["proposal_id"], now=NOW + 3)
+        self.assertEqual(rc, 4, out + err)
+        self.assertEqual(self.routing_bytes(), after)
+
+    def test_selection_before_verification_only_selected_model_exact_level_questions(self):
+        self.config.pop("available_models")
+        self.config["verified_capabilities"]["models"].pop(NEW)
+        self.save_config()
+        before = self.protected_bytes()
+        doc, out = self.offered()
+        self.assertEqual(self.machine(out, "CHECK"), [])
+        self.assertEqual(self.machine(out, "LEVEL"), [])
+        selected, out = self.select_option(doc, "tester")
+        self.assertEqual(self.machine(out, "CHECK"), [[NEW, "tester"]])
+        self.assertEqual(self.machine(out, "LEVEL"), [[NEW, "xhigh"]])
+        rc, out, err = self.cli("review", "--proposal-id", selected["proposal_id"],
+                                "--available-all", now=NOW + 1)
+        self.assertEqual(rc, 0, out + err)
+        checked = self.frozen(out)
+        self.assertEqual(self.machine(out, "CHECK"), [])
+        self.assertEqual(self.machine(out, "LEVEL"), [[NEW, "xhigh"]])
+        rc, out, err = self.cli("review", "--proposal-id", checked["proposal_id"],
+                                "--level", NEW + ":xhigh=yes", now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        completed = self.frozen(out)
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        self.assertEqual(self.protected_bytes(), before)
+        rc, out, err = self.cli("apply", "--proposal-id", completed["proposal_id"], now=NOW + 3)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read_json(self.paths.user_config), self.config)
+        self.assertFalse(Path(self.paths.verified).exists())
+
+    def test_tentative_selection_cannot_apply_before_exact_verification(self):
+        self.config.pop("available_models")
+        self.save_config()
+        doc, _ = self.offered()
+        selected, _ = self.select_option(doc, "tester")
+        before = self.protected_bytes()
+        rc, out, err = self.cli("apply", "--proposal-id", selected["proposal_id"])
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("not confirmed", err)
+        self.assertEqual(self.protected_bytes(), before)
+
+    def test_rejection_drops_selection_without_downgrade_or_replacing_with_cheapest(self):
+        self.config.pop("available_models")
+        self.config["verified_capabilities"]["models"].pop(NEW)
+        self.save_config()
+        before = self.protected_bytes()
+        for rejection in ("availability", "effort"):
+            with self.subTest(rejection=rejection):
+                doc, _ = self.offered()
+                selected, _ = self.select_option(doc, "tester")
+                flags = ("--unavailable", NEW) if rejection == "availability" else (
+                    "--available-all", "--level", NEW + ":xhigh=no")
+                rc, out, err = self.cli("review", "--proposal-id", selected["proposal_id"],
+                                        *flags, now=NOW + 1)
+                self.assertEqual(rc, 3, out + err)
+                if self.machine(out, "PROPOSAL"):
+                    dropped = self.frozen(out)
+                    self.assertEqual(dropped["selected"], [])
+                    self.assertEqual(dropped["overrides"], {})
+                self.assertIn("Dropped:", out)
+                self.assertEqual(self.protected_bytes(), before)
+
+    def test_benchmark_cache_changes_or_expiry_refuse_select_review_apply_without_fetch(self):
+        for command in ("select", "review", "apply"):
+            for mutation in ("metric", "identity", "expiry", "registry", "effort"):
+                with self.subTest(command=command, mutation=mutation):
+                    self.config["available_models"] = {"verified_on": "2026-11-16", "models": self.ids}
+                    if command == "review":
+                        self.config.pop("available_models")
+                    self.save_config()
+                    Path(self.paths.benchmarks).unlink(missing_ok=True)
+                    self.context(benchmark_age=DAY - 100 if mutation == "expiry" else 0)
+                    doc, _ = self.offered("--offline")
+                    if command in ("review", "apply"):
+                        doc, _ = self.select_option(doc, "tester", now=NOW)
+                    if mutation != "expiry":
+                        cache = self.read_json(self.paths.benchmarks)
+                        pid = self.b.PAIRS[1]["id"]
+                        if mutation == "metric":
+                            cache["records"][pid]["metrics"]["terminal_bench"]["values"][NEW]["value"] = 81
+                        elif mutation == "identity":
+                            cache["records"][pid]["url"] += "?changed"
+                        elif mutation == "effort":
+                            cache["records"][pid]["efforts"] = {"gpt-6.1-sol": "medium", NEW: "medium"}
+                        else:
+                            cache["registry"] = "0" * 64
+                        self.write_json(self.paths.benchmarks, cache)
+                    before = self.protected_bytes()
+                    calls = (len(self.fetches), len(self.docs_fetches), len(self.benchmark_fetches))
+                    flags = ("--choose", "1") if command == "select" else (
+                        ("--available-all",) if command == "review" else ())
+                    rc, out, err = self.cli(command, "--proposal-id", doc["proposal_id"], *flags,
+                                            now=NOW + 101 if mutation == "expiry" else NOW + 1)
+                    self.assertEqual(rc, 4, out + err)
+                    self.assertIn("changed", err)
+                    self.assertEqual(self.protected_bytes(), before)
+                    self.assertEqual((len(self.fetches), len(self.docs_fetches),
+                                      len(self.benchmark_fetches)), calls)
+
+    def test_tampered_policy_and_old_frozen_v3_are_refused(self):
+        for mutation in ("policy", "v3"):
+            with self.subTest(mutation=mutation):
+                doc, _ = self.offered()
+                if mutation == "policy":
+                    doc["policy"] = "cost-led"
+                else:
+                    doc["format"] = 3
+                self.write_json(self.paths.proposal, doc)
+                before = self.protected_bytes()
+                rc, out, err = self.cli("select", "--proposal-id", doc["proposal_id"], "--choose", "1")
+                self.assertEqual(rc, 4, out + err)
+                self.assertIn("altered" if mutation == "policy" else "older version", err)
+                self.assertEqual(self.protected_bytes(), before)
+
+    def test_frozen_workload_policy_change_refuses_even_when_equal_rates_hide_cost_difference(self):
+        doc, _ = self.offered()
+        doc, _ = self.select_option(doc, "tester")
+        before = self.protected_bytes()
+        changed_mix = (("input", 0.8), ("cached_input", 0.1), ("cache_write", 0.05), ("output", 0.05))
+        with mock.patch.object(self.mod, "WORKLOAD_MIX", changed_mix):
+            rc, out, err = self.cli("apply", "--proposal-id", doc["proposal_id"], now=NOW + 2)
+        self.assertEqual(rc, 4, out + err)
+        self.assertEqual(self.protected_bytes(), before)
+
+    def test_frozen_threshold_and_availability_age_changes_refuse_unchanged_route_decisions(self):
+        # Neither change affects these fresh, benchmark-only fixtures; the
+        # refusal must come from binding the policy, not changed winners.
+        for name, value in (("MIN_SAVING_FRACTION", 0.2), ("AVAILABILITY_MAX_AGE_DAYS", 31)):
+            with self.subTest(policy=name):
+                doc, _ = self.offered()
+                doc, _ = self.select_option(doc, "tester")
+                before = self.protected_bytes()
+                with mock.patch.object(self.mod, name, value):
+                    rc, out, err = self.cli("apply", "--proposal-id", doc["proposal_id"], now=NOW + 2)
+                self.assertEqual(rc, 4, out + err)
+                self.assertIn("economics changed", err)
+                self.assertEqual(self.protected_bytes(), before)
+
+    def test_terminal_color_is_localized_and_machine_lines_are_bare_exact(self):
+        class TtyOutput(io.StringIO):
+            def isatty(self):
+                return True
+
+        with mock.patch.dict(os.environ, {"TERM": "xterm-256color", "NO_COLOR": "",
+                                          self.mod.COLOR_ENV: "auto", "COLUMNS": "100"}):
+            stream = TtyOutput()
+            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(io.StringIO()):
+                rc = self.mod.main(["propose", "--review"], now=NOW)
+        self.assertEqual(rc, 3, stream.getvalue())
+        out = stream.getvalue()
+        self.assertIn("\x1b[1;36m#", out)
+        self.assertIn("\x1b[1;35mthird-party:", out)
+        self.assertIn("\x1b[1;33mCaution:", out)
+        self.assertIn("\x1b[0m", out)
+        doc = self.frozen(out)
+        actual = [line for line in out.splitlines()
+                  if line.startswith(("REVIEW\t", "SELECTED\t", "ALTERNATIVE\t", "PROPOSAL\t"))]
+        expected = ["REVIEW\tcomplete", "SELECTED\t0"]
+        expected += ["ALTERNATIVE\t%d\t%s\t%s" % (a["n"], a["route"], a["values"]["model"])
+                     for a in doc["alternatives"]]
+        expected += ["PROPOSAL\t" + doc["proposal_id"]]
+        self.assertEqual(actual, expected)
+        self.assertNotIn("\x1b", "\n".join(actual))
+
+    def test_no_color_dumb_and_nonterminal_have_no_ansi(self):
+        for environment in ({"TERM": "xterm", "NO_COLOR": "1", self.mod.COLOR_ENV: "always"},
+                            {"TERM": "dumb", "NO_COLOR": "", self.mod.COLOR_ENV: "always"},
+                            {"TERM": "xterm", "NO_COLOR": "", self.mod.COLOR_ENV: "auto"},
+                            {"TERM": "xterm", "NO_COLOR": "", self.mod.COLOR_ENV: "never"}):
+            with self.subTest(environment=environment), mock.patch.dict(os.environ, environment):
+                rc, out, err = self.cli("propose", "--review")
+                self.assertEqual(rc, 3, out + err)
+                self.assertNotIn("\x1b", out + err)
+
+    def test_width_wraps_without_truncating_names_prices_or_source_urls(self):
+        self.benchmark_efforts.update({"gpt-6.1-sol": "medium", NEW: "medium"})
+        for width in ("40", "80", "140"):
+            with self.subTest(width=width), mock.patch.dict(os.environ, {"COLUMNS": width}):
+                doc, out = self.offered()
+                for model in (NEW, "gpt-6.1-sol", "claude-sonnet-5.5", "gpt-6.1-terra"):
+                    self.assertIn(model, out)
+                for text in ("$10.00", "$12.00", "$18.00"):
+                    self.assertIn(text, out)
+                for p in self.b.PAIRS:
+                    self.assertIn(p["page"], out)
+                self.assertNotIn("gpt-6.2-...", out)
+                self.assertEqual(self.mod.term_width(), int(width))
+        with mock.patch.dict(os.environ, {"COLUMNS": "1"}):
+            self.assertEqual(self.mod.term_width(), 40)
+        with mock.patch.dict(os.environ, {"COLUMNS": "1000"}):
+            self.assertEqual(self.mod.term_width(), 140)
+
+    def test_untrusted_cached_provenance_never_emits_terminal_controls_or_bidi(self):
+        self.context()
+        cache = self.read_json(self.paths.benchmarks)
+        cache["records"][self.b.PAIRS[1]["id"]]["fetched_at"] = (
+            "\x1b]8;;https://evil.invalid\x07forged\x1b]8;;\x07\u202e")
+        self.write_json(self.paths.benchmarks, cache)
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            rc, out, err = self.cli("details")
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotRegex(out, r"[\x1b\x00\u202a-\u202e\u2066-\u2069]")
+
+    def test_mismatched_benchmark_does_not_block_independent_saving_or_official_option(self):
+        self.benchmark_efforts.update({"gpt-6.1-sol": "max", NEW: "max"})
+        for basis in ("saving", "official"):
+            with self.subTest(basis=basis):
+                self.markdown = self.live_prices(new=5 if basis == "saving" else 12, cheap=15)
+                self.doc_facts["gpt-6.1-sol"]["copilot_cli_client"] = (
+                    "Included" if basis == "saving" else "Not included")
+                row = self.rows(self.context())["tester"]
+                alt = next(a for a in row["alternatives"] if a["model"] == NEW)
+                self.assertIn(basis, alt["bases"])
+                self.assertNotIn("benchmark", alt["bases"])
+                self.assertFalse(alt["benchmark"]["supports"])
+                self.assertIsNone(row["proposed"])
+                text = "\n".join(self.mod._bench_lines(alt, "xhigh", {}, "", 3))
+                self.assertIn("setup differs", text)
+                self.assertIn("context only", text)
+                self.assertIn("compared at gpt-6.1-sol 'max'", text)
+                self.assertNotIn("same levels as this route", text)
+
+    def test_short_metrics_show_both_directions_and_exact_hidden_counts_per_source(self):
+        for pair in self.b.PAIRS:
+            if pair["provider"] == "benchleader":
+                self.benchmark_pages[pair["url"]] = comparison_fixture(
+                    pair, efforts=tuple(self.benchmark_efforts[mid] for mid, _ in pair["models"]), values=(
+                        ("Terminal-Bench", "Terminal-Bench", "70%", "80%"),
+                        ("Terminal-Bench 4.0 (AA)", "Artificial Analysis", "50%", "60%"),
+                        ("Terminal-Bench 4.0 (Vals)", "Vals AI", "60%", "70%"),
+                        ("FrontierCode 2.0 (AA)", "Artificial Analysis", "90%", "40%"),
+                        ("SWE Atlas v1.1", "Scale AI SEAL", "90%", "50%"),
+                        ("Coding score", "BenchLeader", "72", "72"),
+                        ("Agents & tools score", "BenchLeader", "90", "n/a")))
+            else:
+                self.benchmark_pages[pair["url"]] = comparison_fixture(pair, values=(
+                    ("Terminal-Bench 4.1", "86%", "70%"),
+                    ("Terminal-Bench 4.0", "50%", "60%"),
+                    ("FrontierCode 2.0", "70%", "70%")))
+        ctx = self.context()
+        alt = self.benchmark_alt(ctx, "gpt-6.1-sol", NEW, "xhigh", "xhigh")
+        out = "\n".join(self.mod._bench_lines(alt, "xhigh", {}, "", 3))
+        leader, lm = out.split("third-party: BenchLM", 1)
+        self.assertIn("current gpt-6.1-sol 70% · option gpt-6.2-sol 80%", leader)
+        self.assertIn("current gpt-6.1-sol 90% · option gpt-6.2-sol 40%", leader)
+        self.assertIn("+4 more metric(s)", leader)
+        self.assertIn("1 higher for the current model, 2 higher for the option, 0 equal, 1 not comparable", leader)
+        self.assertIn("current gpt-6.1-sol 86% · option gpt-6.2-sol 70%", lm)
+        self.assertIn("current gpt-6.1-sol 50% · option gpt-6.2-sol 60%", lm)
+        self.assertIn("+1 more metric(s)", lm)
+        self.assertIn("1 higher for the current model, 0 higher for the option, 0 equal, 0 not comparable", lm)
+        self.assertIn("no overall winner", out)
+        full = "\n".join(self.mod._bench_lines(alt, "xhigh", {}, "", None))
+        self.assertIn("current gpt-6.1-sol 90% · option gpt-6.2-sol 50%", full)
+        self.assertIn("not comparable: only one model has a value", full)
+        self.assertNotIn("more metric(s)", full)
+
+    def test_reversed_pairs_have_independent_labels_prices_and_repeated_directed_notes(self):
+        sonnet, terra = "claude-sonnet-5.5", "gpt-6.1-terra"
+        self.markdown = b"\n".join(line.replace(b"$10", b"$5") if line.startswith(
+            ("| %s |" % sonnet).encode()) else line for line in self.markdown.splitlines())
+        ctx = self.context()
+        all_rows = self.mod.evaluate(ctx)
+        self.mod.number_alternatives(all_rows)
+        rows = [r for r in all_rows if r["key"] in ("coder.small_casual", "reviewer", "test-reviewer")]
+        text = "\n".join(self.mod.render_options(ctx, rows))
+        self.assertIn("current %s 80%% · option %s 70%%" % (terra, sonnet), text)
+        self.assertIn("current %s 70%% · option %s 80%%" % (sonnet, terra), text)
+        self.assertIn("-$5.00/1M, -50%", text)
+        self.assertIn("+$5.00/1M, +100%", text)
+        forward_n = next(a["n"] for r in rows if r["key"] == "reviewer"
+                         for a in r["alternatives"] if a["model"] == terra)
+        last = text[text.index("#%d " % next(a["n"] for r in rows if r["key"] == "test-reviewer"
+                                           for a in r["alternatives"] if a["model"] == terra)):]
+        self.assertIn("same comparison, same direction (current %s -> option %s) as option #%d" %
+                      (sonnet, terra, forward_n), last)
+        for note in ("same levels as this route", "context only", "different directions",
+                     "composite scores disagree", "caution:"):
+            self.assertIn(note, last)
+
+    def test_repeated_directed_reference_restates_its_own_mismatching_setup(self):
+        ctx = self.context()
+        shown = {}
+        first = self.benchmark_alt(ctx, "gpt-6.1-sol", NEW, "xhigh", "xhigh", 7)
+        initial = "\n".join(self.mod._bench_lines(first, "xhigh", shown, "", 3))
+        self.assertIn("same levels as this route", initial)
+        later = self.benchmark_alt(ctx, "gpt-6.1-sol", NEW, "medium", "medium", 9)
+        text = "\n".join(self.mod._bench_lines(later, "medium", shown, "", 3))
+        self.assertIn("as option #7", text)
+        self.assertIn("this route uses 'medium' -> 'medium'", text)
+        self.assertIn("setup differs", text)
+        self.assertNotIn("same levels as this route", text)
+        for note in ("context only", "different directions", "composite scores disagree", "caution:"):
+            self.assertIn(note, text)
+
+    def test_same_model_alignment_is_explicit_and_removes_default_override_only_after_apply(self):
+        old = self.install_managed_drift()
+        before = self.protected_bytes()
+        doc, out = self.offered()
+        self.assertEqual(doc["selected"], [])
+        self.assertEqual(doc["overrides"], {"planner": old})
+        self.assertEqual(doc["route_changes"], [])
+        self.assertIn("drift:", out)
+        self.assertIn("same model", out)
+        self.assertEqual(self.protected_bytes(), before)
+        detail_before = self.whole_home()
+        rc, details, err = self.cli("details", "--proposal-id", doc["proposal_id"])
+        self.assertEqual(rc, 0, details + err)
+        self.assertEqual(self.whole_home(), detail_before)
+        selected, _ = self.select_option(doc, "planner", model=old["model"])
+        self.assertEqual(selected["overrides"], {})
+        self.assertEqual(selected["route_changes"], ["planner"])
+        self.assertEqual(self.protected_bytes(), before)
+        rc, out, err = self.cli("apply", "--proposal-id", selected["proposal_id"], now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read_json(self.paths.state)["overrides"], {})
+        self.assertFalse(Path(self.paths.instructions).exists())
+        self.assertFalse(Path(self.paths.effective).exists())
+        rc, live, err = self.cli("status", "--instructions")
+        self.assertEqual(rc, 0, live + err)
+        self.assertEqual(self.live_routes(live)["planner"], self.defaults["planner"])
+        self.assertEqual(self.read_json(self.paths.settings)["subagents"]["agents"]["unrelated-agent"],
+                         {"model": "human-choice"})
+
+    def test_same_model_alignment_checks_selected_exact_level_and_keeps_nondefault_model(self):
+        old = self.install_managed_drift(model=NEW)
+        self.config.pop("available_models")
+        self.config["verified_capabilities"]["models"].pop(NEW)
+        self.save_config()
+        before = self.protected_bytes()
+        doc, _ = self.offered()
+        selected, out = self.select_option(doc, "planner", model=NEW)
+        self.assertEqual(selected["overrides"]["planner"], dict(self.defaults["planner"], model=NEW))
+        self.assertEqual(self.machine(out, "CHECK"), [[NEW, "planner"]])
+        self.assertEqual(self.machine(out, "LEVEL"), [[NEW, "medium"]])
+        self.assertEqual(self.protected_bytes(), before)
+        rc, out, err = self.cli("review", "--proposal-id", selected["proposal_id"], "--available-all",
+                                "--level", NEW + ":medium=yes", now=NOW + 1)
+        self.assertEqual(rc, 0, out + err)
+        checked = self.frozen(out)
+        self.assertEqual(self.machine(out, "REVIEW"), [["complete"]])
+        self.assertEqual(self.protected_bytes(), before)
+        rc, out, err = self.cli("apply", "--proposal-id", checked["proposal_id"], now=NOW + 2)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.read_json(self.paths.effective)["routes"]["planner"]["values"],
+                         dict(self.defaults["planner"], model=NEW))
+        self.assertEqual(self.read_json(self.paths.user_config), self.config)
+        self.assertNotEqual(old, self.read_json(self.paths.effective)["routes"]["planner"]["values"])
+
+    def test_denied_alignment_never_downgrades_or_selects_a_cheaper_replacement(self):
+        for answer in ("availability", "level"):
+            with self.subTest(answer=answer):
+                old = self.install_managed_drift(model=NEW)
+                self.config.pop("available_models", None)
+                self.config["verified_capabilities"]["models"].pop(NEW, None)
+                self.save_config()
+                before = self.protected_bytes()
+                doc, _ = self.offered()
+                doc, _ = self.select_option(doc, "planner", model=NEW)
+                flags = ("--unavailable", NEW) if answer == "availability" else (
+                    "--available-all", "--level", NEW + ":medium=no")
+                rc, out, err = self.cli("review", "--proposal-id", doc["proposal_id"], *flags, now=NOW + 1)
+                self.assertEqual(rc, 3, out + err)
+                self.assertIn("Dropped:", out)
+                if self.machine(out, "PROPOSAL"):
+                    refused = self.frozen(out)
+                    self.assertEqual(refused["selected"], [])
+                    self.assertEqual(refused["overrides"], {"planner": old})
+                    self.assertEqual(refused["route_changes"], [])
+                self.assertEqual(self.protected_bytes(), before)
+
+    def test_pinned_drift_is_never_offered_or_changed(self):
+        for pin in ("user-config", "native"):
+            with self.subTest(pin=pin):
+                self.config.pop("pins", None)
+                self.save_config()
+                self.install_managed_drift()
+                if pin == "user-config":
+                    self.config["pins"] = {"planner": {"reasoning_effort": "high"}}
+                    self.save_config()
+                else:
+                    settings = self.read_json(self.paths.settings)
+                    settings["subagents"]["agents"]["planner"]["effortLevel"] = "high"
+                    self.write_json(self.paths.settings, settings)
+                ctx = self.mod.build_context(self.paths, NOW)
+                row = self.rows(ctx)["planner"]
+                self.assertEqual(row["alternatives"], [])
+                self.assertIsNone(row["proposed"])
+                self.assertIn("pinned by you", row["reason"])
+                self.assertEqual(row["current"]["reasoning_effort"], "high")
+                before = self.protected_bytes()
+                rc, out, err = self.cli("propose", "--review", "--offline")
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn("generated routing files are out of sync", out)
+                doc = self.frozen(out)
+                self.assertEqual(doc["policy"], "balanced")
+                self.assertEqual(doc["selected"], [])
+                self.assertEqual(doc["route_changes"], [])
+                self.assertFalse(any(a["route"] == "planner" for a in doc["alternatives"]))
+                self.assertEqual(self.protected_bytes(), before)
+
+    def test_blocked_alignment_discloses_drift_and_preserves_current_values(self):
+        for gate in ("effort", "context", "price"):
+            with self.subTest(gate=gate):
+                base = self.defaults["planner"]["model"]
+                self.config["verified_capabilities"]["models"][base] = {
+                    "reasoning_levels": ["low", "medium", "high", "xhigh"]}
+                self.doc_facts[base]["one_million_context"] = "Supported"
+                self.markdown = self.live_prices(new=12, cheap=15, new_long=18)
+                old = self.install_managed_drift()
+                if gate == "effort":
+                    self.config["verified_capabilities"]["models"][base]["reasoning_levels"] = ["low"]
+                    self.save_config()
+                elif gate == "context":
+                    self.doc_facts[base]["one_million_context"] = "Not supported"
+                    self.seed_docs()
+                else:
+                    self.markdown = b"\n".join(line for line in self.markdown.splitlines()
+                                              if not line.startswith(("| %s |" % base).encode()))
+                    self.seed_cache()
+                before = self.protected_bytes()
+                rc, out, err = self.cli("propose", "--offline")
+                self.assertEqual(rc, 3, out + err)
+                row = self.rows(self.mod.build_context(self.paths, NOW))["planner"]
+                self.assertFalse(any("alignment" in a["bases"] for a in row["alternatives"]))
+                self.assertIn("drift:", out)
+                self.assertIn("no correction can be offered right now", out)
+                self.assertEqual(self.protected_bytes(), before)
+                self.assertEqual(self.read_json(self.paths.state)["overrides"]["planner"], old)
+
+    def test_alignment_basis_is_part_of_frozen_evidence(self):
+        self.install_managed_drift()
+        doc, _ = self.offered()
+        doc, _ = self.select_option(doc, "planner", model=self.defaults["planner"]["model"])
+        before = self.protected_bytes()
+        original = self.mod.evaluate
+
+        def altered_basis(ctx):
+            rows = original(ctx)
+            for row in rows:
+                for alt in row["alternatives"]:
+                    if "alignment" in alt["bases"]:
+                        alt["bases"] = []
+            return rows
+
+        with mock.patch.object(self.mod, "evaluate", side_effect=altered_basis):
+            rc, out, err = self.cli("apply", "--proposal-id", doc["proposal_id"], now=NOW + 1)
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("evidence", err)
+        self.assertEqual(self.protected_bytes(), before)
 
 
 if __name__ == "__main__":

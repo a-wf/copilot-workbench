@@ -683,6 +683,44 @@ layers confirmed local overrides on top of them.
   `COPILOT_MODEL_REFRESH_DOCS_FETCH=0`, `COPILOT_TASK_REPORT_PRICING_FETCH=0`
   or `--offline`, and whenever a test injects a pricing transport without a
   capability transport.
+- **Third-party comparisons (`bin/copilot_model_benchmarks.py`).** A
+  library next to the helper (installed alongside it; missing/broken =
+  "unavailable", official flow unchanged) holding a reviewed registry:
+  providers (fixed host, page layout id, metric allowlist, stated limits)
+  and exact pair pages (URL, canonical page, Copilot model ID ↔ display
+  name). On `propose`/`preview` (never `status`, `select`, `review`,
+  `apply` or `details`) every page not fetched in the last 5 min is GET
+  automatically: host resolved once, every address must be public
+  (`ipaddress.is_global` and not private/loopback/link-local/reserved/
+  multicast), connection pinned to it with SNI and certificate
+  verification (system curl `--resolve` pin only after a Python
+  certificate error), redirects refused, HTTP 200 + `text/markdown`/
+  `text/plain` only, 8 s timeout, 20 s shared deadline, 1 MB cap, no
+  cookies/auth/query. Per-layout parsers (BenchLeader `.md` alternate:
+  front-matter `url`, title, "Updated" date, "Every benchmark" table with
+  per-column effort and `†` = other effort; BenchLM markdown: title,
+  canonical page, "Last updated", Category Breakdown tables and
+  public-lane scores, "Estimated" flagged) verify identity and extract only
+  allowlisted metrics (0–100, expected unit); duplicates/unknowns become
+  unknown; no remote free text is stored. Cache
+  `model-refresh/benchmark-evidence.json` (0600; registry digest + parser
+  version, per page URL, fetch time, page date, SHA-256, layout, efforts,
+  metrics, notes; strict validation, any mismatch ignores the whole file),
+  fresh for 24 h; stale copies are reference only. `comparison(current,
+  candidate, current_effort, candidate_effort)` returns per-source metrics
+  for the directed pair, marks each comparable only when both values exist
+  at the stated setting and are not duplicated/estimated, sets an entry's
+  `setup_matches` only when the page states BOTH models' effort and it
+  equals the route's levels, and reports `supports` (a comparable metric
+  higher for the candidate in a FRESH copy whose setup matches), `mixed`
+  and `providers_disagree` disclosures — never an average, winner, price
+  or cross-source blend. Parsing is linear: headings are recognised with
+  string operations (no backtracking pattern), lines over 20,000
+  characters are skipped, cells are cut to 1,000 characters before link
+  stripping, and the remaining patterns are anchored and bounded.
+  Kill switches: `--offline`, `COPILOT_MODEL_REFRESH_BENCHMARKS_FETCH=0`,
+  `COPILOT_TASK_REPORT_PRICING_FETCH=0`, or an injected pricing transport
+  without `BENCHMARK_FETCHER` (tests).
 - **Model facts.** Per model and field: fresh live evidence, else the dated
   catalog (shipped or local overlay) as a documented fallback, else
   unknown. A live value that differs from the shipped catalog is shown as a
@@ -698,6 +736,12 @@ layers confirmed local overrides on top of them.
 - **Resolution.** shipped defaults → managed overrides (`state.json`) →
   `/subagents` values the tool did not write (agent default routes) →
   user-config pins (any route). Pinned routes are never re-proposed.
+- **Policy.** `balanced` (default; menu `p`) or `cost-led` (`--cost-led`;
+  `copilot-s` passes it only with `COPILOT_MODEL_REFRESH_POLICY=cost-led`).
+  The policy is sealed in the proposal and part of the evidence digest.
+  In balanced mode the cost-led decision below is still computed but never
+  proposed (its evidence lines are dropped): every route keeps its model
+  unless the user selects an option.
 - **Decision.** Proposals require a pricing snapshot under 24h old and an
   unexpired catalog (or, when it has expired, fresh live evidence for every
   parsed section; per model, catalog-based facts still fail closed). A
@@ -727,21 +771,46 @@ layers confirmed local overrides on top of them.
   plain `propose` prints `VERIFY<TAB>needed`; `copilot-s` uses review mode
   instead, below). The
   table states that fit is categorical, not measured or equal quality.
-- **Optional alternatives.** Per unpinned route with a known current
-  price, an eligible model (every gate above) in the route's accepted task
-  area that is NOT ≥ 10% cheaper is offered only when it has a concrete
-  documented differentiator versus the current model: official Copilot CLI
-  "included" where the current model is not, the route's task area where
-  the current model's differs, or documented 1M context (long_context
-  routes) / configurable reasoning the current model lacks. Category,
-  newness or price are never differentiators; without one the model is
-  listed as considered with that reason. Alternatives are numbered,
-  shown with the blended Default (and long-context) price delta in $ and
-  %, the differentiator with its source, the official "Excels at" text
-  labelled as the vendor's description, and limits; `propose` prints
-  `ALTERNATIVE<TAB>n<TAB>route<TAB>model`. None is ever pre-selected: when
-  nothing else changes, `propose` still exits 3 but freezes a no-op
-  proposal so an explicit selection is possible.
+- **Options (alternatives).** Per unpinned route with a known current
+  price, an eligible model (every gate above except the 10% rule) in the
+  route's accepted task area is offered with `bases`: `saving` (≥ 10%
+  cheaper; balanced only — cost-led lists the non-cheapest ones as
+  considered), `official` (a concrete documented differentiator versus the
+  current model: official Copilot CLI "included" where the current model is
+  not, the route's task area where the current model's differs, or
+  documented 1M context (long_context routes) / configurable reasoning the
+  current model lacks) and/or `benchmark` (only for a NOT-cheaper model: a
+  fresh reviewed third-party comparison of that exact pair `supports` it at
+  the route's levels); `alignment` (balanced only) is the CURRENT model at
+  the route's shipped baseline effort/context when the current values
+  drifted from it and that model passes every gate there (the overview
+  always shows a `drift:` line for such a route, with the option number or
+  why no correction can be offered). The short view shows at most three
+  comparable metrics per source in turn from each direction plus counts
+  of hidden ones per direction; a later option with the same DIRECTED
+  pair references the earlier one but repeats its own setup note,
+  disclosures and caution.
+  Category, newness or price are never reasons; without one the model is
+  listed as considered with that reason. Options are numbered (route
+  order, then price) and rendered with the blended Default (and
+  long-context) price delta in $ and %, both models' official rates, the
+  reasons with sources, the third-party evidence and cautions, the
+  official "Excels at" text labelled as the vendor's description, and what
+  remains to confirm; `propose` prints `ALTERNATIVE<TAB>n<TAB>route<TAB>model`.
+  None is ever pre-selected: when nothing else changes, `propose` still
+  exits 3 but freezes a no-op proposal so an explicit selection is possible.
+- **Output.** `propose`/`preview` print a change-first overview (source
+  summary, every route with current values and option numbers, the
+  options, third-party coverage + caution + source URLs, ACTION REQUIRED
+  for plain propose, next step); `--details` appends the full report, and
+  `details [--proposal-id ID]` prints it from caches only (no lock, no
+  network, no writes; a proposal is peeked read-only after checking id,
+  format, lifetime and seal, and the output says whether its evidence
+  still matches). Colour: SGR codes only on stdout when it is a terminal
+  or `COPILOT_MODEL_REFRESH_COLOR=always`, never with `NO_COLOR`/
+  `TERM=dumb`, never on machine lines; widths and wrapping are computed on
+  plain text (`COLUMNS` wins; a pipe without it is not wrapped), and words
+  are never broken.
 - **Review mode (`propose --review`, what menu `p` runs).** A candidate
   whose ONLY failing gates are availability and/or the exact reasoning
   level (user-fixable codes) is kept as tentatively eligible and may be
@@ -767,17 +836,19 @@ layers confirmed local overrides on top of them.
   `apply` refuses any proposal that still has pending items. Saved
   availability/level evidence is always reused first; `record-verified`
   remains a separate command.
-- **Two-phase apply.** `propose` writes `pending-proposal.json` (format 3,
-  15 min TTL) with digests of settings, state, user config, verified
-  record, routing defaults, catalog, capability evidence, pricing snapshot
-  and generated files, the expected output digests, an evidence digest
-  (pricing snapshot and status, capability digest incl. freshness, catalog,
-  availability records, local date, each route's decision and
-  alternatives) and the numbered alternatives. `select --proposal-id
-  --choose N[,N]` re-derives everything cache-only, refuses on any
-  difference, and writes a NEW proposal (same expiry) whose overrides add
-  the chosen alternatives (one per route; it replaces that route's
-  cost-led change). `copilot-s` asks for an exact `yes`, then `apply
+- **Two-phase apply.** `propose` writes `pending-proposal.json` (format 4,
+  15 min TTL; older formats are refused) with digests of settings, state,
+  user config, verified record, routing defaults, catalog, capability
+  evidence, third-party comparison cache (registry digest + per-page record
+  hash + freshness), pricing snapshot and generated files, the expected
+  output digests, an evidence digest (pricing snapshot and status,
+  capability digest incl. freshness, third-party digest, policy, catalog,
+  availability records, local date, each route's decision and options with
+  their bases), the sealed `policy` and the numbered options. `select
+  --proposal-id --choose N[,N]` re-derives everything cache-only, refuses
+  on any difference, and writes a NEW proposal (same expiry) whose
+  overrides add the chosen options (one per route; the choice replaces any
+  earlier selection and, in cost-led mode, that route's cost-led change). `copilot-s` asks for an exact `yes`, then `apply
   --proposal-id` re-reads everything, re-derives the decisions, refuses on
   any mismatch, on an older-format proposal, on overrides that are not
   exactly the re-derived ones (tampering), and on a proposal id already in

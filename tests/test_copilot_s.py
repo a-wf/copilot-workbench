@@ -29,10 +29,12 @@ import select
 import signal
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import termios
 import unittest
 from unittest import mock
 
@@ -2057,6 +2059,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
     SELECT_PROMPT = "Select session to resume"
     CONFIRM = "anything else cancels):"
     PAUSE = "Press Enter to return to the menu..."
+    OPTIONS = "Enter = none:"
     PROPOSAL_ID = "0123456789abcdef"
     AVAILABLE = "Are all these proposed models available in /model? [y/N]:"
     UNAVAILABLE = "Enter cancels):"
@@ -2070,6 +2073,8 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 "import json,os,runpy,sys\n"
                 "args=sys.argv[1:]\n"
                 "with open(os.environ['REFRESH_LOG'],'a') as f: f.write(json.dumps(args)+'\\n')\n"
+                "if os.environ.get('REFRESH_RENDER_LOG'):\n"
+                " with open(os.environ['REFRESH_RENDER_LOG'],'a') as f: f.write(json.dumps({'args':args,'color':os.environ.get('COPILOT_MODEL_REFRESH_COLOR'),'columns':os.environ.get('COLUMNS')})+'\\n')\n"
                 "def real_helper():\n"
                 " os.environ['COPILOT_TASK_REPORT_HELPER']=os.environ['REAL_REPORT_HELPER']\n"
                 " runpy.run_path(os.environ['REAL_REFRESH_HELPER'],run_name='__main__')\n"
@@ -2111,6 +2116,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 " print('Final effective routing: ten routes' if rc==0 else 'fixture apply refused before write')\n"
                 " sys.exit(rc)\n"
                 "if args[0]=='discard': print('Cancelled; Final effective routing (kept): ten routes')\n"
+                "if args[0]=='details': print('Details view: cached synthetic fixture, no fetch or writes'); sys.exit(0)\n"
                 "if args[0]=='status':\n"
                 " rc=int(os.environ.get('STATUS_RC','0'))\n"
                 " if rc: print('fixture status could not read routing'); sys.exit(rc)\n"
@@ -2190,11 +2196,13 @@ class TestModelRefreshMenu(BaseHomeTestCase):
             self.assertEqual(sum(row.startswith(label + "  ") for row in rows), 1, section)
         self.assertIn("native-status-choice", section)
 
-    def _scripted_tty(self, env, actions, args=(), timeout=12, forbidden=()):
+    def _scripted_tty(self, env, actions, args=(), timeout=12, forbidden=(), columns=None):
         pid, master = pty.fork()
         if pid == 0:
             os.chdir(self.cwd)
             os.execve("/bin/bash", ["/bin/bash", COPILOT_S, *args], env)
+        if columns:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
         output = bytearray()
         cursor = answered = 0
         status = None
@@ -2407,7 +2415,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 if os.path.exists(self.refresh_log):
                     os.unlink(self.refresh_log)
                 status, out = self._scripted_tty(env, [
-                    (self.EMPTY_PROMPT, "p\n"), ("or Enter for none:", "1\n"),
+                    (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, "1\n"),
                     (self.CONFIRM, confirm), (self.PAUSE, self._assert_no_launch_at_pause),
                     (self.EMPTY_PROMPT, "q\n"),
                 ])
@@ -2427,7 +2435,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 if os.path.exists(self.refresh_log):
                     os.unlink(self.refresh_log)
                 status, out = self._scripted_tty(env, [
-                    (self.EMPTY_PROMPT, "p\n"), ("or Enter for none:", selection),
+                    (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, selection),
                     (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
                 ])
                 self.assertEqual(status, 0, out)
@@ -2443,7 +2451,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 if os.path.exists(self.refresh_log):
                     os.unlink(self.refresh_log)
                 status, out = self._scripted_tty(env, [
-                    (self.EMPTY_PROMPT, "p\n"), ("or Enter for none:", "1,2\n"),
+                    (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, "1,2\n"),
                     (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
                 ])
                 self.assertEqual(status, 0, out)
@@ -2587,7 +2595,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
         ])
         before = self._routing_snapshot()
         status, out = self._scripted_tty(env, [
-            (self.EMPTY_PROMPT, "p\n"), ("or Enter for none:", "1\n"),
+            (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, "1\n"),
             (self.AVAILABLE, "y\n"), (self.CONFIRM, "yes\n"),
             (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
         ])
@@ -2636,7 +2644,7 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                     actions += [(self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n")]
                     status, out = self._scripted_tty(
                         env, actions, forbidden=(self.AVAILABLE, "Does /model offer reasoning level",
-                                                 "or Enter for none:", self.CONFIRM))
+                                                 self.OPTIONS, self.CONFIRM))
                     self.assertEqual(status, 0, out)
                     self.assertIn("malformed review output", out)
                     self.assertFalse(any(c[0] == "apply" for c in self._calls()))
@@ -2700,6 +2708,298 @@ class TestModelRefreshMenu(BaseHomeTestCase):
                 self.assertEqual(self._calls()[-1], ["status"])
                 self.assertNotIn("Type 'yes'", out)
                 self.assertEqual(self._routing_snapshot(), before)
+
+
+class TestBalancedRefreshMenuDetails(BaseHomeTestCase):
+    """New menu behavior, sharing fixtures only (not duplicating old tests)."""
+
+    def test_details_d_and_D_keep_proposal_then_selection_and_exact_yes(self):
+        env = self._refresh_env({"REFRESH_ALTS": "1", "REFRESH_RC": "3"})
+        before = self._routing_snapshot()
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, "d\n"),
+            (self.OPTIONS, "D\n"), (self.OPTIONS, "1\n"),
+            (self.CONFIRM, "yes\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+            (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self._calls(), [
+            ["propose", "--review"],
+            ["details", "--proposal-id", self.PROPOSAL_ID],
+            ["details", "--proposal-id", self.PROPOSAL_ID],
+            ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
+            ["apply", "--proposal-id", "fedcba9876543210"],
+        ])
+        self.assertEqual(out.count("Details view: cached synthetic fixture"), 2)
+        self.assertEqual(self._routing_snapshot(), before)
+        self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_details_repeat_budget_five_never_selects_or_applies_a_details_token(self):
+        env = self._refresh_env({"REFRESH_ALTS": "1", "REFRESH_RC": "3"})
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), *[(self.OPTIONS, "d\n") for _ in range(6)],
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(sum(c[0] == "details" for c in self._calls()), 5)
+        self.assertFalse(any(c[0] in ("select", "apply") for c in self._calls()))
+        self.assertEqual(self._calls()[-1], ["discard", "--proposal-id", self.PROPOSAL_ID])
+
+    def test_balanced_selection_precedes_only_selected_model_availability_and_level(self):
+        second, third = "2222222222222222", "3333333333333333"
+        env = self._review_env([
+            self._review_reply(alternatives=(1,), rc=3),
+            self._review_reply(second, checks=("gpt-6.2-sol",),
+                               levels=(("gpt-6.2-sol", "xhigh"),), selected=1),
+            self._review_reply(third, selected=1),
+        ])
+        before = self._routing_snapshot()
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, "1\n"),
+            (self.AVAILABLE, "y\n"),
+            ("Does /model offer reasoning level 'xhigh' for gpt-6.2-sol? [y/N]", "y\n"),
+            (self.CONFIRM, "yes\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+            (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertLess(out.index(self.OPTIONS), out.index(self.AVAILABLE))
+        self.assertEqual(self._calls(), [
+            ["propose", "--review"],
+            ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
+            ["review", "--proposal-id", second, "--available-all",
+             "--level", "gpt-6.2-sol:xhigh=yes"],
+            ["apply", "--proposal-id", third],
+        ])
+        self.assertEqual(self._routing_snapshot(), before)
+        self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_rejected_selection_reoffers_new_numbers_without_automatic_replacement(self):
+        second, third, fourth = "2222222222222222", "3333333333333333", "4444444444444444"
+        env = self._review_env([
+            self._review_reply(alternatives=(1,), rc=3),
+            self._review_reply(second, checks=("gpt-6.2-sol",), selected=1),
+            self._review_reply(third, alternatives=(2,), rc=3),
+            self._review_reply(fourth, selected=1),
+        ])
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, "1\n"),
+            (self.AVAILABLE, "n\n"), (self.UNAVAILABLE, "gpt-6.2-sol\n"),
+            (self.OPTIONS, "2\n"), (self.CONFIRM, "no\n"),
+            (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertIn("renumbered", out)
+        self.assertEqual(self._calls(), [
+            ["propose", "--review"],
+            ["select", "--proposal-id", self.PROPOSAL_ID, "--choose", "1"],
+            ["review", "--proposal-id", second, "--unavailable", "gpt-6.2-sol"],
+            ["select", "--proposal-id", third, "--choose", "2"],
+            ["discard", "--proposal-id", fourth],
+        ])
+        self.assertFalse(os.path.exists(self.copilot_log))
+
+    def test_policy_explicit_cost_led_forwarded_invalid_policy_never_calls_helper(self):
+        env = self._refresh_env({"COPILOT_MODEL_REFRESH_POLICY": "cost-led", "REFRESH_RC": "3"})
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+            (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self._calls(), [["propose", "--review", "--cost-led"]])
+        os.unlink(self.refresh_log)
+        env["COPILOT_MODEL_REFRESH_POLICY"] = "invalid"
+        status, out = self._scripted_tty(env, [
+            (self.EMPTY_PROMPT, "p\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+            (self.EMPTY_PROMPT, "q\n"),
+        ])
+        self.assertEqual(status, 0, out)
+        self.assertIn("must be 'balanced' or 'cost-led'", out)
+        self.assertEqual(self._calls(), [])
+
+    def test_terminal_forwarding_color_and_width_honors_no_color_and_dumb(self):
+        render_log = os.path.join(self.home, "render.jsonl")
+        for additions, color in (({"TERM": "xterm-256color"}, "always"),
+                                 ({"TERM": "xterm-256color", "NO_COLOR": "1"}, "never"),
+                                 ({"TERM": "dumb"}, "never")):
+            with self.subTest(additions=additions):
+                if os.path.exists(render_log):
+                    os.unlink(render_log)
+                env = self._refresh_env(dict(additions, REFRESH_RC="3", REFRESH_ALTS="1",
+                                             REFRESH_RENDER_LOG=render_log))
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, "d\n"),
+                    (self.OPTIONS, "\n"), (self.PAUSE, self._assert_no_launch_at_pause),
+                    (self.EMPTY_PROMPT, "q\n"),
+                ], columns=80)
+                self.assertEqual(status, 0, out)
+                with open(render_log, encoding="utf-8") as f:
+                    records = [json.loads(line) for line in f]
+                self.assertEqual([r["color"] for r in records], [color] * 3)
+                self.assertEqual([r["columns"] for r in records], ["80"] * 3)
+
+    def sourceable(self):
+        path = os.path.join(self.home, "sourceable-launcher")
+        with open(COPILOT_S, encoding="utf-8") as f:
+            lines = f.readlines()
+        self.assertEqual(lines[-1].strip(), 'main "$@"')
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines[:-1])
+        return path
+
+    def test_nonterminal_forwarding_never_enables_color(self):
+        result = run(["bash", "-c", 'source "$1"; model_refresh_terminal_setup; printf "COLOR=%s\\n" "$MR_COLOR"',
+                      "_", self.sourceable()], env=self.env({"TERM": "xterm"}))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("COLOR=never", result.stdout)
+
+    def _alternative_protocol(self, command, lines):
+        env = self._review_env([{"lines": [
+            *lines, "REVIEW\tcomplete", "SELECTED\t0", "PROPOSAL\t" + self.PROPOSAL_ID,
+        ], "rc": 3}])
+        result = run(["bash", "-c",
+                      'source "$1"; rc=0; run_model_refresh_helper "$2" || rc=$?; '
+                      'printf "HELPER_RC=%s\\nPROTOCOL=%s\\nALTERNATIVES=%s\\n" '
+                      '"$rc" "$MR_PROTOCOL_OK" "${MR_ALTERNATIVES[*]}"',
+                      "_", self.sourceable(), command], env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("HELPER_RC=3", result.stdout)
+        self.assertFalse(os.path.exists(self.copilot_log))
+        return result.stdout
+
+    def test_malformed_alternative_fields_fail_closed_in_shell_protocol(self):
+        malformed = (
+            "ALTERNATIVE\t1", "ALTERNATIVE\t1\ttester",
+            "ALTERNATIVE\t1\tbad/id\tgpt-6.2-sol",
+            "ALTERNATIVE\t1\ttester\tbad/model",
+            "ALTERNATIVE\t1\ttester\tgpt-6.2-sol\textra",
+            "ALTERNATIVE\t0\ttester\tgpt-6.2-sol",
+            "ALTERNATIVE\t01\ttester\tgpt-6.2-sol",
+            "ALTERNATIVE\t001\ttester\tgpt-6.2-sol",
+            "ALTERNATIVE\t1000\ttester\tgpt-6.2-sol",
+            "ALTERNATIVE\t-1\ttester\tgpt-6.2-sol",
+            "ALTERNATIVE\t 1\ttester\tgpt-6.2-sol",
+            "ALTERNATIVE\t\ttester\tgpt-6.2-sol",
+            "ALTERNATIVE\t1\ttester,coder\tgpt-6.2-sol",
+            "ALTERNATIVE\t1\ttester\tgpt-6.2-sol\t",
+            "ALTERNATIVE\t1\ttester\t",
+        )
+        for command in ("propose", "select", "review"):
+            for line in malformed:
+                with self.subTest(command=command, line=line):
+                    self.assertIn("PROTOCOL=false", self._alternative_protocol(command, [line]))
+
+    def test_alternative_bounds_valid_route_and_model_pass_duplicate_numbers_refuse(self):
+        valid = ["ALTERNATIVE\t1\treviewer.stronger\tgpt-6.1-terra",
+                 "ALTERNATIVE\t999\tcoder\tgpt-6.2-sol"]
+        for command in ("propose", "select", "review"):
+            with self.subTest(command=command, case="valid bounds"):
+                out = self._alternative_protocol(command, valid)
+                self.assertIn("PROTOCOL=true", out)
+                self.assertIn("ALTERNATIVES=1 999\n", out)
+            for duplicate in (valid[0], "ALTERNATIVE\t1\ttester\tgpt-6.2-sol"):
+                with self.subTest(command=command, duplicate=duplicate):
+                    out = self._alternative_protocol(command, [valid[0], duplicate])
+                    self.assertIn("PROTOCOL=false", out)
+
+    def test_alignment_selection_checks_exact_level_and_still_needs_final_exact_yes(self):
+        model = "gpt-6.1-sol"
+        second, third = "2222222222222222", "3333333333333333"
+        for confirm, command in (("yes\n", "apply"), ("YES\n", "discard")):
+            with self.subTest(confirm=confirm):
+                env = self._review_env([
+                    {"lines": [
+                        "Same model alignment: planner gpt-6.1-sol low/default -> medium/long_context; none selected",
+                        "REVIEW\tcomplete", "SELECTED\t0",
+                        "ALTERNATIVE\t1\tplanner\t" + model, "PROPOSAL\t" + self.PROPOSAL_ID,
+                    ], "rc": 3},
+                    {"lines": [
+                        "Selected same model alignment only", "CHECK\t%s\tplanner" % model,
+                        "LEVEL\t%s\tmedium" % model, "REVIEW\tpending", "SELECTED\t1",
+                        "PROPOSAL\t" + second,
+                    ]},
+                    {"lines": [
+                        "Revised planner: gpt-6.1-sol medium/long_context",
+                        "REVIEW\tcomplete", "SELECTED\t1", "PROPOSAL\t" + third,
+                    ]},
+                ])
+                before = self._routing_snapshot()
+
+                def confirmed_only_after_checks():
+                    self.assertEqual(self._routing_snapshot(), before)
+                    self.assertFalse(any(c[0] == "apply" for c in self._calls()))
+                    self.assertEqual(self._calls()[-1], [
+                        "review", "--proposal-id", second, "--available-all",
+                        "--level", model + ":medium=yes",
+                    ])
+                    return confirm
+
+                status, out = self._scripted_tty(env, [
+                    (self.EMPTY_PROMPT, "p\n"), (self.OPTIONS, "1\n"),
+                    (self.AVAILABLE, "y\n"),
+                    ("Does /model offer reasoning level 'medium' for gpt-6.1-sol? [y/N]", "y\n"),
+                    (self.CONFIRM, confirmed_only_after_checks),
+                    (self.PAUSE, self._assert_no_launch_at_pause), (self.EMPTY_PROMPT, "q\n"),
+                ])
+                self.assertEqual(status, 0, out)
+                self.assertEqual(self._calls()[-1], [command, "--proposal-id", third])
+                self.assertEqual(self._routing_snapshot(), before)
+                self.assertIn("sites see an ordinary request from your IP address", out)
+                self.assertNotIn("nothing about you is sent", out)
+                self.assertFalse(os.path.exists(self.copilot_log))
+
+
+# Copy fixture methods/attributes rather than inheriting test methods.
+# This keeps the original menu suite a single execution per batch.
+for _name in tuple(vars(TestModelRefreshMenu)):
+    if not _name.startswith("test_") and _name not in ("__dict__", "__weakref__", "__module__", "__doc__"):
+        if _name not in vars(TestBalancedRefreshMenuDetails):
+            setattr(TestBalancedRefreshMenuDetails, _name, getattr(TestModelRefreshMenu, _name))
+
+
+class TestModelRefreshDistribution(BaseHomeTestCase):
+    def test_new_library_install_copy_symlink_custom_prefix_and_uninstall_preserve_state(self):
+        state = os.path.join(self.home, ".copilot", "model-refresh")
+        os.makedirs(state)
+        sentinels = {}
+        for name in ("benchmark-evidence.json", "state.json", "user-config.json"):
+            path = os.path.join(state, name)
+            sentinels[path] = b'{"fixture":"preserve user data"}\n'
+            with open(path, "wb") as f:
+                f.write(sentinels[path])
+        module = os.path.join(REPO_ROOT, "bin", "copilot_model_benchmarks.py")
+        for copy_mode, custom in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(copy=copy_mode, custom=custom):
+                prefix = os.path.join(self.home, "custom", "tools") if custom else os.path.join(
+                    self.home, ".local", "bin")
+                arguments = (["--copy"] if copy_mode else []) + (["--prefix", prefix] if custom else [])
+                installed = run([INSTALL_SH, *arguments], env=self.env())
+                self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+                library = os.path.join(prefix, "copilot_model_benchmarks.py")
+                self.assertTrue(os.path.exists(library))
+                self.assertEqual(os.path.islink(library), not copy_mode)
+                with open(library, "rb") as f, open(module, "rb") as original:
+                    self.assertEqual(f.read(), original.read())
+                manifest = os.path.join(self.home, ".copilot-cli-toolkit", "install-manifest.txt")
+                with open(manifest, encoding="utf-8") as f:
+                    self.assertIn(library, f.read().splitlines())
+                code = (
+                    "import importlib.util,sys; "
+                    "s=importlib.util.spec_from_file_location('fixture_refresh',sys.argv[1]); "
+                    "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                    "b,e=m.load_benchmark_module(); assert b is not None,e; "
+                    "assert len(b.PAIRS)==4; print(b.__file__)"
+                )
+                smoke = run([sys.executable, "-c", code,
+                             os.path.join(prefix, "copilot-model-refresh.py")], env=self.env())
+                self.assertEqual(smoke.returncode, 0, smoke.stdout + smoke.stderr)
+                self.assertEqual(os.path.realpath(smoke.stdout.strip()),
+                                 os.path.realpath(library if copy_mode else module))
+                removed = run([UNINSTALL_SH], env=self.env())
+                self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+                self.assertFalse(os.path.lexists(library))
+                for path, data in sentinels.items():
+                    with open(path, "rb") as f:
+                        self.assertEqual(f.read(), data)
 
 
 class TestRegistryLockSafety(BaseHomeTestCase):

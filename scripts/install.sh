@@ -272,6 +272,11 @@ install_one "$REPO_ROOT/bin/copilot-report-cleanup.py" "$BIN_PREFIX/copilot-repo
 # prefix for --copy installs — so it must sit next to them.
 install_one "$REPO_ROOT/bin/copilot_quarantine_purge.py" "$BIN_PREFIX/copilot_quarantine_purge.py"
 install_one "$REPO_ROOT/bin/copilot-model-refresh.py" "$BIN_PREFIX/copilot-model-refresh.py" true
+# Reviewed third-party comparison registry + parser (a library, not a
+# command) loaded by copilot-model-refresh.py from its own real directory,
+# so it must sit next to it. Without it menu p still works (official
+# evidence only) and says third-party comparisons are unavailable.
+install_one "$REPO_ROOT/bin/copilot_model_benchmarks.py" "$BIN_PREFIX/copilot_model_benchmarks.py"
 install_one "$REPO_ROOT/bin/copilot-session-report.py" "$BIN_PREFIX/copilot-session-report.py" true
 
 # --- Session-local RTK hook plugin (used only by `copilot-s --rtk`) ---

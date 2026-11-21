@@ -26,7 +26,8 @@
 #     `r` -> 4, or `purge --batch <batch>`) BEFORE uninstalling, because the
 #     purge engine copilot_quarantine_purge.py is removed with the tools.
 #   - Subagent model-refresh state (~/.copilot/model-refresh: confirmed
-#     overrides, your user-config.json pins/availability list, backups) and
+#     overrides, your user-config.json pins/availability list, backups, the
+#     cached official capability and third-party comparison evidence) and
 #     what an applied refresh wrote outside it (the /subagents values in
 #     ~/.copilot/settings.json and the generated
 #     ~/.copilot/instructions/copilot-toolkit-model-routing.instructions.md).

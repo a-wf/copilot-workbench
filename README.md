@@ -90,12 +90,15 @@ sessions may need a reload or restart.
 - **Subagent model refresh** (`copilot-s` menu `p`) — compares each
   subagent route against the current official GitHub Copilot prices and the
   current official model capability pages (with a dated, sourced catalog
-  as fallback), lists every model in view with its documented facts and
-  whether you verified it, shows the current/proposed table with reasons
-  plus optional (possibly more expensive) alternatives that have a
-  documented differentiator, and applies local overrides only after you
-  type `yes`; shipped defaults and your own `/subagents` values are never
-  overwritten.
+  as fallback), plus a short reviewed list of public third-party benchmark
+  comparison pages shown as reference only. Balanced by default: a compact,
+  colour-highlighted overview lists every route and numbered options
+  (cheaper ones, and others backed by an official differentiator or a
+  third-party comparison of that exact pair) with official prices and
+  cautions; **nothing is preselected**, you choose by number, and local
+  overrides are applied only after you type `yes`. The full report (all
+  models, rejected candidates, raw rates) is an optional details view.
+  Shipped defaults and your own `/subagents` values are never overwritten.
 - **Automatic per-task usage reports** — every session exit appends
   token counts, model-call time, reasoning-effort intent, and an estimated
   USD cost to a cumulative Markdown report for the task associated with
@@ -204,6 +207,7 @@ This installs:
 | What | Installed to | Method |
 |---|---|---|
 | `copilot-s`, `copilot-task-report.py`, `copilot-session-cleanup.py`, `copilot-report-cleanup.py`, `copilot-model-refresh.py`, `copilot-session-report.py` | `~/.local/bin/` | symlink by default (or plain file copy with `--copy`) |
+| Libraries loaded from the tools' own directory: `copilot_quarantine_purge.py` (cleanup purge engine), `copilot_model_benchmarks.py` (menu `p` third-party comparison registry/parser) | `~/.local/bin/` | symlink (or copy with `--copy`); not commands |
 | Session-local RTK hook plugin (`copilot-s --rtk` only) | `~/.local/bin/copilot-s-rtk-plugin/` | symlink (or copy with `--copy`), file by file; loaded per launch with `--plugin-dir`, **never** installed as a Copilot plugin |
 | 7 agent definitions | `~/.copilot/agents/` | symlink (or copy with `--copy`) |
 | Orchestrator instructions | `~/.copilot/copilot-instructions.md` | symlink (or copy with `--copy`) |
@@ -511,7 +515,12 @@ or partial, 130 interrupted.
 Menu option `p) Refresh subagent models from current prices` (also offered
 when there are no saved sessions — there, Enter still starts a new session
 and `p` returns to that menu instead of launching anything) runs
-`copilot-model-refresh.py propose`:
+`copilot-model-refresh.py propose --review` in the **balanced** policy (the
+default): nothing is changed or preselected automatically — you choose
+options by number. The legacy **cost-led** policy (the cheapest eligible
+saving of at least 10% proposed automatically, still applied only after
+`yes`) remains available with `COPILOT_MODEL_REFRESH_POLICY=cost-led` for
+`p`, or `--cost-led` on the helper.
 
 1. **Current prices.** It fetches the official
    [models and pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing)
@@ -539,14 +548,70 @@ and `p` returns to that menu instead of launching anything) runs
    authorizes a change. Per model and field, fresh official evidence is
    used first and the dated catalog is the fallback. Disable the fetch with
    `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` (or `--offline`).
-3. **Table.** For each of the ten routes — the seven custom agents,
-   `coder (small/casual)`, `reviewer (stronger override)`, and the built-in
-   `task` route — it shows the current model · effort · context and its
-   source (shipped default / managed override / your pin), the proposal,
-   official input / cached / cache-write / output rates per 1M tokens
-   (plus long-context tier rates), the snapshot id and cache age, and the
-   reason and evidence for every keep/change decision. **All models in
-   view** — the union of the official pricing, the official capability
+3. **Third-party comparisons (automatic, reference only).** In the same run
+   it also GETs a fixed, reviewed list of public comparison pages
+   (registry in `bin/copilot_model_benchmarks.py`; initially
+   [BenchLeader](https://www.benchleader.com/methodology) and
+   [BenchLM](https://benchlm.ai/score-sources) pages for
+   `claude-sonnet-5.5` vs `gpt-6.1-terra` and `gpt-6.1-sol` vs
+   `gpt-6.2-sol`). See [Third-party comparisons](#third-party-comparisons-in-menu-p)
+   below for what is fetched, how it is parsed and its limits. They can
+   make an option *visible*; they never choose, gate or apply anything.
+4. **Overview first.** The output starts with a compact, change-first
+   overview: the state of each source (official pricing, official docs,
+   third-party pages, your availability record, any blocking warning),
+   every one of the ten routes — the seven custom agents,
+   `coder (small/casual)`, `reviewer (stronger override)` and the built-in
+   `task` route — with its current model · effort · context, source and
+   whether it has options, then the **numbered options**. Each option shows
+   current → option, the blended price change in $ and % (and above the
+   long-context threshold), the exact official rates of both models (input,
+   cached input, cache write, output; long-context tier rates), why it is
+   offered, the third-party evidence for that exact pair (source, page
+   date, fetch age, reasoning effort as stated by the page versus your
+   route's level, each listed metric with both values, and a caution), and
+   what is still to confirm. Then the third-party coverage with every
+   source URL, the caution, and the next step. Colours are semantic
+   (option numbers, savings vs higher prices, warnings, third-party blocks)
+   but every line keeps its words; they appear only on a terminal and never
+   with `NO_COLOR` set or `TERM=dumb`. Text wraps to your terminal width
+   without cutting model IDs, prices or warnings. The screen is never
+   cleared.
+5. **Options and selection.** In the balanced policy a route's options are
+   the models that pass every gate below (except the 10% rule) and are in
+   the route's accepted official task area, and either are **at least 10%
+   cheaper** (all of them, not only the cheapest) or, if not, have a
+   concrete documented **official differentiator** versus the current model
+   (e.g. listed as included for Copilot CLI in the official per-client
+   table when the current model is not) or a **fresh reviewed third-party
+   comparison of that exact pair, measured at this route's reasoning
+   levels** — the page must state both models' effort and it must equal
+   the route's level for the current model and the option — reporting a
+   higher score for it on at least one comparable metric (other metrics may
+   favour the current model; a cheaper option is never "backed" by a
+   cherry-picked metric). Scores at an unstated or different effort (e.g.
+   BenchLeader's `max` columns for a `low`/`high` route, or BenchLM, which
+   states no effort) are shown as context only and never make an option
+   visible. A higher Category, a newer version or a higher price alone is
+   never a reason; such models are listed as "considered" in the details
+   view. When an unpinned route's current effort/context differs from its
+   shipped baseline (for example after a toolkit update changed the
+   baseline level under an existing override), the overview shows a
+   **drift** line, and when the current model passes every gate at the
+   baseline values a same-model **alignment** option corrects it (selected,
+   checked and confirmed like any other option). Nothing is
+   preselected and no recommendation is implied: at the prompt you type
+   option numbers (at most one per route), `d` for the details view, or
+   Enter for none (every route keeps its model). Pinned routes and routes
+   with an unknown current price get no options.
+6. **Details view (optional).** `d` at the prompt, `copilot-model-refresh.py
+   details [--proposal-id ID]` or `propose/preview --details` prints the
+   full report: for each route the reason and evidence for every
+   keep/change decision, every cheaper candidate that was not eligible and
+   why, every same-task-area model considered, the official rates table,
+   the snapshot id and cache age, every option in full, every parsed
+   third-party metric (including non-comparable ones) with provenance, and
+   **All models in view** — the union of the official pricing, the official capability
    pages, the catalog, your verified records and the current routes,
    including unpriced or undocumented ones as *unknown* — are listed with
    price, task area, 1M context, configurable reasoning, Copilot CLI
@@ -558,12 +623,17 @@ and `p` returns to that menu instead of launching anything) runs
    it) is assessed from the current official pages when they document its
    task area, Category, capabilities and CLI support; otherwise it is
    listed as unassessed and never assigned. Models new since your last
-   refresh are flagged.
-4. **Check the proposed models in `/model`.** `copilot-s` runs the helper in
-   review mode: a candidate blocked *only* by availability or an exact
-   reasoning level you have not verified may still be proposed, marked
-   TENTATIVE (every other gate below still applies). After the table, it
-   lists each proposed model once — its route(s), the exact reasoning
+   refresh are flagged. `details` reads cached copies only: no network
+   request, no lock, nothing written, the pending proposal untouched (with
+   `--proposal-id` it uses that proposal's sealed policy, answers and
+   selection read-only and says whether its numbers still match).
+7. **Check YOUR selected models in `/model`.** `copilot-s` runs the helper in
+   review mode: an option blocked *only* by availability or an exact
+   reasoning level you have not verified is still offered, marked
+   "still to confirm" (every other gate below still applies) — and you are
+   asked about it only if you select it.
+   After your selection it lists each selected (or, in the cost-led policy,
+   proposed) model once — its route(s), the exact reasoning
    level(s) it needs, blended price and why — and asks **"Are all these
    proposed models available in /model? [y/N]"**. On No you type only the
    unavailable IDs from that list (spaces/commas; anything else is
@@ -575,40 +645,27 @@ and `p` returns to that menu instead of launching anything) runs
    prices and evidence (an unavailable model is excluded for the rest of
    that run, even if an older record lists it) and asks again only about
    new proposals, until nothing is pending; if no replacement remains, every
-   route keeps its model. Your answers live only inside the sealed proposal
+   route keeps its model. If an answer removes one of your selections, the
+   renumbered options are offered again (at most three selection rounds;
+   numbers entered then replace the whole selection, Enter keeps what is
+   left). Your answers live only inside the sealed proposal
    for that run — never in `verified-models.json`, `user-config.json` or
    any routing file — and a tentative proposal can never be applied. To
    save a `/model` record for later runs instead, run
    `copilot-model-refresh.py record-verified` (interactive; saved to
    `~/.copilot/model-refresh/verified-models.json`, dated, valid 30 days,
    only after you type `yes`).
-5. **Optional alternatives.** Besides the cost-saving proposals (rule
-   unchanged: at least 10% cheaper), a route can list numbered optional
-   alternatives: models that pass every gate below, are in the route's
-   official task area, are *not* at least 10% cheaper (they may cost the
-   same or more), and have a concrete documented differentiator versus the
-   current model — e.g. listed as included for Copilot CLI in the official
-   per-client table when the current model is not listed there. A higher
-   Category, a newer version or a higher price is never a differentiator;
-   such models are shown as "considered" with the reason. Each alternative
-   shows the blended price change in $ and % (and above the long-context
-   threshold), the differentiator and its source, the official "Excels at"
-   text labelled as the vendor's description, and its limits — no measured,
-   equal or better quality claim. None is pre-selected: you may type their
-   numbers (Enter = none; offered once, from the latest table); a selected
-   alternative replaces that route's cost-saving change, is checked in
-   `/model` like any proposed model if needed, and still needs the final
-   `yes`. Pinned routes and
-   routes with an unknown current price get none.
-6. **Confirm.** Only a fully checked proposal is offered, and changes are
+8. **Confirm.** Only a fully checked proposal is offered, and changes are
    applied only after you type exactly `yes` (anything else, Enter, or EOF
    cancels). The proposal is frozen with
-   digests of everything it read plus an evidence digest; `apply` (and
-   `select`) re-derive every decision from the cached evidence and refuse,
-   changing nothing, if `settings.json`, the refresh state, your user
-   config or verified record, the routing defaults, the catalog, the
-   capability evidence (or its freshness), the pricing snapshot or the
-   generated files changed in between (the digests cover the parsed prices
+   digests of everything it read plus an evidence digest (including the
+   policy and the third-party comparison cache and registry); `apply` (and
+   `select`/`review`) re-derive every decision from the cached evidence —
+   never re-fetching — and refuse, changing nothing, if `settings.json`,
+   the refresh state, your user config or verified record, the routing
+   defaults, the catalog, the capability evidence or third-party
+   comparisons (or their freshness), the pricing snapshot or the generated
+   files changed in between (the digests cover the parsed prices
    and capability values themselves), if the proposal is older than
    15 min (measured from its real creation; a future-dated or extended
    proposal is refused), was altered (proposals are sealed with a private
@@ -619,7 +676,7 @@ and `p` returns to that menu instead of launching anything) runs
    "unavailable" message instead of a guessed table) and waits for Enter
    before returning to the menu.
 
-**How a replacement is chosen (categorical fit, not a quality score).**
+**Which models can be offered (categorical fit, not a quality score).**
 The facts are the official pricing page's *Category* (Lightweight /
 Versatile / Powerful), the model comparison's *Task area*, the
 supported-models page's 1M-context and configurable-reasoning support, and
@@ -629,7 +686,8 @@ the same pages; reviewed 2026-11-16, expires 2027-02-14) as the fallback
 when a page is unavailable or stale. A live value that differs from the
 shipped catalog is shown as a change; one that contradicts your local
 overlay blocks that model until you re-vet it. The shipped routes stay the
-baseline. A route is changed only when it is not pinned and a candidate:
+baseline. A model can be offered (balanced) or proposed (cost-led) for a
+route only when the route is not pinned and the model:
 
 - has the same official task area as the route's shipped baseline model and
   a Category at least as high, configurable reasoning, 1M-context support if
@@ -651,11 +709,14 @@ baseline. A route is changed only when it is not pinned and a candidate:
   per model (Copilot CLI shows them only in the interactive `/model`
   picker), so the shipped catalog lists no levels and an unknown level
   always blocks the replacement; and
-- is at least 10% cheaper under a disclosed blended workload assumption
-  (15% input, 75% cached input, 5% cache write, 5% output of the Default-
-  tier rates — and, for `long_context` routes, also of the rates billed above
-  the long-context threshold). A current model that is unpriced (shipped
-  default or override alike) is always kept: no saving can be shown.
+- in the cost-led policy, is at least 10% cheaper under a disclosed blended
+  workload assumption (15% input, 75% cached input, 5% cache write, 5%
+  output of the Default-tier rates — and, for `long_context` routes, also of
+  the rates billed above the long-context threshold); in the balanced
+  policy that same rule marks a "saving" option, and a not-cheaper option
+  needs an official differentiator or a third-party comparison as above. A
+  current model that is unpriced (shipped default or override alike) is
+  always kept and gets no options: no price impact can be shown.
 
 The effort and context tier stay those of the route baseline. Nothing is
 inferred from price or release date; unknown, unavailable, unverified,
@@ -668,13 +729,15 @@ catalog enter (`reviewed_on`, `retrieved_on`, `expires_on`, `verified_on`)
 are compared with your **local** calendar date. A catalog (shipped or local) whose review or any source
 `retrieved_on` date lies in the future, whose sources postdate its review,
 or whose `expires_on` is not after `reviewed_on` cannot authorize any
-replacement. The table
-itself states, before the routes, that fit is categorical and **not**
-measured quality, and a proposed change never claims equal quality. When
+replacement. The details report
+states, before the routes, that fit is categorical and **not**
+measured quality, and no option or change claims equal quality. When
 replacements are blocked only by availability or reasoning levels you have
-not verified (always the case on a first run), the output ends with an
+not verified (always the case on a first run of the non-review CLI
+`propose`), the overview ends with an
 **ACTION REQUIRED** block naming the blocked candidates and a ready-to-edit
-`user-config.json` example.
+`user-config.json` example (menu `p` asks about your selected models
+instead).
 
 **Your user config** — `~/.copilot/model-refresh/user-config.json` (never
 written by the tool; all keys optional):
@@ -780,16 +843,128 @@ impact is an assumption, not your bill. The capability fetch sends only a
 plain GET for the two fixed public URLs (no credentials, cookies, model
 usage or local data); remote text is sanitized, shown only in the
 terminal, and never written into the generated instruction or settings.
-Scripted use: `copilot-model-refresh.py propose` prints machine lines
+Scripted use: `copilot-model-refresh.py propose` (balanced unless
+`--cost-led`; `--details` appends the full report; `--offline` uses cached
+copies only) prints machine lines
 `PROPOSAL<TAB>id`, `ALTERNATIVE<TAB>n<TAB>route<TAB>model` and
 `VERIFY<TAB>needed`; `propose --review` instead adds
 `CHECK<TAB>model<TAB>routes`, `LEVEL<TAB>model<TAB>effort`,
 `REVIEW<TAB>pending|complete` and `SELECTED<TAB>count`, and `review
 --proposal-id ID (--available-all | --unavailable IDS) [--level
 MODEL:EFFORT=yes|no ...]` answers them (a proposal with anything pending is
-never applicable); `select --proposal-id ID --choose 1,2` adds chosen
-alternatives (new id); `record-verified` is interactive and refuses to run
-without a terminal.
+never applicable); `select --proposal-id ID --choose 1,2` chooses options
+(it replaces any earlier selection of that proposal; new id); `details
+[--proposal-id ID] [--cost-led]` is the read-only full report;
+`record-verified` is interactive and refuses to run without a terminal.
+Machine lines are never coloured. Colour is on only when stdout is a
+terminal, or with `COPILOT_MODEL_REFRESH_COLOR=always` (what `copilot-s`
+sets after checking its own terminal, together with `COLUMNS`, because it
+captures the helper's output); `NO_COLOR` (any value) or `TERM=dumb`
+always disables it, and output to a pipe without `COLUMNS` is not wrapped.
+A balanced proposal with nothing selected exits 3 (no changes) and still
+prints a `PROPOSAL` id so options can be selected.
+
+#### Third-party comparisons in menu `p`
+
+- **What is fetched.** Only the exact HTTPS URLs listed in
+  `bin/copilot_model_benchmarks.py` (one reviewed page per provider and
+  model pair; the BenchLeader pages via their published `.md` alternate,
+  BenchLM via `Accept: text/markdown`). No URL is built from your input,
+  settings, models or remote content, and no generic URL can be added
+  from the command line. The GET happens automatically whenever `p`
+  (or `propose`/`preview` without `--offline`) runs; no cookies,
+  credentials, query string, model usage or local data are sent beyond the
+  request itself (a fixed User-Agent and Accept header). Like any web
+  request, the sites (and their CDN) see your IP address and the request
+  time.
+- **Transport.** The host must be the provider's fixed host; it is
+  resolved once and every resolved address must be a public IP (no
+  loopback/private/link-local/reserved target, even through DNS), the
+  connection is pinned to that address, TLS certificate verification is on
+  (a verified system-curl fallback, pinned with `--resolve`, only after a
+  Python certificate error), redirects are refused, only HTTP 200 with a
+  `text/markdown`/`text/plain` body is accepted, each request has an 8 s
+  timeout, all of them share a 20 s deadline and each body is capped at
+  1 MB. Standard library only.
+- **Parsing.** One strict, versioned parser per page layout verifies the
+  page identity (canonical URL, a title naming exactly the two expected
+  models, the column headers) and reads the publisher's "updated" date and
+  only an allowlisted set of metrics (Terminal-Bench variants, FrontierCode
+  2.0, SWE Atlas v1.1, and each aggregator's own coding/agentic category
+  scores, labelled as the aggregator's own scale) with numeric sanity
+  checks (0–100, expected unit). Missing values (`–`, "Coming soon"),
+  duplicated rows, unknown values and unknown layouts are **unknown**,
+  never guessed; a changed layout makes that page unusable with the error
+  shown. A value BenchLeader marks as measured at another effort setting,
+  or a score BenchLM marks as estimated, is shown but not comparable.
+  Reasoning effort is recorded only where the page states it per column
+  (BenchLeader: e.g. `max`); BenchLM states none, so it is "unknown". The
+  route's own level is shown next to it, and a mismatch is labelled
+  ("setup differs"). Remote free text is never stored or shown: labels come
+  from the allowlist, names from the registry, values are numbers (all
+  remote and error text is stripped of control, ANSI and bidi characters).
+- **Cache and freshness.** `~/.copilot/model-refresh/benchmark-evidence.json`
+  (0600; URL, fetch time, page date, content SHA-256, parser version and
+  layout per page). A page fetched under 5 min ago is reused; a copy is
+  *fresh* for 24 h (local policy) — older copies are shown in the details
+  view as reference only and never make an option visible. A failed fetch
+  keeps the last valid copy and shows the error. A cache written for
+  another parser or registry version is ignored.
+- **Use and limits.** A comparison is shown for an option only when it
+  covers exactly the current model and the option, always in that
+  direction (a reversed pair is shown in full again, never as a reference
+  to an earlier option). Each source line states its setup relative to
+  that route; scores at an unstated or different effort are labelled
+  "context only". The short view lists at most three comparable metrics
+  per source, taken in turn from those higher for the option, higher for
+  the current model and equal, so a mixed result always shows both
+  directions, and says how many hidden metrics go each way (all are in the
+  details view). Each metric is
+  compared only with the same metric from the same source; there is no
+  average, overall winner or cross-source blend, and third-party prices are
+  never read (their blended prices use other assumptions — official
+  GitHub prices are the only prices shown). When the listed metrics point
+  in different directions, or the aggregators' own composite scores
+  disagree (for example BenchLeader and BenchLM on agentic scores for
+  Sonnet 5.5 vs Terra), that is disclosed. Aggregators may republish the
+  same underlying runs (e.g. both list the same Terminal-Bench results),
+  so agreement is not independent confirmation and neither is treated as
+  primary. Coverage is limited to the reviewed pairs — not comprehensive —
+  and nothing says anything about your account, plan, organization
+  policy, harness or the level your route uses; it is never proof of
+  quality, availability or of a reasoning level. Official pricing, official
+  docs and your own `/model` answers remain the only gates.
+- **Switches.** `--offline` or `COPILOT_MODEL_REFRESH_BENCHMARKS_FETCH=0`
+  (cached copies only), `COPILOT_TASK_REPORT_PRICING_FETCH=0` (no fetching
+  at all). If the module is missing or fails, or every page fails, `p`
+  works exactly on official evidence and says the comparisons are
+  unavailable; nothing changes automatically in any case.
+- **Example** (abridged; numbers are whatever the pages say at fetch time):
+
+  ```
+  #1 planner: gpt-6.1-sol · medium · long_context -> gpt-6.2-sol · medium · long_context
+     price: blended $1.00 -> $1.00 per 1M (same blended price) — toolkit blend assumption, not your bill
+     official $/1M: gpt-6.1-sol in 2.00 · cached 0.1 · cache write 2.50 · out 10.00  ->  gpt-6.2-sol in 2.00 · ...
+     offered because: official differentiator: listed as included for Copilot CLI in the official per-client
+         table (...); current model: not listed
+     third-party: BenchLeader (aggregator; page updated 2026-11-21; fetched 0m ago; compared at gpt-6.1-sol 'max'
+         vs gpt-6.2-sol 'max' as stated by BenchLeader; this route uses 'medium' -> 'medium' — setup differs, so
+         these scores are context only (not a reason to offer this option) and may not reflect your route)
+         https://www.benchleader.com/compare/gpt-6-1-sol-vs-gpt-6-2-sol
+       - Terminal-Bench: current gpt-6.1-sol 60.9% · option gpt-6.2-sol 61.5%
+       - Terminal-Bench 4.0 (AA) [Artificial Analysis]: current gpt-6.1-sol 56.1% · option gpt-6.2-sol 60.1%
+       - SWE Atlas v1.1 [Scale AI SEAL]: current gpt-6.1-sol 65.9% · option gpt-6.2-sol 60.5%
+       +4 more metric(s) not shown here (0 higher for the current model, 4 higher for the option, 0 equal,
+         0 not comparable) — see the details view
+     note: the listed metrics point in different directions (some higher for the current model, some for the
+         option) — no overall winner is implied
+     caution: third-party data, not official and not your account, plan, harness or effort; not proof of quality
+     still to confirm: its availability in /model and reasoning level 'medium' — asked only if you select it
+  ```
+
+  To add a pair, a maintainer adds a reviewed entry to `PAIRS` (and, for a
+  new provider, a parser and metric allowlist) — that changes the registry
+  digest, so older caches and proposals are ignored/refused.
 
 ### Context metrics (new copilot-s sessions only)
 
@@ -1674,7 +1849,7 @@ Verify the pipeline is loaded:
 | Legacy company fixed per-request policy (inactive) | `~/.copilot/task-reports/request-pricing.json` | copied from `config/request-pricing.json` on first install (only if absent); unused |
 | Executables install prefix | `scripts/install.sh --prefix DIR` | `~/.local/bin` |
 | Install method | `scripts/install.sh --copy` | symlink |
-| Subagent model refresh (menu `p`) | `copilot-model-refresh.py`; state, backups, capability evidence cache, your `user-config.json` and `verified-models.json` (recorded with `copilot-model-refresh.py record-verified`) in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated fallback catalog `~/.copilot/model-role-catalog.json`; `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` stops the capability-page fetch | no overrides; replacements need your verified availability list |
+| Subagent model refresh (menu `p`) | `copilot-model-refresh.py` (+ `copilot_model_benchmarks.py` next to it); state, backups, capability and third-party comparison caches, your `user-config.json` and `verified-models.json` (recorded with `copilot-model-refresh.py record-verified`) in `~/.copilot/model-refresh/` (or `$COPILOT_HOME/model-refresh/`); curated fallback catalog `~/.copilot/model-role-catalog.json`; `COPILOT_MODEL_REFRESH_DOCS_FETCH=0` / `COPILOT_MODEL_REFRESH_BENCHMARKS_FETCH=0` stop the capability-page / third-party fetch; `COPILOT_MODEL_REFRESH_POLICY=cost-led` restores the legacy cost-led `p`; `NO_COLOR` disables colour | balanced: no overrides, nothing preselected; options need your verified availability list or your answer for the model you select |
 | Model refresh helper path | `COPILOT_MODEL_REFRESH_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-model-refresh.py` |
 | Per-launch session reports | `COPILOT_SESSION_REPORTS_DIR` env var | `~/.copilot/session-reports` (never pruned automatically) |
 | Session report helper path | `COPILOT_SESSION_REPORT_HELPER` env var | sibling of `copilot-s`, else `~/.local/bin/copilot-session-report.py` |

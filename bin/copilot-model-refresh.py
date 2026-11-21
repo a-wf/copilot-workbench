@@ -39,13 +39,46 @@ What it does
   including unpriced/undocumented models as unknown, with availability
   shown as verified / unverified / not in your complete list — never as a
   claim about your account.
-- Besides the cost-led proposals (unchanged 10% rule), lists OPTIONAL
-  alternatives per route that are not >= 10% cheaper (possibly more
-  expensive) but pass every gate AND have a concrete documented
-  differentiator against the current model (e.g. official Copilot CLI
-  support the current model lacks). They are never selected automatically;
-  `select` adds chosen ones to a frozen proposal, which still needs `yes`.
-- Proposes a change automatically only for an unpinned route whose
+- Policy. BALANCED (default; copilot-s menu `p`): no change is proposed or
+  preselected automatically. Per unpinned route it OFFERS numbered options
+  among models that pass every gate below: each >= 10% cheaper model (all of
+  them, not only the cheapest), and any not-cheaper (possibly more
+  expensive) model with a concrete documented official differentiator
+  against the current model (e.g. official Copilot CLI support the current
+  model lacks) OR a fresh reviewed third-party comparison of that exact
+  pair reporting a higher score for it on at least one comparable metric.
+  You choose by number (`select`, at most one per route), confirm what is
+  unverified about YOUR choice (review mode), then a separate exact `yes`
+  applies it. COST-LED (`--cost-led`, the legacy behaviour): the cheapest
+  eligible >= 10% saving below is proposed automatically (still only applied
+  after `yes`), the other cheaper ones are listed as considered, and
+  options are offered as above.
+- Third-party comparisons (bin/copilot_model_benchmarks.py): in the same
+  run, the fixed, reviewed public comparison pages listed there (initially
+  BenchLeader and BenchLM pages for claude-sonnet-5.5 vs gpt-6.1-terra and
+  gpt-6.1-sol vs gpt-6.2-sol) are fetched AUTOMATICALLY (HTTPS GET only, no
+  query/cookies/auth, public-IP-only DNS check with the connection pinned to
+  it, certificate verification on, redirects refused, timeout, shared
+  deadline, size cap), parsed by strict versioned per-layout parsers
+  (identity, date, allowlisted metrics, numeric sanity; anything unknown
+  stays unknown) and cached (<COPILOT_HOME>/model-refresh/
+  benchmark-evidence.json; reused < 5 min, fresh < 24h, older = reference
+  only). They are shown next to the options with source, page date,
+  effort/harness when stated, and cautions; they are never a gate, never
+  proof of availability, quality or a reasoning level, never averaged into
+  a winner, and third-party prices are never read. Coverage is limited to
+  the reviewed pairs. Failure or absence changes nothing official.
+- Output: a compact, change-first overview (sources, every route, the
+  numbered options with official prices and third-party evidence, coverage
+  and cautions, next step). The long report (every route's reasons, all
+  rejected/considered candidates, official rates table, the whole model
+  universe, every parsed third-party metric) is the details view:
+  `propose/preview --details`, or `details [--proposal-id ID]` from cached
+  copies only (no network, nothing written). Colour only on a terminal
+  (or COPILOT_MODEL_REFRESH_COLOR=always), never with NO_COLOR or
+  TERM=dumb, never on machine lines; output to a pipe without COLUMNS is
+  not wrapped.
+- A route change (cost-led) or an option is possible only for an unpinned route whose
   replacement passes every evidence gate, is listed in the user's verified availability list
   (Copilot CLI offers no documented programmatic model catalog to verify
   availability), has the route's SPECIFIC reasoning level verified for that
@@ -59,10 +92,12 @@ What it does
   equal-quality claim. Shipped routing defaults (config/agent-routing.yaml,
   agents/*.agent.md, instructions) are NEVER modified.
 - `propose` freezes the proposal with digests of every input it read and an
-  evidence digest (pricing snapshot, capability evidence, availability
-  records, per-route decisions and alternatives); `select` and `apply`
-  re-derive everything from the caches and refuse (change nothing) if any
-  of it changed, the proposal expired, was altered, or was already applied.
+  evidence digest (pricing snapshot, capability evidence, third-party
+  comparison cache and registry, availability records, the policy, per-route
+  decisions and options); `select`, `review` and `apply` re-derive everything
+  from the caches (never re-fetching) and refuse (change nothing) if any of
+  it changed, the proposal expired, was altered, was made by an older
+  format, or was already applied.
 - `propose --review` (what copilot-s menu `p` runs) additionally lets a
   candidate that is blocked ONLY by your unverified /model availability
   and/or an unverified exact reasoning level be proposed TENTATIVELY, so
@@ -127,8 +162,10 @@ Honest limits
 - The blended cost is an assumption-based comparison aid, not a forecast
   and not your bill.
 
-Commands: status [--instructions] | preview [--offline] |
-          propose [--offline] [--review] |
+Commands: status [--instructions] |
+          preview [--offline] [--cost-led] [--details] |
+          propose [--offline] [--review] [--cost-led] [--details] |
+          details [--proposal-id ID] [--cost-led] |
           review --proposal-id ID (--available-all | --unavailable IDS)
                  [--level MODEL:EFFORT=yes|no ...] |
           select --proposal-id ID --choose N[,N...] | apply --proposal-id ID |
@@ -148,10 +185,14 @@ User-maintained input (never written by this tool):
   {verified_on, models}, verified_capabilities {verified_on, models:
   {model: {reasoning_levels}}}, pins {route: {model?, reasoning_effort?,
   context_tier?}}, optional dated local catalog overlay.
-Network: only the fixed official docs.github.com URLs above (no auth, no
-  cookies, nothing sent but the GET). Disable with
-  COPILOT_MODEL_REFRESH_DOCS_FETCH=0 (or COPILOT_TASK_REPORT_PRICING_FETCH=0,
-  which disables all fetching).
+Network (propose/preview only; automatic): the fixed official
+  docs.github.com URLs above and the fixed third-party comparison URLs in
+  copilot_model_benchmarks.py (no auth, no cookies, none of your models,
+  settings or data sent — only the GET of a fixed URL; like any web request
+  the sites see your IP address and the request time). Kill switches:
+  --offline (cache only), COPILOT_MODEL_REFRESH_DOCS_FETCH=0 (official
+  capability pages), COPILOT_MODEL_REFRESH_BENCHMARKS_FETCH=0 (third-party
+  pages), COPILOT_TASK_REPORT_PRICING_FETCH=0 (all fetching).
 Stdlib only.
 """
 
@@ -188,7 +229,13 @@ USER_CONFIG_KIND = "copilot-toolkit-model-refresh-user-config"
 SEEN_KIND = "copilot-toolkit-model-refresh-seen-models"
 CAPABILITY_KIND = "copilot-toolkit-model-capability-evidence"
 VERIFIED_KIND = "copilot-toolkit-model-refresh-verified-models"
-PROPOSAL_FORMAT = 3
+PROPOSAL_FORMAT = 4
+# Selection policy. "balanced" (default, copilot-s p): nothing is changed or
+# preselected automatically; savings and documented/benchmark-backed options
+# are offered by number. "cost-led" (explicit --cost-led): the legacy
+# behaviour that proposes the cheapest eligible >= 10% saving automatically.
+POLICIES = ("balanced", "cost-led")
+DEFAULT_POLICY = "balanced"
 
 EXIT_OK = 0
 EXIT_ERROR = 2
@@ -283,6 +330,18 @@ DOCS_FETCH_ENV = "COPILOT_MODEL_REFRESH_DOCS_FETCH"
 # all (fixtures never cause live traffic).
 CAPABILITY_FETCHER = None
 
+# Third-party benchmark comparisons (bin/copilot_model_benchmarks.py, next
+# to this file): a fixed, reviewed list of public comparison pages, fetched
+# automatically with the official pages. Reference evidence only — it can
+# make an option VISIBLE, never selected. Injection points for tests:
+# BENCHMARK_MODULE (pre-loaded module) and BENCHMARK_FETCHER (callable
+# (url, timeout_seconds, max_bytes) -> bytes). When a PRICING_FETCHER is
+# injected but no BENCHMARK_FETCHER, nothing is fetched (no live traffic).
+BENCHMARK_MODULE = None
+BENCHMARK_FETCHER = None
+BENCHMARK_MODULE_FILE = "copilot_model_benchmarks.py"
+COLOR_ENV = "COPILOT_MODEL_REFRESH_COLOR"
+
 
 def capability_url(source):
     return DOCS_API_PREFIX + source["pathname"]
@@ -323,6 +382,7 @@ class Paths(object):
         self.user_config = os.path.join(self.state_dir, "user-config.json")
         self.capabilities = os.path.join(self.state_dir, "capability-evidence.json")
         self.verified = os.path.join(self.state_dir, "verified-models.json")
+        self.benchmarks = os.path.join(self.state_dir, "benchmark-evidence.json")
         self.proposal_key = os.path.join(self.state_dir, ".proposal-key")
         self.settings = os.path.join(self.copilot_home, "settings.json")
         self.instructions_dir = os.path.join(self.copilot_home, "instructions")
@@ -497,10 +557,13 @@ def fmt_age(seconds):
 # Terminal/C1 control characters, zero-width and bidi overrides: never
 # echoed from remote documents or exception text.
 _CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+# Whole ANSI CSI / OSC (e.g. hyperlink) / two-byte escape sequences, removed
+# before the control characters so no payload text of a sequence survives.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
 
 
 def _safe_text(text, limit=200):
-    text = re.sub(r"\s+", " ", _CONTROL_RE.sub(" ", str(text))).strip()
+    text = re.sub(r"\s+", " ", _CONTROL_RE.sub(" ", _ANSI_RE.sub(" ", str(text)))).strip()
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
 
@@ -1666,6 +1729,80 @@ def refresh_capabilities(paths, now, module, fetch):
     return capability_context(cache, now, notes, warning)
 
 
+# ------------------------------------- third-party benchmark comparisons ---
+
+def _benchmark_unavailable(reason):
+    reason = _safe_text(reason, 200)
+    return {"pairs": {}, "warning": reason, "available": False,
+            "digest": hashlib.sha256(("unavailable:" + reason).encode("utf-8")).hexdigest()}
+
+
+def load_benchmark_module():
+    """The comparison module next to this file (None + reason when missing
+    or broken: everything official keeps working without it)."""
+    global BENCHMARK_MODULE
+    if BENCHMARK_MODULE is not None:
+        return BENCHMARK_MODULE, None
+    path = os.path.join(_script_dir(), BENCHMARK_MODULE_FILE)
+    if not os.path.isfile(path):
+        return None, ("third-party comparisons unavailable: %s is not installed next to this tool (re-run the "
+                      "installer)" % BENCHMARK_MODULE_FILE)
+    try:
+        spec = importlib.util.spec_from_file_location("copilot_model_benchmarks_shared", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as ex:  # noqa: BLE001 - optional evidence must never break p
+        return None, "third-party comparisons unavailable: %s failed to load (%s)" % (
+            BENCHMARK_MODULE_FILE, type(ex).__name__)
+    BENCHMARK_MODULE = module
+    return module, None
+
+
+def refresh_benchmarks(paths, now, pricing_module, fetch, offline):
+    """Third-party comparison context. fetch=True (propose/preview without
+    --offline): GET the reviewed pages automatically unless a kill switch is
+    set; otherwise cache only (select/review/apply/status/details never
+    fetch). Never raises: any failure leaves the official flow unchanged."""
+    module, problem = load_benchmark_module()
+    if module is None:
+        return _benchmark_unavailable(problem)
+    try:
+        reason = None
+        if not fetch:
+            reason = "cache only (no network)"
+        else:
+            enabled = getattr(pricing_module, "official_pricing_fetch_enabled", None)
+            if enabled is not None and not enabled():
+                reason = "network fetch disabled (%s=0): cached copies only" % getattr(
+                    pricing_module, "OFFICIAL_PRICING_FETCH_ENV", "COPILOT_TASK_REPORT_PRICING_FETCH")
+            elif BENCHMARK_FETCHER is None and PRICING_FETCHER is not None:
+                reason = "not fetched: an injected pricing transport has no comparison transport (no live traffic)"
+            reason = module.fetch_disabled_reason(offline, reason)
+        fetcher = None
+        if BENCHMARK_FETCHER is not None:
+            fetcher = (lambda url, timeout, max_bytes, _deadline: BENCHMARK_FETCHER(url, timeout, max_bytes))
+        if reason is None and os.path.islink(paths.state_dir):
+            reason = "not fetched: %s is a symlink" % paths.state_dir
+        return module.refresh(paths.benchmarks, now, reason is None, reason, fetcher)
+    except KeyboardInterrupt:
+        raise
+    except Exception as ex:  # noqa: BLE001
+        return _benchmark_unavailable("third-party comparisons unavailable (%s: %s)" % (
+            type(ex).__name__, _safe_text(ex, 120)))
+
+
+def benchmark_comparison(ctx, current, candidate, current_effort=None, candidate_effort=None):
+    """Comparison for the DIRECTED pair current -> candidate. Scores can
+    support offering the candidate only where the source states both
+    models' reasoning effort and it equals the route's levels
+    (current_effort / candidate_effort); otherwise they are context only."""
+    bctx = ctx.get("benchmarks")
+    module = BENCHMARK_MODULE
+    if not bctx or not bctx.get("available") or module is None or current == candidate:
+        return {"fresh": [], "stale": [], "supports": False, "mixed": False, "providers_disagree": False}
+    return module.comparison(bctx, current, candidate, current_effort, candidate_effort)
+
+
 def _canonical_sha256(obj):
     return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=True).encode("ascii")).hexdigest()
@@ -2136,6 +2273,13 @@ def evaluate(ctx):
                 {SOURCE_LABELS[s] for s in cur["sources"].values() if s.startswith("pin:")}))
             row["alternatives_note"] = "pinned by you — no alternatives offered (remove the pin to re-evaluate)"
             continue
+        # Unpinned route whose effort/context differs from its shipped
+        # baseline: always shown (never silently kept), whether or not a
+        # correction can be offered right now.
+        base_values = defaults[key]
+        if values["model"] != INHERIT and (values["reasoning_effort"], values["context_tier"]) != (
+                base_values["reasoning_effort"], base_values["context_tier"]):
+            row["drift"] = {"effort": base_values["reasoning_effort"], "context": base_values["context_tier"]}
         if ctx["global_block"]:
             row["reason"] = "kept: " + ctx["global_block"]
             continue
@@ -2198,9 +2342,27 @@ def evaluate(ctx):
                 return l_new is not None and cur_long is not None and l_new <= cur_long * (1 - MIN_SAVING_FRACTION)
             return True
 
+        n_evidence = len(row["evidence"])
         _decide_route(row, ctx, values, baseline, eligible, current_reasons, key in overrides and
                       cur["sources"]["model"] == "managed", cur_cost, cur_long, long_route, saving_ok)
-        _attach_alternatives(row, ctx, values, policy, results, cur_cost, cur_long, long_route, saving_ok)
+        align = None
+        if ctx.get("policy", DEFAULT_POLICY) == "balanced":
+            if row["proposed"] is not None:
+                # Balanced: nothing is changed or preselected automatically;
+                # the cost-led pick is offered like every other saving.
+                del row["evidence"][n_evidence:]
+                row["proposed"] = None
+                row.pop("proposed_cost", None)
+                row["reason"] = ("kept: balanced mode — nothing changes automatically; any options listed are "
+                                 "only offered for your explicit choice (none preselected)")
+            # Effort/context drift of the CURRENT model (e.g. the shipped
+            # baseline's level changed after an override was applied): the
+            # same-model correction is offered as an explicit option when
+            # that model passes every gate at the baseline's effort/context
+            # (cost-led mode proposes it itself, as before).
+            if row.get("drift") and values["model"] in eligible and eligible[values["model"]][1] != values:
+                align = dict(eligible[values["model"]][1])
+        _attach_alternatives(row, ctx, values, policy, results, cur_cost, cur_long, long_route, saving_ok, align)
     return rows
 
 
@@ -2287,15 +2449,37 @@ def _decide_route(row, ctx, values, baseline, eligible, current_reasons, current
                                "anything can be applied" % best)
 
 
-def _attach_alternatives(row, ctx, values, policy, results, cur_cost, cur_long, long_route, saving_ok):
-    """Optional alternatives (never auto-selected): eligible models in the
-    route's accepted task area that are NOT >= 10% cheaper, each with a
-    concrete documented differentiator versus the current model. Everything
-    else in that task area is listed as considered with its reasons."""
+def _saving_text(snapshot, mid, cur_cost, cur_long, long_route):
+    d_new = blended_cost(default_rates(snapshot, mid))
+    text = "%.0f%% cheaper (blended, Default tier" % (100.0 * (1 - d_new / cur_cost))
+    if long_route:
+        l_new = blended_cost(long_tier_rates(snapshot, mid))
+        text += "; %.0f%% cheaper above the long-context threshold" % (100.0 * (1 - l_new / cur_long))
+    return text + ") under the current official pricing"
+
+
+def _attach_alternatives(row, ctx, values, policy, results, cur_cost, cur_long, long_route, saving_ok, align=None):
+    """Options (never auto-selected) among eligible models in the route's
+    accepted task area:
+    - "saving": >= 10% cheaper (balanced mode only — cost-led mode proposes
+      the cheapest one itself and lists the others as considered);
+    - "official": a concrete documented official differentiator versus the
+      current model;
+    - "benchmark": a FRESH reviewed third-party comparison of this exact
+      pair, whose stated reasoning effort for BOTH models equals this
+      route's levels, reports a higher score for it on at least one
+      comparable metric (other metrics may favour the current model; never
+      proof of quality; unstated/different effort is context only);
+    - "alignment" (balanced, `align` given): the CURRENT model at the
+      route's shipped baseline effort/context, when the current values
+      drifted from it and that model passes every gate at those values.
+    Everything else in that task area is listed as considered with its
+    reasons (details view)."""
     if cur_cost is None:
         row["alternatives_note"] = "current price unknown — no alternatives can be costed or offered"
         return
     facts, snapshot = ctx["facts"], ctx["snapshot"]
+    balanced = ctx.get("policy", DEFAULT_POLICY) == "balanced"
     cur_f = facts.get(values["model"])
     chosen = row["proposed"]["model"] if row["proposed"] else None
     for model_id in sorted(results):
@@ -2313,29 +2497,78 @@ def _attach_alternatives(row, ctx, values, policy, results, cur_cost, cur_long, 
                 continue  # already listed as a blocked cheaper candidate
             row["considered"].append({"model": model_id, "cost": cost, "status": "not eligible", "reasons": reasons})
             continue
-        if saving_ok(model_id):
+        saving = saving_ok(model_id)
+        if saving and not balanced:
             row["considered"].append({"model": model_id, "cost": cost, "reasons": [],
                                       "status": "eligible and >= %d%% cheaper, but another option is cheaper"
                                                 % round(MIN_SAVING_FRACTION * 100)})
             continue
         diffs = documented_differentiators(cur_f, f, policy, long_route)
-        if not diffs:
+        bench = benchmark_comparison(ctx, values["model"], model_id, values["reasoning_effort"],
+                                     cand_values["reasoning_effort"])
+        bases = []
+        if saving:
+            bases.append("saving")
+        if diffs:
+            bases.append("official")
+        if bench["supports"] and not saving:
+            # Only a reason to SHOW a not-cheaper option; a saving is offered
+            # anyway and is never "backed" by a cherry-picked metric.
+            bases.append("benchmark")
+        if not bases:
             row["considered"].append({"model": model_id, "cost": cost, "reasons": [],
-                                      "status": "eligible but not offered: no documented differentiator versus "
-                                                "the current model (a higher Category, newer version or higher "
-                                                "price is not one)"})
+                                      "status": "eligible but not offered: not >= %d%% cheaper, no documented "
+                                                "official differentiator and no fresh third-party comparison of "
+                                                "this exact pair reporting a higher score for it (a higher "
+                                                "Category, newer version or higher price is not one)"
+                                                % round(MIN_SAVING_FRACTION * 100)})
             continue
         row["alternatives"].append({
             "route": row["key"], "model": model_id, "values": dict(cand_values), "cost": cost,
             "current_cost": cur_cost, "long_route": long_route,
             "long_cost": blended_cost(long_tier_rates(snapshot, model_id)) if long_route else None,
-            "current_long": cur_long if long_route else None, "differentiators": diffs,
+            "current_long": cur_long if long_route else None, "differentiators": diffs, "bases": bases,
+            "saving_text": _saving_text(snapshot, model_id, cur_cost, cur_long, long_route) if saving else None,
+            "benchmark": bench, "current_model": values["model"],
             "excels_at": f.get("excels_at"), "notes": list(f["notes"]), "pending": list(pending),
             "level": reasoning_level_status(model_id, cand_values["reasoning_effort"], ctx),
             "replaces_proposal": chosen is not None,
             "basis": "current official docs" if f["all_live"] else "dated catalog"})
     row["alternatives"].sort(key=lambda a: (a["cost"], a["model"]))
     row["considered"].sort(key=lambda c: (c["cost"] is None, c["cost"] or 0, c["model"]))
+    if align is not None:
+        model_id = values["model"]
+        f = facts.get(model_id) or {}
+        row["alternatives"].insert(0, {
+            "route": row["key"], "model": model_id, "values": dict(align), "cost": cur_cost,
+            "current_cost": cur_cost, "long_route": long_route, "long_cost": cur_long if long_route else None,
+            "current_long": cur_long if long_route else None, "differentiators": [], "bases": ["alignment"],
+            "saving_text": None, "benchmark": benchmark_comparison(ctx, model_id, model_id),
+            "current_model": model_id, "align_from": dict(values), "excels_at": None,
+            "notes": list(f.get("notes") or []), "pending": list(row["tentative"].get(model_id, [])),
+            "level": reasoning_level_status(model_id, align["reasoning_effort"], ctx),
+            "replaces_proposal": False,
+            "basis": "current official docs" if f.get("all_live") else "dated catalog"})
+
+
+def alternative_why(alt):
+    """Plain-language reason an option is offered (never a recommendation)."""
+    parts = []
+    if "alignment" in alt.get("bases", []):
+        old = alt.get("align_from") or {}
+        parts.append("same model, corrected to the route's shipped baseline effort/context: '%s' · '%s' -> '%s' · "
+                     "'%s' (the current values drifted from the baseline; nothing else changes)"
+                     % (old.get("reasoning_effort"), old.get("context_tier"), alt["values"]["reasoning_effort"],
+                        alt["values"]["context_tier"]))
+    if alt.get("saving_text"):
+        parts.append(alt["saving_text"])
+    for diff in alt.get("differentiators") or []:
+        parts.append("official differentiator: " + diff)
+    if "benchmark" in alt.get("bases", []):
+        parts.append("a fresh reviewed third-party comparison of this exact pair, measured at the reasoning levels "
+                     "this route uses as stated by the source, reports a higher score for it on at least one listed "
+                     "metric (others may favour the current model; not proof of quality)")
+    return "; ".join(parts) or "offered"
 
 
 def number_alternatives(rows):
@@ -2362,6 +2595,18 @@ def derive_overrides(rows, state, defaults, selected):
     return out
 
 
+def economics_digest():
+    """Binds every constant that decides what counts as a saving / how prices
+    are compared (the disclosed workload mix, the saving threshold, the
+    availability-record age). A proposal is valid only under the exact
+    economics it was shown with — never because a changed rule happens to
+    give the same numbers."""
+    return _canonical_sha256({"workload_mix": [[k, s] for k, s in WORKLOAD_MIX],
+                              "min_saving_fraction": MIN_SAVING_FRACTION,
+                              "availability_max_age_days": AVAILABILITY_MAX_AGE_DAYS,
+                              "cache_write_fallback": "input-rate"})
+
+
 def evidence_digest(ctx, rows):
     """Digest of every piece of evidence a decision rests on: pricing
     snapshot, capability evidence, catalog, availability/capability records,
@@ -2372,9 +2617,12 @@ def evidence_digest(ctx, rows):
         "capabilities": ctx["capabilities"]["digest"], "catalog": ctx["catalog_digest"],
         "user_config": ctx["user_sha"], "verified": ctx["verified_sha"], "today": ctx["today"].isoformat(),
         "review": review_doc(ctx.get("review")),
+        "policy": ctx.get("policy"), "benchmarks": (ctx.get("benchmarks") or {}).get("digest"),
+        "economics": economics_digest(),
         "routes": [{"key": r["key"], "current": r["current"], "proposed": r["proposed"],
                     "tentative": r.get("tentative", {}),
-                    "alternatives": [[a["model"], a["values"], round(a["cost"], 9), a.get("pending", [])]
+                    "alternatives": [[a["model"], a["values"], round(a["cost"], 9), a.get("pending", []),
+                                      a.get("bases", [])]
                                      for a in r["alternatives"]]}
                    for r in rows],
     }
@@ -2409,7 +2657,7 @@ def review_targets(rows, selected):
         by_route[alt["route"]] = {
             "route": alt["route"], "label": labels[alt["route"]], "values": dict(alt["values"]),
             "pending": list(alt.get("pending", [])),
-            "why": "your selected optional alternative #%d (%s)" % (alt["n"], "; ".join(alt["differentiators"])),
+            "why": "your selected option #%d (%s)" % (alt["n"], alternative_why(alt)),
             "cost": alt["cost"], "current_cost": alt["current_cost"], "alternative": alt["n"]}
     return [by_route[r["key"]] for r in ROUTES if r["key"] in by_route]
 
@@ -2593,8 +2841,8 @@ def plan_outputs(ctx, new_overrides):
 
 # --------------------------------------------------------------- context ---
 
-def build_context(paths, now, refresh=None, offline=False):
-    """Read every input. refresh=None: cache-only (status/select/apply)."""
+def build_context(paths, now, refresh=None, offline=False, policy=DEFAULT_POLICY):
+    """Read every input. refresh=None: cache-only (status/select/apply/details)."""
     defaults, routing_path, routing_sha = load_defaults(paths)
     user_config, user_sha = load_user_config(paths)
     verified, verified_sha, verified_warning = load_verified_record(paths)
@@ -2614,6 +2862,7 @@ def build_context(paths, now, refresh=None, offline=False):
     else:
         pricing_ctx, pricing_note = module.load_official_pricing_context(now=now), "cache only (no network)"
     capabilities = refresh_capabilities(paths, now, module, fetch=bool(refresh) and not offline)
+    benchmarks = refresh_benchmarks(paths, now, module, fetch=bool(refresh), offline=offline)
     if refresh and offline:
         for src in capabilities["sources"].values():
             src["note"] = "offline: using the cached copy (no network request)"
@@ -2645,7 +2894,8 @@ def build_context(paths, now, refresh=None, offline=False):
         "pricing_ctx": pricing_ctx, "pricing_note": pricing_note, "snapshot": snapshot,
         "global_block": "; ".join(blocks), "availability": availability(user_config, today, verified),
         "module": module, "capabilities": capabilities, "verified": verified, "verified_sha": verified_sha,
-        "verified_warning": verified_warning,
+        "verified_warning": verified_warning, "benchmarks": benchmarks,
+        "policy": policy if policy in POLICIES else DEFAULT_POLICY,
     }
     ctx["universe"] = model_universe(ctx)
     ctx["facts"] = {m: model_facts(m, ctx) for m in ctx["universe"]}
@@ -2654,15 +2904,93 @@ def build_context(paths, now, refresh=None, offline=False):
 
 # ------------------------------------------------------------- rendering ---
 
-def _table(headers, rows, indent="  "):
+# Human output styling. Colour is semantic decoration only: every line keeps
+# its words (CHANGE, NOT verified, caution, ...). It is used only on stdout,
+# only when stdout is a terminal (or COPILOT_MODEL_REFRESH_COLOR=always, which
+# copilot-s sets after checking ITS terminal, because it captures this
+# output), never with NO_COLOR set or TERM=dumb, and never on machine lines
+# (PROPOSAL/ALTERNATIVE/VERIFY/CHECK/LEVEL/REVIEW/SELECTED) or stderr.
+_STYLE = {"on": False}
+_SGR = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "magenta": "35", "cyan": "36",
+        "boldred": "1;31", "boldgreen": "1;32", "boldyellow": "1;33", "boldcyan": "1;36", "boldmagenta": "1;35"}
+
+
+def color_wanted(stream=None):
+    if os.environ.get("NO_COLOR", "") != "" or os.environ.get("TERM", "") == "dumb":
+        return False
+    mode = os.environ.get(COLOR_ENV, "auto").strip().lower()
+    if mode in ("never", "0", "off", "no", "false"):
+        return False
+    if mode in ("always", "1", "on", "yes", "true"):
+        return True
+    try:
+        return bool((stream or sys.stdout).isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def sty(name, text):
+    """`text` wrapped in one SGR style when colour is on (else unchanged).
+    Callers compute widths on the plain text first."""
+    if not _STYLE["on"] or not text or name is None:
+        return text
+    return "\033[%sm%s\033[0m" % (_SGR[name], text)
+
+
+def term_width():
+    """Columns available, kept in a readable range; text is wrapped to it,
+    never truncated. COLUMNS (forwarded by copilot-s, which captures this
+    output) wins; output to a pipe/file without COLUMNS is not wrapped at
+    all (one logical line per line, easy to grep)."""
+    env = os.environ.get("COLUMNS", "").strip()
+    if env.isdigit() and int(env) > 0:
+        return max(40, min(int(env), 140))
+    try:
+        if not sys.stdout.isatty():
+            return 100000
+        cols = shutil.get_terminal_size((100, 24)).columns
+    except (ValueError, OSError, AttributeError):
+        return 100000
+    return max(40, min(cols, 140))
+
+
+def _wrap(prefix, body, indent="  ", style=None, body_style=None, hang=4, width=None):
+    """Word-wrap `prefix + body` to the terminal width (model IDs, prices and
+    warnings are never cut: no word is broken) and style the prefix and/or
+    the body after the wrap, so visible widths are computed on plain text."""
+    import textwrap
+    width = width or term_width()
+    lines = textwrap.wrap(prefix + body, width=width, initial_indent=indent, subsequent_indent=indent + " " * hang,
+                          break_long_words=False, break_on_hyphens=False) or [indent + prefix.rstrip()]
+    out = []
+    for i, line in enumerate(lines):
+        lead = indent if i == 0 else indent + " " * hang
+        rest = line[len(lead):]
+        if i == 0 and prefix.strip() and rest.startswith(prefix.strip()):
+            head = prefix.strip()
+            rest = rest[len(head):]
+            out.append(lead + sty(style, head) + sty(body_style, rest) if rest.strip() else lead + sty(style, head))
+        else:
+            out.append(lead + sty(body_style, rest))
+    return out
+
+
+def _table(headers, rows, indent="  ", cell_style=None):
+    """Plain-text-width table; cell_style(row_index, col_index, text) may
+    return a style name applied after padding (so alignment is exact)."""
     widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
             widths[i] = max(widths[i], len(cell))
-    out = [indent + "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip(),
+    out = [indent + sty("bold", "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip()),
            indent + "  ".join("-" * w for w in widths)]
-    for row in rows:
-        out.append(indent + "  ".join(c.ljust(widths[i]) for i, c in enumerate(row)).rstrip())
+    for r, row in enumerate(rows):
+        cells = []
+        for i, c in enumerate(row):
+            name = cell_style(r, i, c) if cell_style else None
+            pad = " " * (widths[i] - len(c)) if i < len(row) - 1 else ""
+            cells.append(sty(name, c) + pad)
+        out.append((indent + "  ".join(cells)).rstrip())
     return out
 
 
@@ -2681,6 +3009,419 @@ def _source_text(sources):
     if len(vals) == 1:
         return SOURCE_LABELS[vals.pop()]
     return "mixed: " + ", ".join("%s=%s" % (f, SOURCE_LABELS[sources[f]]) for f in FIELDS)
+
+
+THIRD_PARTY_CAUTION = (
+    "third-party aggregator numbers are reference only: not official GitHub statements, not about your account, "
+    "plan, organization policy, harness or the reasoning level your route uses, and never proof of equal or better "
+    "quality, of availability or of a reasoning level. Aggregators may republish the same underlying runs, so "
+    "agreement between them is not independent confirmation. A score is compared only with the same metric from "
+    "the same source; no average, overall winner or price from them is used (their blended prices use other "
+    "assumptions). Official pricing and official docs remain the only gates.")
+
+
+def _num(value):
+    return ("%.2f" % value).rstrip("0").rstrip(".")
+
+
+def _score(value, unit):
+    if value is None:
+        return "n/a"
+    return _num(value) + ("%" if unit == "%" else "")
+
+
+def benchmark_summary(ctx):
+    b = ctx.get("benchmarks")
+    if not b or not b.get("available"):
+        return "unavailable — %s (official evidence is unaffected)" % _safe_text(
+            (b or {}).get("warning") or "not loaded", 200)
+    pairs = b["pairs"]
+    counts = {}
+    for st in pairs.values():
+        counts[st["status"]] = counts.get(st["status"], 0) + 1
+    text = "%d of %d reviewed comparison pages fresh (< 24h)" % (counts.get("fresh", 0), len(pairs))
+    if counts.get("stale") or counts.get("future"):
+        text += ", %d stale/future-dated (reference only, never used)" % (counts.get("stale", 0)
+                                                                          + counts.get("future", 0))
+    if counts.get("missing"):
+        text += ", %d not available" % counts["missing"]
+    failed = sum(1 for st in pairs.values() if st["note"].startswith("REFRESH FAILED"))
+    if failed:
+        text += "; %d refresh(es) failed this run (details view shows why)" % failed
+    notes = {_safe_text(st["note"], 120) for st in pairs.values() if not st["note"].startswith("REFRESH FAILED")}
+    if len(notes) == 1:
+        text += "; " + notes.pop()
+    if b.get("warning"):
+        text += "; warning: " + _safe_text(b["warning"], 160)
+    return text
+
+
+def _pricing_summary(ctx):
+    pc, snap = ctx["pricing_ctx"], ctx["snapshot"]
+    if not snap:
+        return "none available — nothing can be offered (%s)" % ctx["pricing_note"]
+    return "%s, fetched %s ago — %s · %s" % (pc.get("status"), fmt_age(pc.get("age_seconds")), ctx["pricing_note"],
+                                            snap["public_url"])
+
+
+def _docs_summary(ctx):
+    cap = ctx.get("capabilities") or {"sources": {}}
+    parts = []
+    for key in sorted(cap["sources"]):
+        s = cap["sources"][key]
+        state = s["status"] + (" (%s ago)" % fmt_age(s["age"]) if s["record"] else "")
+        if s["last_error"] and s["status"] != "fresh":
+            state += ", refresh failed"
+        parts.append("%s %s" % (s["source"]["label"], state))
+    return "; ".join(parts) or "none"
+
+
+def _rates_text(snap, model_id, long_route):
+    entry = snap["models"].get(model_id) if snap else None
+    if entry is None:
+        return "%s: not in the official pricing" % model_id
+    r = entry["tiers"]["default"]
+    cw = _money(r["cache_write"]) if r["cache_write_status"] == "rate" else r["cache_write_status"].replace("_", " ")
+    text = "%s in %s · cached %s · cache write %s · out %s" % (model_id, _money(r["input"]), _money(r["cached_input"]),
+                                                               cw, _money(r["output"]))
+    if long_route and entry.get("threshold"):
+        lr, thr = entry["tiers"]["long_context"], entry["threshold"]
+        text += " (above %s input: in %s · cached %s · out %s)" % (
+            thr.get("label") or "%dK" % (thr["tokens"] // 1000), _money(lr["input"]), _money(lr["cached_input"]),
+            _money(lr["output"]))
+    return text
+
+
+def _direction(x):
+    return (x["candidate"] > x["current"]) - (x["candidate"] < x["current"])
+
+
+def _pick_metrics(comparable, limit):
+    """Up to `limit` comparable metrics for the short view, taken in turn
+    from those higher for the option, higher for the current model and
+    equal (each in priority order), then shown in priority order — so a
+    mixed result always shows both directions (no cherry-picking)."""
+    queues = [[x for x in comparable if _direction(x) > 0], [x for x in comparable if _direction(x) < 0],
+              [x for x in comparable if _direction(x) == 0]]
+    picked = []
+    while len(picked) < limit and any(queues):
+        for queue in queues:
+            if queue and len(picked) < limit:
+                picked.append(queue.pop(0))
+    return [x for x in comparable if any(x is p for p in picked)]
+
+
+def _setup_text(e, cur, cand, current_effort, option_effort):
+    """How the source's stated setup relates to THIS route (shown with every
+    source, also when the same comparison is referenced again)."""
+    eff = e["efforts"]
+    if not any(eff.values()):
+        return ("reasoning effort and harness not stated by %s (unknown) — context only, not a reason to offer "
+                "this option" % e["provider"])
+    text = "compared at %s '%s' vs %s '%s' as stated by %s" % (
+        cur, eff.get(cur) or "not stated", cand, eff.get(cand) or "not stated", e["provider"])
+    if e.get("setup_matches"):
+        return text + "; same levels as this route ('%s' -> '%s'); harness per publisher" % (
+            current_effort, option_effort)
+    return text + ("; this route uses '%s' -> '%s' — setup differs, so these scores are context only (not a reason "
+                   "to offer this option) and may not reflect your route" % (current_effort, option_effort))
+
+
+def _bench_notes(bench, indent):
+    out = []
+    if bench.get("mixed"):
+        out += _wrap("note: ", "the listed metrics point in different directions (some higher for the current "
+                               "model, some for the option) — no overall winner is implied", indent=indent,
+                     style="yellow")
+    if bench.get("providers_disagree"):
+        out += _wrap("note: ", "the aggregators' own composite scores disagree for this pair (conflict disclosed; "
+                               "neither is treated as primary)", indent=indent, style="yellow")
+    out += _wrap("caution: ", "third-party data, not official and not your account, plan, harness or effort; not "
+                              "proof of quality (see Caution below)", indent=indent, style="yellow")
+    return out
+
+
+def _bench_lines(alt, current_effort, shown, indent, limit=3):
+    """Third-party evidence for one option: the DIRECTED pair current ->
+    option only, as reported, with this route's setup note, both directions
+    of a mixed result, every disclosure and the caution."""
+    bench = alt.get("benchmark") or {"fresh": [], "stale": []}
+    cur, cand = alt["current_model"], alt["model"]
+    option_effort = alt["values"]["reasoning_effort"]
+    key = (cur, cand)  # directed: a reversed pair is never a "same comparison"
+    out = []
+    if not bench["fresh"]:
+        if bench["stale"]:
+            ages = ", ".join(fmt_age(e["age"]) for e in bench["stale"])
+            out += _wrap("third-party: ", "only a stale/future-dated copy exists (fetched %s ago) — reference only, "
+                                          "never used; see the details view" % ages, indent=indent, style="magenta")
+        else:
+            out += _wrap("third-party: ", "no reviewed comparison for this exact pair (coverage is limited — this "
+                                          "is not evidence either way)", indent=indent, style="dim")
+        return out
+    if key in shown and limit is not None:
+        out += _wrap("third-party: ", "same comparison, same direction (current %s -> option %s) as option #%d "
+                                      "above; for this route: %s" % (
+                                          cur, cand, shown[key], " | ".join(
+                                              _setup_text(e, cur, cand, current_effort, option_effort)
+                                              for e in bench["fresh"])),
+                     indent=indent, style="magenta")
+        return out + _bench_notes(bench, indent)
+    shown.setdefault(key, alt.get("n"))
+    for e in bench["fresh"]:
+        head = "%s (aggregator; page updated %s; fetched %s ago; %s) %s" % (
+            e["provider"], _safe_text(e["updated_on"] or "date not stated", 40), fmt_age(e["age"]),
+            _setup_text(e, cur, cand, current_effort, option_effort), _safe_text(e["page"], 300))
+        out += _wrap("third-party: ", head, indent=indent, style="boldmagenta")
+        comparable = [x for x in e["metrics"] if x["comparable"]]
+        others = [x for x in e["metrics"] if not x["comparable"]]
+        listed = comparable if limit is None else _pick_metrics(comparable, limit)
+        for x in listed + (others if limit is None else []):
+            label = _safe_text(x["label"], 80)
+            if x["publisher"] and x["publisher"] not in label:
+                label += " [%s]" % _safe_text(x["publisher"], 60)
+            if x["kind"] == "composite":
+                label += " (aggregator's own scale)"
+            text = "%s: current %s %s · option %s %s" % (label, cur, _score(x["current"], x["unit"]), cand,
+                                                        _score(x["candidate"], x["unit"]))
+            if not x["comparable"]:
+                text += " — not comparable: %s" % x["why_not"]
+            out += _wrap("- ", text, indent=indent + "  ", hang=2)
+        hidden = [x for x in comparable if not any(x is y for y in listed)]
+        n_other = len(others) if limit is not None else 0
+        if hidden or n_other:
+            counts = [("%d higher for the current model" % sum(_direction(x) < 0 for x in hidden)),
+                      ("%d higher for the option" % sum(_direction(x) > 0 for x in hidden)),
+                      ("%d equal" % sum(_direction(x) == 0 for x in hidden)),
+                      ("%d not comparable" % n_other)]
+            out += _wrap("", "+%d more metric(s) not shown here (%s) — see the details view" % (
+                len(hidden) + n_other, ", ".join(counts)), indent=indent + "  ", body_style="dim")
+    return out + _bench_notes(bench, indent)
+
+
+def render_options(ctx, rows, details=False, heading=True):
+    """The numbered options (never preselected), with price, why they are
+    offered, third-party evidence for the exact pair and what is still to be
+    confirmed — the part of `p` a decision is made on."""
+    alts = [a for r in rows for a in r["alternatives"]]
+    out = [""]
+    if not alts:
+        out += _wrap("Options: ", "none right now — every route keeps its current model. The details view lists "
+                                  "every candidate that was considered and why it was not offered.", indent="",
+                     style="bold")
+        return out
+    if heading:
+        out += _wrap("Options", " — choose by number, at most one per route; NONE is preselected and nothing "
+                                "changes until you confirm with an exact yes:", indent="", style="bold")
+    shown = {}
+    for row in rows:
+        for alt in row["alternatives"]:
+            out.append("")
+            out += _wrap("#%d " % alt["n"], "%s: %s -> %s" % (row["label"], _route_text(row["current"]),
+                                                              _route_text(alt["values"])),
+                         indent="  ", style="boldcyan", hang=5)
+            ind = "     "
+            cheaper = alt["cost"] < alt["current_cost"] - 1e-12
+            dearer = alt["cost"] > alt["current_cost"] + 1e-12
+            price = "blended $%s -> $%s per 1M (%s)" % (_money(alt["current_cost"]), _money(alt["cost"]),
+                                                        _delta_text(alt["cost"], alt["current_cost"]))
+            if alt["long_route"]:
+                price += "; above the long-context threshold $%s -> $%s (%s)" % (
+                    _money(alt["current_long"]), _money(alt["long_cost"]),
+                    _delta_text(alt["long_cost"], alt["current_long"]))
+            price += " — toolkit blend assumption, not your bill"
+            out += _wrap("price: ", price, indent=ind, style="bold",
+                         body_style="green" if cheaper else ("yellow" if dearer else None))
+            out += _wrap("official $/1M: ", "%s  ->  %s" % (
+                _rates_text(ctx["snapshot"], alt["current_model"], alt["long_route"]),
+                _rates_text(ctx["snapshot"], alt["model"], alt["long_route"])), indent=ind, style="bold")
+            out += _wrap("offered because: ", alternative_why(alt), indent=ind, style="bold")
+            if "alignment" not in alt["bases"]:
+                out += _bench_lines(alt, row["current"]["reasoning_effort"], shown, ind, None if details else 3)
+            if alt["pending"]:
+                need = " and ".join(t for c, t in ((REASON_AVAILABILITY, "its availability in /model"),
+                                                   (REASON_CAPABILITY, "reasoning level '%s'"
+                                                    % alt["values"]["reasoning_effort"])) if c in alt["pending"])
+                out += _wrap("still to confirm: ", "%s — asked only if you select it, before the final yes" % need,
+                             indent=ind, style="boldyellow")
+            else:
+                ok, provenance = alt["level"]
+                out += _wrap("checks: ", "availability verified; reasoning level '%s' %s %s" % (
+                    alt["values"]["reasoning_effort"], "verified via" if ok else "NOT verified:", provenance),
+                    indent=ind, style="bold")
+            if alt["replaces_proposal"]:
+                out += _wrap("note: ", "selecting it REPLACES this route's proposed cost-saving change", indent=ind,
+                             style="yellow")
+            for note in alt["notes"][:3]:
+                out += _wrap("note: ", _safe_text(note, 240), indent=ind, style="yellow")
+    return out
+
+
+def render_coverage(ctx):
+    b = ctx.get("benchmarks") or {}
+    out = [""]
+    if not b.get("available"):
+        out += _wrap("Third-party comparisons: ", "unavailable (%s). Official pricing and docs are unaffected."
+                     % _safe_text(b.get("warning") or "not loaded", 200), indent="", style="boldmagenta")
+        return out
+    pair_names = sorted({" vs ".join(m for m, _n in st["pair"]["models"]) for st in b["pairs"].values()})
+    providers = sorted({st["provider"]["label"] for st in b["pairs"].values()})
+    out += _wrap("Third-party coverage: ", "%d reviewed public page(s) from %s for %d model pair(s) only (%s) — NOT "
+                                           "comprehensive; every other pair simply has no third-party evidence here."
+                 % (len(b["pairs"]), ", ".join(providers), len(pair_names), "; ".join(pair_names)),
+                 indent="", style="boldmagenta")
+    out += _wrap("Caution: ", THIRD_PARTY_CAUTION[0].upper() + THIRD_PARTY_CAUTION[1:], indent="", style="boldyellow")
+    for pid in sorted(b["pairs"]):
+        st = b["pairs"][pid]
+        rec = st["record"]
+        state = st["status"] + (" (fetched %s ago, page updated %s)" % (
+            fmt_age(st["age"]), _safe_text(rec["updated_on"] or "not stated", 40)) if rec else "")
+        if st["note"].startswith("REFRESH FAILED"):
+            state += "; " + _safe_text(st["note"], 200)
+        out += _wrap("source: ", "%s %s — %s — %s" % (
+            st["provider"]["label"], " vs ".join(m for m, _n in st["pair"]["models"]), state,
+            _safe_text(st["pair"]["page"], 300)), indent="  ", style="dim")
+    return out
+
+
+def render_next(ctx, rows, review_mode, freeze):
+    alts = [a for r in rows for a in r["alternatives"]]
+    changes = any(r["proposed"] for r in rows)
+    if review_mode and alts:
+        text = ("at the prompt below enter option numbers (e.g. 1 or 1,3), d for the full details view, or press "
+                "Enter to keep every route unchanged. If you select a model whose /model availability or reasoning "
+                "level is not verified, you are asked about exactly that model next; nothing is applied until you "
+                "type yes.")
+    elif review_mode and changes:
+        text = "answer the checks below; nothing is applied until you type yes."
+    elif freeze and alts:
+        text = ("choose with copilot-model-refresh.py select --proposal-id ID --choose N[,N] (ID from the PROPOSAL "
+                "line), then apply --proposal-id NEW_ID. Full details (cached copies only): "
+                "copilot-model-refresh.py details.")
+    elif freeze and changes:
+        text = "apply with copilot-model-refresh.py apply --proposal-id ID (from the PROPOSAL line), or discard it."
+    elif not alts and not changes:
+        text = ("nothing to choose — every route keeps its current model. Why each candidate was not offered: "
+                "copilot-model-refresh.py details (cached copies only).")
+    else:
+        text = "preview only — nothing was frozen. Full details: --details or copilot-model-refresh.py details."
+    return [""] + _wrap("Next: ", text, indent="", style="boldcyan")
+
+
+def render_overview(ctx, rows, review_mode=False, freeze=False, recap=False):
+    """Change-first summary shown at the top of every propose/preview: source
+    state, every route (current model and whether options exist), the
+    numbered options with price and third-party evidence, coverage/caution
+    and the next step. The long all-models / rejected-candidates / raw-rates
+    report is the details view."""
+    balanced = ctx.get("policy", DEFAULT_POLICY) == "balanced"
+    out = []
+    if not recap:
+        out.append(sty("bold", "Subagent model routing — %s" % (
+            "balanced mode: options only, nothing preselected" if balanced
+            else "cost-led mode: the cheapest eligible >= %d%% saving is proposed automatically"
+            % round(MIN_SAVING_FRACTION * 100))))
+        out += _wrap("Official pricing: ", _pricing_summary(ctx), style="bold")
+        out += _wrap("Official docs: ", _docs_summary(ctx), style="bold")
+        out += _wrap("Third-party: ", benchmark_summary(ctx), style="bold")
+        out += _wrap("Availability: ", ctx["availability"][1], style="bold")
+        if ctx["global_block"]:
+            out += _wrap("BLOCKED: ", "%s — nothing can be offered or changed" % ctx["global_block"], style="boldred")
+        for warning in list(ctx["pin_warnings"]) + [ctx.get("verified_warning"),
+                                                    (ctx.get("capabilities") or {}).get("warning")]:
+            if warning:
+                out += _wrap("Warning: ", _safe_text(warning, 300), style="boldyellow")
+    out.append("")
+    out.append(sty("bold", "Current routes") + " (model · effort · context, source):")
+    width = term_width()
+    label_w = max(len(r["label"]) for r in rows) if width >= 110 else 0
+    for row in rows:
+        numbers = ["#%d" % a["n"] for a in row["alternatives"]]
+        if row["proposed"]:
+            status, style = ("CHANGE proposed -> %s (blended $%s -> $%s per 1M)" % (
+                _route_text(row["proposed"]), _money(row.get("current_cost")), _money(row.get("proposed_cost"))),
+                "green")
+        elif numbers:
+            status, style = "%d option(s): %s" % (len(numbers), ", ".join(numbers)), "cyan"
+        else:
+            reason = row["reason"][6:] if row["reason"].startswith("kept: ") else row["reason"]
+            if reason.startswith("balanced mode"):
+                reason = row.get("alternatives_note") or "no option offered (the details view lists what was " \
+                                                          "considered)"
+            status, style = "no options — %s" % _safe_text(reason, 220), "dim"
+        body = "%s (%s) — %s" % (_route_text(row["current"]), _source_text(row["sources"]), status)
+        out += _wrap(row["label"].ljust(label_w) + "  ", body, style="bold", body_style=style,
+                     hang=(label_w + 2) if label_w else 4)
+        if row.get("drift"):
+            fix = [a["n"] for a in row["alternatives"] if "alignment" in a["bases"]]
+            if fix:
+                how = "option #%d corrects it (same model)" % fix[0]
+            elif row["proposed"] is not None:
+                how = "the proposed change above uses the baseline effort/context"
+            else:
+                how = ("no correction can be offered right now (the current model does not pass every gate at the "
+                       "baseline values — see the details view); `copilot-model-refresh.py reset --yes` returns all "
+                       "managed overrides to the shipped defaults")
+            out += _wrap("drift: ", "effort/context %s · %s differ from this route's shipped baseline %s · %s — %s"
+                         % (row["current"]["reasoning_effort"], row["current"]["context_tier"],
+                            row["drift"]["effort"], row["drift"]["context"], how),
+                         indent="  " + " " * ((label_w + 2) if label_w else 4), style="boldyellow")
+    out += render_options(ctx, rows)
+    if not recap:
+        out += render_coverage(ctx)
+        if ctx.get("review") is None:
+            out += render_action_required(ctx, rows)
+        out += render_next(ctx, rows, review_mode, freeze)
+    return out
+
+
+def render_benchmark_details(ctx):
+    """Every reviewed comparison page: identity, freshness, provenance and
+    every allowlisted metric exactly as parsed (stale copies included,
+    labelled reference only)."""
+    b = ctx.get("benchmarks") or {}
+    out = ["", sty("bold", "Third-party comparison pages (reviewed list; reference only):")]
+    if not b.get("available"):
+        out += _wrap("", "unavailable: %s" % _safe_text(b.get("warning") or "not loaded", 200))
+        return out
+    for pid in sorted(b["pairs"]):
+        st = b["pairs"][pid]
+        pair, rec = st["pair"], st["record"]
+        models = [m for m, _n in pair["models"]]
+        out += _wrap("", "%s — %s vs %s · %s" % (st["provider"]["label"], models[0], models[1],
+                                                   _safe_text(pair["page"], 300)),
+                     style=None, body_style="boldmagenta")
+        out += _wrap("status: ", "%s; %s%s" % (st["status"], _safe_text(st["note"], 200),
+                                               ("; last error: " + _safe_text(st["last_error"], 200))
+                                               if st["last_error"] else ""), indent="    ")
+        out += _wrap("limits: ", st["provider"]["limits"], indent="    ")
+        if rec is None:
+            continue
+        out += _wrap("provenance: ", "GET %s · fetched %s (%s ago) · page updated %s · sha256 %s · parser v%s (%s)" % (
+            _safe_text(rec["url"], 300), _safe_text(rec["fetched_at"], 40), fmt_age(st["age"]),
+            _safe_text(rec["updated_on"] or "not stated", 40), _safe_text(rec["content_sha256"], 64)[:16],
+            _safe_text(rec["parser_version"], 10), _safe_text(rec["layout"], 60)), indent="    ")
+        out += _wrap("reasoning effort: ", ", ".join("%s %s" % (m, _safe_text(rec["efforts"].get(m) or "not stated",
+                                                                                20))
+                                                     for m in models), indent="    ")
+        for key in sorted(rec["metrics"]):
+            m = rec["metrics"][key]
+            vals = []
+            for mid in models:
+                v = m["values"][mid]
+                vals.append("%s %s%s" % (mid, _score(v["value"], m["unit"]),
+                                         " (measured at another effort)" if v["other_effort"] else ""))
+            flags = [f for f, on in (("duplicated row — unknown", m["conflict"]),
+                                     ("marked estimated by the aggregator", m["estimated"])) if on]
+            out += _wrap("- ", "%s%s%s: %s%s" % (
+                _safe_text(m["label"], 80), " [%s]" % _safe_text(m["publisher"], 60)
+                if m["publisher"] and m["publisher"] not in m["label"] else "",
+                " (aggregator's own scale)" if m["kind"] == "composite" else "", "; ".join(vals),
+                (" — " + "; ".join(flags)) if flags else ""), indent="    ", hang=2)
+        for note in rec["notes"]:
+            out += _wrap("note: ", _safe_text(note, 240), indent="    ")
+    out += _wrap("Caution: ", THIRD_PARTY_CAUTION[0].upper() + THIRD_PARTY_CAUTION[1:], indent="", style="boldyellow")
+    return out
 
 
 def render_header(ctx):
@@ -2719,6 +3460,7 @@ def render_header(ctx):
                         out.append("  Warning:      %s: %s — treated as unknown" % (label, _safe_text(sec["error"], 200)))
         if cap.get("warning"):
             out.append("  Warning:      %s" % _safe_text(cap["warning"], 240))
+    out.append("  Third-party:  %s" % benchmark_summary(ctx))
     out.append("  Availability: %s" % ctx["availability"][1])
     if ctx.get("verified_warning"):
         out.append("  Warning:      %s" % ctx["verified_warning"])
@@ -2728,7 +3470,12 @@ def render_header(ctx):
 
 
 def render_proposal(ctx, rows, unassessed, new_models):
-    out = render_header(ctx)
+    """The full details report (propose/preview --details and `details`):
+    source header, every route's decision, official rates, reasons and
+    evidence, every rejected/considered candidate, the options in full, the
+    whole model universe and the third-party pages as parsed."""
+    out = ["", sty("bold", "===== Details (full report) =====")]
+    out += render_header(ctx)
     out.append("")
     out.append("NOTE: fit below is CATEGORICAL (official Category / Task area / capability labels from a dated catalog),")
     out.append("      NOT measured quality. A proposed change does not claim equal quality — review it before confirming.")
@@ -2798,9 +3545,6 @@ def render_proposal(ctx, rows, unassessed, new_models):
         if row.get("alternatives_note"):
             out.append("      alternatives: %s" % row["alternatives_note"])
     out += render_alternatives(ctx, rows)
-    if ctx.get("review") is None:
-        # In a review (copilot-s p) you are asked about the proposed models instead.
-        out += render_action_required(ctx, rows)
     out += render_universe(ctx, rows, new_models)
     if unassessed:
         out.append("")
@@ -2808,14 +3552,21 @@ def render_proposal(ctx, rows, unassessed, new_models):
                    "the catalog; listed only, never assigned): %s" % ", ".join(unassessed))
     if new_models:
         out.append("New in the official pricing since your last refresh: %s" % ", ".join(new_models))
+    out += render_benchmark_details(ctx)
     out.append("")
+    if ctx.get("policy", DEFAULT_POLICY) == "balanced":
+        rule = ("Balanced mode: NO change is proposed or preselected automatically; eligible models at least %d%% "
+                "cheaper (for long_context routes also on the rates above the long-context threshold) and eligible "
+                "models with a documented official differentiator or a fresh reviewed third-party comparison are "
+                "offered by number for your explicit choice" % round(MIN_SAVING_FRACTION * 100))
+    else:
+        rule = ("Cost-led mode: a change is proposed automatically only when it is at least %d%% cheaper (for "
+                "long_context routes also on the rates above the long-context threshold); other options are never "
+                "selected automatically" % round(MIN_SAVING_FRACTION * 100))
     out.append("* Blended $/1M = %s of the official Default-tier rates; cache write uses the input rate when no "
                "separate cache-write rate is listed. An assumption for comparison only, not a forecast and not your "
-               "bill. A change is proposed automatically only when it is at least %d%% cheaper (for long_context "
-               "routes also on the rates above the long-context threshold); an unpriced or unverifiable current "
-               "model is always kept. Optional alternatives are never selected automatically."
-               % (", ".join("%d%% %s" % (round(s * 100), k.replace("_", " ")) for k, s in WORKLOAD_MIX),
-                  round(MIN_SAVING_FRACTION * 100)))
+               "bill. %s. An unpriced or unverifiable current model is always kept."
+               % (", ".join("%d%% %s" % (round(s * 100), k.replace("_", " ")) for k, s in WORKLOAD_MIX), rule))
     out.append("  Fit is categorical (official Category / Task area / capability labels from current official docs or "
                "the dated catalog), not a quality score; shipped routes remain the baseline recommendation.")
     return out
@@ -2831,45 +3582,21 @@ def _delta_text(new, cur):
 
 
 def render_alternatives(ctx, rows):
-    alts = [a for r in rows for a in r["alternatives"]]
-    out = ["", "Optional alternatives (never selected automatically; choose them by number in copilot-s p, then "
-               "confirm):"]
-    if not alts:
-        out.append("  none — no eligible model in a route's task area has a documented differentiator versus the "
-                   "current model (see 'same task area' lines above for what was considered and why).")
+    """Details view of the options: everything render_options shows, with
+    every parsed third-party metric (including non-comparable ones)."""
+    out = ["", sty("bold", "Options in full (never selected automatically; choose them by number in copilot-s p, "
+                           "then confirm):")]
+    if not any(r["alternatives"] for r in rows):
+        out.append("  none — no eligible model in a route's task area is >= %d%% cheaper%s, has a documented "
+                   "official differentiator or a fresh reviewed third-party comparison versus the current model (see "
+                   "'same task area' lines above for what was considered and why)."
+                   % (round(MIN_SAVING_FRACTION * 100), "" if ctx.get("policy", DEFAULT_POLICY) == "balanced"
+                      else " than the proposed change"))
         return out
-    for alt in alts:
-        row = next(r for r in rows if r["key"] == alt["route"])
-        out.append("  #%d %s: %s -> %s" % (alt["n"], row["label"], _route_text(row["current"]),
-                                           _route_text(alt["values"])))
-        cost_line = "      blended $/1M (Default tier): %s -> %s (%s)" % (
-            _money(alt["current_cost"]), _money(alt["cost"]), _delta_text(alt["cost"], alt["current_cost"]))
-        if alt["long_route"]:
-            cost_line += "; above the long-context threshold: %s -> %s (%s)" % (
-                _money(alt["current_long"]), _money(alt["long_cost"]),
-                _delta_text(alt["long_cost"], alt["current_long"]))
-        out.append(cost_line)
-        for diff in alt["differentiators"]:
-            out.append("      documented differentiator: %s" % _safe_text(diff, 300))
-        if alt["excels_at"]:
-            out.append("      official 'Excels at' text: \"%s\" (the vendor's description, not a measurement)"
-                       % _safe_text(alt["excels_at"], 300))
-        ok, provenance = alt["level"]
-        out.append("      reasoning level '%s' %s %s; 1M context %s for context '%s'; evidence: %s" % (
-            alt["values"]["reasoning_effort"], "verified via" if ok else "NOT verified yet:", provenance,
-            "documented" if alt["values"]["context_tier"] == "long_context" else "not needed",
-            alt["values"]["context_tier"], alt["basis"]))
-        if alt["pending"]:
-            out.append("      TENTATIVE: if you select it you are asked to confirm its %s in /model before the "
-                       "final yes" % " and ".join(
-                           t for c, t in ((REASON_AVAILABILITY, "availability"),
-                                          (REASON_CAPABILITY, "reasoning level")) if c in alt["pending"]))
-        for note in alt["notes"]:
-            out.append("      note: %s" % _safe_text(note, 240))
-        if alt["replaces_proposal"]:
-            out.append("      selecting it REPLACES this route's proposed cost-saving change")
-        out.append("      limits: categorical evidence only — NOT a measured, equal or better quality claim; the "
-                   "price impact uses the blended assumption, not your bill")
+    out += render_options(ctx, rows, details=True, heading=False)[1:]
+    out.append("")
+    out.append("  limits: categorical official evidence and reference-only third-party numbers — NOT a measured, "
+               "equal or better quality claim; the price impact uses the blended assumption, not your bill.")
     return out
 
 
@@ -2928,7 +3655,7 @@ def render_review(ctx, rows, targets, pending, heading):
     pending. Your answers so far are listed (this run only; not saved)."""
     review = ctx.get("review") or blank_review()
     by_route = {t["route"]: t for t in targets}
-    out = ["", heading]
+    out = [""] + _wrap("", heading, indent="", body_style="bold")
     table_rows = []
     for row in rows:
         t = by_route.get(row["key"])
@@ -2938,10 +3665,12 @@ def render_review(ctx, rows, targets, pending, heading):
             continue
         status = "CHANGE — confirm in /model" if t["pending"] else "CHANGE"
         if t["alternative"]:
-            status += " (your alternative #%d)" % t["alternative"]
+            status += " (your option #%d)" % t["alternative"]
         table_rows.append([row["label"], _route_text(row["current"]), _route_text(t["values"]),
                            "%s -> %s" % (_money(t["current_cost"]), _money(t["cost"])), status])
-    out += _table(["Route", "Current (model · effort · context)", "Proposed", "Blended $/1M", "Decision"], table_rows)
+    out += _table(["Route", "Current (model · effort · context)", "Proposed", "Blended $/1M", "Decision"], table_rows,
+                  cell_style=lambda _r, c, text: (("boldyellow" if "confirm" in text else "boldgreen")
+                                                  if c == 4 and text.startswith("CHANGE") else None))
     if targets:
         out.append("")
         out.append("Proposed models (each listed once):")
@@ -3084,7 +3813,7 @@ def render_universe(ctx, rows, new_models):
 
 
 def render_final(effective, defaults, changed_keys, heading):
-    out = ["", heading]
+    out = [""] + _wrap("", heading, indent="", body_style="bold")
     rows = []
     for route in ROUTES:
         key = route["key"]
@@ -3094,7 +3823,8 @@ def render_final(effective, defaults, changed_keys, heading):
             status = "kept (shipped default)"
         rows.append([route["label"], v["model"], v["reasoning_effort"], v["context_tier"],
                      _source_text(effective[key]["sources"]), status])
-    out += _table(["Route", "Model", "Effort", "Context", "Source", "Status"], rows)
+    out += _table(["Route", "Model", "Effort", "Context", "Source", "Status"], rows,
+                  cell_style=lambda _r, c, text: "boldgreen" if c == 5 and text == "CHANGED" else None)
     return out
 
 
@@ -3493,13 +4223,17 @@ def cmd_status(paths, args, now):
     return EXIT_OK
 
 
-def _evaluate_and_render(ctx):
+def _evaluate_and_render(ctx, details=False, review_mode=False, freeze=False):
+    """Evaluate, then render the change-first overview (and, with details,
+    the full report after it)."""
     rows = evaluate(ctx)
     alternatives = number_alternatives(rows)
     unassessed, new_models, priced = unassessed_and_new(ctx)
     new_overrides = proposed_overrides(rows, ctx["state"], ctx["defaults"])
     plan = plan_outputs(ctx, new_overrides)
-    lines = render_proposal(ctx, rows, unassessed, new_models)
+    lines = render_overview(ctx, rows, review_mode=review_mode, freeze=freeze)
+    if details:
+        lines += render_proposal(ctx, rows, unassessed, new_models)
     return rows, new_overrides, plan, lines, priced, alternatives
 
 
@@ -3509,7 +4243,8 @@ def _input_digests(ctx):
             "routing": ctx["routing_sha"], "catalog": ctx["catalog_digest"],
             "instructions": file_sha256(paths.instructions), "effective": file_sha256(paths.effective),
             "verified": ctx["verified_sha"], "capabilities": ctx["capabilities"]["digest"],
-            "pricing": pricing_digest(ctx["snapshot"])}
+            "pricing": pricing_digest(ctx["snapshot"]), "benchmarks": ctx["benchmarks"]["digest"],
+            "economics": economics_digest()}
 
 
 def _expected_outputs(ctx, plan):
@@ -3614,7 +4349,7 @@ def _freeze_proposal(ctx, rows, alternatives, selected, new_overrides, plan, rou
         "digests": _input_digests(ctx), "expected": _expected_outputs(ctx, plan),
         "snapshot_id": ctx["snapshot"]["snapshot_id"], "evidence_digest": evidence_digest(ctx, rows),
         "alternatives": _frozen_alternatives(alternatives), "selected": sorted(selected),
-        "review": review_doc(ctx.get("review")),
+        "review": review_doc(ctx.get("review")), "policy": ctx.get("policy", DEFAULT_POLICY),
     }
     doc["seal"] = _proposal_seal(_proposal_key(ctx["paths"], create=True), doc)
     atomic_write_bytes(ctx["paths"].proposal, json_bytes(doc))
@@ -3644,13 +4379,18 @@ def _print_review_lines(pending, alternatives, selected_count, proposal_id):
     _print_machine_lines(alternatives, False, proposal_id)
 
 
+def _policy_from_args(args):
+    return "cost-led" if getattr(args, "cost_led", False) else DEFAULT_POLICY
+
+
 def cmd_preview(paths, args, now, freeze=False):
     review_mode = freeze and getattr(args, "review", False)
+    details = getattr(args, "details", False)
     with refresh_lock(paths):
         note = recover_journal(paths)
         if note:
             print("Note: %s." % note)
-        ctx = build_context(paths, now, refresh=True, offline=args.offline)
+        ctx = build_context(paths, now, refresh=True, offline=args.offline, policy=_policy_from_args(args))
         if review_mode:
             ctx["review"] = blank_review()
         if ctx["snapshot"] is None:
@@ -3660,7 +4400,8 @@ def cmd_preview(paths, args, now, freeze=False):
             print("Error: no valid official pricing snapshot is available; routing was left unchanged.",
                   file=sys.stderr)
             return EXIT_ERROR
-        rows, new_overrides, plan, lines, priced, alternatives = _evaluate_and_render(ctx)
+        rows, new_overrides, plan, lines, priced, alternatives = _evaluate_and_render(
+            ctx, details=details, review_mode=review_mode, freeze=freeze)
         print("\n".join(lines))
         remember_seen(paths, priced, ctx["snapshot"]["snapshot_id"], now)
         verify_needed = bool(render_action_required(ctx, rows)) and not review_mode
@@ -3672,13 +4413,10 @@ def cmd_preview(paths, args, now, freeze=False):
             print("\n".join(render_review(ctx, rows, targets, pending,
                                           "Proposed mapping to check in Copilot CLI's /model picker:")))
         if not route_changes and not sync:
-            print("\n".join(render_final(ctx["effective"], ctx["defaults"], set(),
-                                         "No routing changes proposed — final effective routing (kept):")))
             if freeze and alternatives and preflight(ctx, plan) is None:
                 # Nothing is proposed by default; the frozen (no-op) proposal
-                # only lets you add an optional alternative explicitly.
-                print("\nNo cost-saving change is proposed. %d optional alternative(s) are listed above; nothing "
-                      "changes unless you select one and then confirm." % len(alternatives))
+                # only lets you add an option explicitly. The current routes
+                # above are the effective routing until you confirm one.
                 proposal_id = _freeze_proposal(ctx, rows, alternatives, [], new_overrides, plan, [], now,
                                                now + PROPOSAL_TTL_SECONDS)
                 if review_mode:
@@ -3686,6 +4424,8 @@ def cmd_preview(paths, args, now, freeze=False):
                 else:
                     _print_machine_lines(alternatives, verify_needed, proposal_id)
                 return EXIT_NO_CHANGES
+            print("\n".join(render_final(ctx["effective"], ctx["defaults"], set(),
+                                         "No routing changes proposed — final effective routing (kept):")))
             if freeze:
                 with contextlib.suppress(OSError):
                     os.unlink(paths.proposal)
@@ -3700,8 +4440,8 @@ def cmd_preview(paths, args, now, freeze=False):
         print("\n".join(render_final(plan["effective"], ctx["defaults"], set(route_changes),
                                      ("TENTATIVE effective routing IF you confirm every pending check and then apply "
                                       if has_pending(pending) else "Effective routing IF you apply ")
-                                     + "(categorical fit only — not measured or equal quality; optional "
-                                       "alternatives NOT included unless you select them):")))
+                                     + "(categorical fit only — not measured or equal quality; options NOT included "
+                                       "unless you select them):")))
         problem = preflight(ctx, plan)
         if problem:
             with contextlib.suppress(OSError):
@@ -3757,6 +4497,8 @@ def _load_proposal(paths, proposal_id, now):
     if "review" not in doc:
         raise RefreshError("malformed proposal (review)", EXIT_REFUSED)
     validate_review(doc["review"])
+    if doc.get("policy") not in POLICIES:
+        raise RefreshError("malformed proposal (policy)", EXIT_REFUSED)
     return doc
 
 
@@ -3769,9 +4511,12 @@ def _verify_proposal_evidence(paths, doc, ctx):
         with contextlib.suppress(OSError):
             os.unlink(paths.proposal)
         raise RefreshError(message, EXIT_REFUSED)
-    # Your sealed review answers (None = a plain proposal) are part of the
-    # re-derivation; nothing is re-fetched mid-review.
+    # Your sealed review answers (None = a plain proposal) and the sealed
+    # policy (balanced / cost-led) are part of the re-derivation; nothing is
+    # re-fetched mid-review (third-party comparisons come from their cache,
+    # bound by the frozen digest).
     ctx["review"] = validate_review(doc["review"])
+    ctx["policy"] = doc["policy"]
     current = _input_digests(ctx)
     stale = sorted(k for k, v in current.items() if doc["digests"].get(k) != v)
     if stale:
@@ -3782,9 +4527,9 @@ def _verify_proposal_evidence(paths, doc, ctx):
     rows = evaluate(ctx)
     alternatives = number_alternatives(rows)
     if evidence_digest(ctx, rows) != doc["evidence_digest"]:
-        refuse("refused: the evidence behind the proposal (prices, official capability evidence or its freshness, "
-               "availability, date or a resulting decision) changed since it was shown, or the proposal was "
-               "altered; nothing was applied — run p again")
+        refuse("refused: the evidence behind the proposal (prices, official capability evidence, third-party "
+               "comparisons or their freshness, availability, date or a resulting decision) changed since it was "
+               "shown, or the proposal was altered; nothing was applied — run p again")
     if _frozen_alternatives(alternatives) != doc["alternatives"]:
         refuse("refused: the proposal's optional alternatives do not match a re-derivation (altered?); nothing was "
                "applied — run p again")
@@ -3802,8 +4547,10 @@ def _parse_choice(text):
 
 
 def cmd_select(paths, args, now):
-    """Explicitly add optional alternatives to a frozen proposal. Writes a
-    NEW frozen proposal (same expiry, new id) — never any routing file."""
+    """Explicitly choose options (alternatives) for a frozen proposal. The
+    choice REPLACES any earlier selection of that proposal. Writes a NEW
+    frozen proposal (same expiry, new id, same sealed policy and review
+    answers) — never any routing file."""
     choice = _parse_choice(args.choose)
     with refresh_lock(paths):
         note = recover_journal(paths)
@@ -3815,12 +4562,12 @@ def cmd_select(paths, args, now):
         by_n = {a["n"]: a for a in alternatives}
         missing = [str(n) for n in choice if n not in by_n]
         if missing:
-            raise RefreshError("no optional alternative #%s in this proposal; nothing was selected"
+            raise RefreshError("no option #%s in this proposal; nothing was selected"
                                % ", #".join(missing), EXIT_REFUSED)
         selected = [by_n[n] for n in choice]
         routes = [a["route"] for a in selected]
         if len(set(routes)) != len(routes):
-            raise RefreshError("choose at most one alternative per route; nothing was selected", EXIT_REFUSED)
+            raise RefreshError("choose at most one option per route; nothing was selected", EXIT_REFUSED)
         new_overrides = derive_overrides(rows, ctx["state"], ctx["defaults"], selected)
         plan = plan_outputs(ctx, new_overrides)
         problem = preflight(ctx, plan)
@@ -3832,19 +4579,20 @@ def cmd_select(paths, args, now):
         route_changes = [r["key"] for r in ROUTES if r["key"] in changed]
         proposal_id = _freeze_proposal(ctx, rows, alternatives, choice, new_overrides, plan, route_changes,
                                        doc["created_epoch"], doc["expires_epoch"])
-        out = ["", "You selected these OPTIONAL alternatives (your explicit choice — not a recommendation, not a "
-                   "measured, equal or better quality claim):"]
+        out = [""] + _wrap("", "You selected these options (your explicit choice — not a recommendation, not a "
+                                "measured, equal or better quality claim):", indent="", body_style="bold")
         more = False
         for alt in selected:
             row = next(r for r in rows if r["key"] == alt["route"])
             more = more or alt["cost"] > alt["current_cost"]
-            out.append("  #%d %s: %s -> %s · blended $/1M %s -> %s (%s)%s" % (
-                alt["n"], row["label"], _route_text(row["current"]), _route_text(alt["values"]),
+            out += _wrap("#%d " % alt["n"], "%s: %s -> %s · blended $/1M %s -> %s (%s)%s" % (
+                row["label"], _route_text(row["current"]), _route_text(alt["values"]),
                 _money(alt["current_cost"]), _money(alt["cost"]), _delta_text(alt["cost"], alt["current_cost"]),
-                " — replaces this route's proposed cost-saving change" if alt["replaces_proposal"] else ""))
+                " — replaces this route's proposed cost-saving change" if alt["replaces_proposal"] else ""),
+                style="boldcyan", hang=5)
         if more:
-            out.append("  At least one selection costs MORE than the current route under the blended assumption "
-                       "(not your bill).")
+            out += _wrap("Note: ", "at least one selection costs MORE than the current route under the blended "
+                                   "assumption (not your bill).", style="boldyellow")
         pending = review_pending(review_targets(rows, selected))
         if ctx["review"] is not None:
             out += render_review(ctx, rows, review_targets(rows, selected), pending,
@@ -3853,7 +4601,7 @@ def cmd_select(paths, args, now):
         out += render_final(plan["effective"], ctx["defaults"], set(route_changes),
                             ("TENTATIVE effective routing IF you confirm every pending check and then apply "
                              if has_pending(pending) else "Effective routing IF you apply ")
-                            + "(includes your selected alternatives; categorical fit only — not measured or equal "
+                            + "(includes your selected options; categorical fit only — not measured or equal "
                               "quality):")
         print("\n".join(out))
         if ctx["review"] is not None:
@@ -3967,15 +4715,20 @@ def cmd_review(paths, args, now):
         out = ["", "Review round %d — your answers are used for this copilot-s p run only (never saved). Recomputed "
                    "from the same frozen prices and official evidence (nothing re-fetched)." % new_review["round"]]
         for old in dropped:
-            out.append("  Your selected alternative #%d (%s -> %s) is no longer offered after your answers and was "
-                       "dropped." % (old["n"], old["route"], _route_text(old["values"])))
+            out += _wrap("Dropped: ", "your selected option #%d (%s -> %s) is no longer offered after your answers "
+                                      "and was removed from the selection." % (old["n"], old["route"],
+                                                                                _route_text(old["values"])),
+                         style="boldyellow")
         out += render_review(ctx, rows, targets, pending, "Revised mapping:")
-        out.append("")
-        out.append("Reasons:")
-        for row in rows:
-            out.append("  %s: %s" % (row["label"], _safe_text(row["reason"], 400)))
+        if ctx.get("policy") != "balanced":
+            out.append("")
+            out.append("Reasons:")
+            for row in rows:
+                out.append("  %s: %s" % (row["label"], _safe_text(row["reason"], 400)))
         if alternatives:
-            out += render_alternatives(ctx, rows)
+            out += [""] + _wrap("", "Options after your answers (renumbered; your remaining selection is kept by "
+                                    "identity):", indent="", body_style="bold")
+            out += render_options(ctx, rows, heading=False)
         if not route_changes and not sync:
             out += render_final(ctx["effective"], ctx["defaults"], set(),
                                 "No eligible replacement remains after your answers — every route keeps its "
@@ -4046,7 +4799,7 @@ def cmd_apply(paths, args, now):
     changed = set(doc.get("route_changes", [])) | set(changed_keys)
     out = ["Applied. Backups of replaced files: %s" % paths.backups]
     for alt in selected:
-        out.append("Included your selected optional alternative #%d: %s -> %s." % (
+        out.append("Included your selected option #%d: %s -> %s." % (
             alt["n"], alt["route"], _route_text(alt["values"])))
     if any(k in new_overrides for k in AGENT_NAMES) or plan["settings_changed"]:
         out.append("Native /subagents settings updated for agent default routes (values you set yourself were left "
@@ -4100,6 +4853,91 @@ def cmd_reset(paths, args, now):
             os.unlink(paths.proposal)
     print("\n".join(["Reset complete. Backups of replaced files: %s" % paths.backups]
                     + render_final(plan["effective"], ctx["defaults"], set(changed_keys), "Final effective routing:")))
+    return EXIT_OK
+
+
+def _peek_proposal(paths, proposal_id, now):
+    """(doc, None) for the pending proposal when it is current, unexpired and
+    its seal verifies — READ-ONLY (never deletes or rewrites anything, unlike
+    select/review/apply) — else (None, why)."""
+    if not PROPOSAL_ID_RE.match(proposal_id or ""):
+        return None, "invalid proposal id"
+    try:
+        raw = read_bytes(paths.proposal)
+        if raw is None:
+            return None, "no pending proposal"
+        doc = parse_json_bytes(raw, paths.proposal)
+    except (OSError, RefreshError) as ex:
+        return None, "the pending proposal cannot be read (%s)" % _safe_text(ex, 120)
+    if (not isinstance(doc, dict) or doc.get("kind") != PROPOSAL_KIND or doc.get("proposal_id") != proposal_id
+            or doc.get("format") != PROPOSAL_FORMAT):
+        return None, "the pending proposal does not match %s" % proposal_id
+    created, expires = doc.get("created_epoch"), doc.get("expires_epoch")
+    if (not isinstance(created, (int, float)) or not isinstance(expires, (int, float)) or isinstance(created, bool)
+            or isinstance(expires, bool) or created > now or now > expires):
+        return None, "the proposal expired or has an invalid lifetime"
+    try:
+        key = _proposal_key(paths)
+    except RefreshError:
+        key = None
+    seal = doc.get("seal")
+    if key is None or not isinstance(seal, str) or not hmac.compare_digest(seal, _proposal_seal(key, doc)):
+        return None, "the proposal's seal cannot be verified"
+    if doc.get("policy") not in POLICIES:
+        return None, "the proposal has no valid policy"
+    try:
+        validate_review(doc.get("review"))
+    except RefreshError as ex:
+        return None, _safe_text(ex, 120)
+    return doc, None
+
+
+def cmd_details(paths, args, now):
+    """The full report (every route's reasons, all rejected/considered
+    candidates, official rates, the whole model universe, every parsed
+    third-party page) from CACHED copies only: no network, no lock, nothing
+    written, no proposal changed. With --proposal-id, the pending proposal's
+    sealed policy, review answers and selection are used (read-only), so the
+    option numbers match the prompt as long as nothing changed."""
+    note = recover_journal(paths, report_only=True)
+    doc, why = (None, None)
+    if args.proposal_id:
+        doc, why = _peek_proposal(paths, args.proposal_id, now)
+    policy = doc["policy"] if doc else _policy_from_args(args)
+    ctx = build_context(paths, now, refresh=None, policy=policy)
+    out = [sty("bold", "Details view — read-only, from cached copies only (no network request, nothing written, "
+                       "no proposal changed).")]
+    if note:
+        out += _wrap("Warning: ", note, style="boldyellow")
+    if args.proposal_id and doc is None:
+        out += _wrap("Note: ", "proposal %s not used (%s); showing the plain %s evaluation." % (
+            _safe_text(args.proposal_id, 20), why, policy), style="yellow")
+    if ctx["snapshot"] is None:
+        out += render_header(ctx)
+        out += render_final(ctx["effective"], ctx["defaults"], set(), "Current effective routing (no cached official "
+                                                                      "pricing, so nothing can be evaluated):")
+        print("\n".join(out))
+        return EXIT_ERROR
+    if doc is not None:
+        ctx["review"] = validate_review(doc["review"])
+    rows = evaluate(ctx)
+    alternatives = number_alternatives(rows)
+    if doc is not None:
+        same = (evidence_digest(ctx, rows) == doc["evidence_digest"]
+                and _frozen_alternatives(alternatives) == doc.get("alternatives"))
+        out += _wrap("Proposal: ", ("%s — the numbers below match it." % doc["proposal_id"]) if same else (
+            "%s — its inputs or evidence changed since it was shown, so numbers below may differ and the proposal "
+            "will be refused at select/apply (run p again)." % doc["proposal_id"]),
+            style="bold" if same else "boldyellow")
+        if doc.get("selected"):
+            out += _wrap("Selected so far: ", ", ".join("#%d" % n for n in doc["selected"]), style="bold")
+    unassessed, new_models, _priced = unassessed_and_new(ctx)
+    out += render_proposal(ctx, rows, unassessed, new_models)
+    if ctx.get("review") is None:
+        out += render_action_required(ctx, rows)
+    out += ["", sty("bold", "===== Recap (same options as above) =====")]
+    out += render_overview(ctx, rows, recap=True)
+    print("\n".join(out))
     return EXIT_OK
 
 
@@ -4235,12 +5073,20 @@ def main(argv=None, now=None):
                         "parameter out; no pricing/catalog needed)")
     p.set_defaults(func=cmd_status)
     for name, freeze in (("preview", False), ("propose", True)):
-        p = sub.add_parser(name, help=("Fetch current official prices and capability docs and show proposed "
-                                       "changes, optional alternatives and all models"
+        p = sub.add_parser(name, help=("Fetch current official prices and capability docs plus the reviewed "
+                                       "third-party comparison pages and show the routes and numbered options "
+                                       "(balanced: nothing preselected)"
                                        + (" (no routing writes)" if not freeze else
                                           "; freeze the proposal for apply and print 'PROPOSAL<TAB>id'")))
         p.add_argument("--offline", action="store_true",
-                       help="Use the cached pricing snapshot and capability evidence only (no network)")
+                       help="Use the cached pricing snapshot, capability evidence and third-party comparisons only "
+                            "(no network)")
+        p.add_argument("--cost-led", action="store_true",
+                       help="Legacy cost-led policy: automatically propose the cheapest eligible >= 10%% cheaper "
+                            "model per route (still needs an explicit apply); default is balanced (options only)")
+        p.add_argument("--details", action="store_true",
+                       help="Also print the full report (all models, rejected candidates, raw rates, every parsed "
+                            "third-party page) after the overview")
         if freeze:
             p.add_argument("--review", action="store_true",
                            help="Review mode (copilot-s p): also propose candidates pending only your /model "
@@ -4262,14 +5108,21 @@ def main(argv=None, now=None):
     p = sub.add_parser("apply", help="Apply a frozen proposal (refuses if anything changed since)")
     p.add_argument("--proposal-id", required=True)
     p.set_defaults(func=cmd_apply)
-    p = sub.add_parser("select", help="Add explicitly chosen optional alternatives to a frozen proposal (writes a "
-                                      "new frozen proposal; no routing writes; prints 'PROPOSAL<TAB>id')")
+    p = sub.add_parser("select", help="Choose options for a frozen proposal (replaces any earlier selection; writes "
+                                      "a new frozen proposal; no routing writes; prints 'PROPOSAL<TAB>id')")
     p.add_argument("--proposal-id", required=True)
-    p.add_argument("--choose", required=True, help="Alternative numbers shown by propose, e.g. 1 or 1,3")
+    p.add_argument("--choose", required=True, help="Option numbers shown by propose, e.g. 1 or 1,3 (at most one "
+                                                   "per route)")
     p.set_defaults(func=cmd_select)
     p = sub.add_parser("record-verified", help="Interactively record the models/reasoning levels you verified in "
                                                "Copilot CLI's /model picker (saved only after an exact 'yes')")
     p.set_defaults(func=cmd_record_verified)
+    p = sub.add_parser("details", help="Print the full report from CACHED copies only (no network, nothing "
+                                       "written); --proposal-id uses that pending proposal's policy and answers "
+                                       "read-only")
+    p.add_argument("--proposal-id")
+    p.add_argument("--cost-led", action="store_true", help="Evaluate with the legacy cost-led policy")
+    p.set_defaults(func=cmd_details)
     p = sub.add_parser("discard", help="Discard a frozen proposal and show the unchanged routing")
     p.add_argument("--proposal-id", required=True)
     p.set_defaults(func=cmd_discard)
@@ -4278,6 +5131,7 @@ def main(argv=None, now=None):
     p.set_defaults(func=cmd_reset)
     args = parser.parse_args(argv)
     now = time.time() if now is None else now
+    _STYLE["on"] = color_wanted()
     paths = Paths()
     try:
         return args.func(paths, args, now)
